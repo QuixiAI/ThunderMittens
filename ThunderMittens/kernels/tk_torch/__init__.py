@@ -30,6 +30,9 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "rotary", "rotary.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "attn_causal", "attn_causal.metal"),
+    os.path.join(_KERNELS, "flux", "flux.metal"),
+    os.path.join(_KERNELS, "gemm_staged", "gemm_staged.metal"),
+    os.path.join(_KERNELS, "attn_multiwarp", "attn_multiwarp.metal"),
 ]
 
 
@@ -115,3 +118,24 @@ def gelu(x: torch.Tensor):
 def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     """Causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""
     return _ext.attn_causal(q, k, v)
+
+
+def flux_gelu(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor):
+    """Fused gelu(x @ w + bias). f32/bf16 MPS; N%32, M%32, K%16."""
+    return _ext.flux_gelu(x, w, bias)
+
+
+def flux_gate(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor,
+              gate: torch.Tensor, residual: torch.Tensor):
+    """Fused (x @ w + bias) * gate + residual. f32/bf16 MPS; N%32, M%32, K%16."""
+    return _ext.flux_gate(x, w, bias, gate, residual)
+
+
+def gemm_staged(x: torch.Tensor, y: torch.Tensor):
+    """Multi-simdgroup threadgroup-staged GEMM (x @ y). f32/bf16 MPS; N%32, M%32, K%16."""
+    return _ext.gemm_staged(x, y)
+
+
+def attn_multiwarp(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """Multi-warp flash attention forward (shared K/V). bf16 (B,H,N,D) MPS; D in {64,128}, N%32."""
+    return _ext.attn_multiwarp(q, k, v)

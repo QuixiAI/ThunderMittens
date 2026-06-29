@@ -246,6 +246,64 @@ static at::Tensor attn_causal_mps(const at::Tensor& q_in, const at::Tensor& k_in
   return out;
 }
 
+static at::Tensor flux_gelu_mps(const at::Tensor& x_in, const at::Tensor& w_in,
+                                const at::Tensor& bias_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "flux_gelu: x must be an MPS tensor");
+  auto x = x_in.contiguous(), w = w_in.contiguous(), bias = bias_in.contiguous();
+  TORCH_CHECK(x.dim() == 2 && w.dim() == 2 && x.size(1) == w.size(0), "flux_gelu: (N,K)@(K,M)");
+  const int N = x.size(0), K = x.size(1), M = w.size(1);
+  TORCH_CHECK(N % 32 == 0 && M % 32 == 0 && K % 16 == 0, "flux_gelu: N%32,M%32,K%16");
+  auto out = at::empty({N, M}, x.options());
+  const std::string tn = tk_type_name(x);
+  tk_encode([&](TorchEncoder& e) { tk::launch_flux_gelu(e, out, x, w, bias, N, K, M, tn); });
+  return out;
+}
+
+static at::Tensor flux_gate_mps(const at::Tensor& x_in, const at::Tensor& w_in,
+                                const at::Tensor& bias_in, const at::Tensor& gate_in,
+                                const at::Tensor& res_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "flux_gate: x must be an MPS tensor");
+  auto x = x_in.contiguous(), w = w_in.contiguous(), bias = bias_in.contiguous();
+  auto gate = gate_in.contiguous(), res = res_in.contiguous();
+  TORCH_CHECK(x.dim() == 2 && w.dim() == 2 && x.size(1) == w.size(0), "flux_gate: (N,K)@(K,M)");
+  const int N = x.size(0), K = x.size(1), M = w.size(1);
+  TORCH_CHECK(N % 32 == 0 && M % 32 == 0 && K % 16 == 0, "flux_gate: N%32,M%32,K%16");
+  auto out = at::empty({N, M}, x.options());
+  const std::string tn = tk_type_name(x);
+  tk_encode([&](TorchEncoder& e) { tk::launch_flux_gate(e, out, x, w, bias, gate, res, N, K, M, tn); });
+  return out;
+}
+
+static at::Tensor gemm_staged_mps(const at::Tensor& x_in, const at::Tensor& y_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "gemm_staged: x must be an MPS tensor");
+  auto x = x_in.contiguous(), y = y_in.contiguous();
+  TORCH_CHECK(x.dim() == 2 && y.dim() == 2 && x.size(1) == y.size(0), "gemm_staged: (N,K)@(K,M)");
+  TORCH_CHECK(x.scalar_type() == at::kFloat || x.scalar_type() == at::kBFloat16,
+              "gemm_staged: dtype float32 or bfloat16");
+  const int N = x.size(0), K = x.size(1), M = y.size(1);
+  TORCH_CHECK(N % 32 == 0 && M % 32 == 0 && K % 16 == 0, "gemm_staged: N%32,M%32,K%16");
+  auto out = at::empty({N, M}, x.options());
+  const std::string tn = tk_type_name(x);
+  tk_encode([&](TorchEncoder& e) { tk::launch_gemm_staged(e, out, x, y, N, K, M, tn); });
+  return out;
+}
+
+static at::Tensor attn_multiwarp_mps(const at::Tensor& q_in, const at::Tensor& k_in,
+                                     const at::Tensor& v_in) {
+  TORCH_CHECK(q_in.device().is_mps(), "attn_multiwarp: q must be an MPS tensor");
+  TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "attn_multiwarp: q must be bfloat16");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
+  TORCH_CHECK(q.dim() == 4, "attn_multiwarp: expects (B,H,N,D)");
+  const int B = q.size(0), H = q.size(1);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  const int D = q.size(3);
+  TORCH_CHECK(D == 64 || D == 128, "attn_multiwarp: D must be 64 or 128");
+  TORCH_CHECK(N % 32 == 0, "attn_multiwarp: N must be a multiple of 32");
+  auto out = at::empty_like(q);
+  tk_encode([&](TorchEncoder& e) { tk::launch_attn_multiwarp(e, q, k, v, out, N, H, B, D); });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
@@ -257,4 +315,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rotary", &rotary_mps, "ThunderMittens rotary/RoPE (MPS)");
   m.def("gelu", &gelu_mps, "ThunderMittens GELU (MPS)");
   m.def("attn_causal", &attn_causal_mps, "ThunderMittens causal attention (MPS)");
+  m.def("flux_gelu", &flux_gelu_mps, "ThunderMittens fused GEMM+GELU (MPS)");
+  m.def("flux_gate", &flux_gate_mps, "ThunderMittens fused GEMM+gate+residual (MPS)");
+  m.def("gemm_staged", &gemm_staged_mps, "ThunderMittens staged multi-simdgroup GEMM (MPS)");
+  m.def("attn_multiwarp", &attn_multiwarp_mps, "ThunderMittens multi-warp attention (MPS)");
 }

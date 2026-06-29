@@ -33,6 +33,10 @@ inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_stri
 inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string(D); }
 inline std::string gelu_kernel_name(int D) { return "gelu_" + std::to_string(D); }
 inline std::string attn_causal_kernel_name(int D) { return "attn_causal_" + std::to_string(D); }
+inline std::string flux_gelu_kernel_name(const std::string& t) { return "flux_gelu_" + t; }
+inline std::string flux_gate_kernel_name(const std::string& t) { return "flux_gate_" + t; }
+inline std::string gemm_staged_kernel_name(const std::string& t) { return "gemm_staged_" + t; }
+inline std::string attn_multiwarp_kernel_name(int D) { return "attn_multiwarp_" + std::to_string(D); }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -124,6 +128,53 @@ void launch_attn_causal(E& e, typename E::in_t q, typename E::in_t k, typename E
   e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
   e.bytes(N, 4); e.bytes(H, 5);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
+// ----- flux_gelu: D@0 A@1 B@2 bias@3 ; N@4 K@5 M@6 (i32) ; grid (M/32, N/32, 1) -----
+// out = gelu(A@B + bias); A (N,K), B (K,M), bias (M,).
+template <class E>
+void launch_flux_gelu(E& e, typename E::out_t d, typename E::in_t a, typename E::in_t b,
+                      typename E::in_t bias, int N, int K, int M, const std::string& t) {
+  e.pipeline(flux_gelu_kernel_name(t));
+  e.out(d, 0); e.in(a, 1); e.in(b, 2); e.in(bias, 3);
+  e.bytes(N, 4); e.bytes(K, 5); e.bytes(M, 6);
+  e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
+}
+
+// ----- flux_gate: D@0 A@1 B@2 bias@3 gate@4 residual@5 ; N@6 K@7 M@8 ; grid (M/32, N/32, 1) -----
+// out = (A@B + bias) * gate + residual.
+template <class E>
+void launch_flux_gate(E& e, typename E::out_t d, typename E::in_t a, typename E::in_t b,
+                      typename E::in_t bias, typename E::in_t gate, typename E::in_t resid,
+                      int N, int K, int M, const std::string& t) {
+  e.pipeline(flux_gate_kernel_name(t));
+  e.out(d, 0); e.in(a, 1); e.in(b, 2); e.in(bias, 3); e.in(gate, 4); e.in(resid, 5);
+  e.bytes(N, 6); e.bytes(K, 7); e.bytes(M, 8);
+  e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
+}
+
+// ----- gemm_staged: D@0 A@1 B@2 ; N@3 K@4 M@5 (i32) ; grid (M/32, N/32, 1), 64 threads
+//        (2 simdgroups) per threadgroup. A (N,K), B (K,M), out (N,M). -----
+template <class E>
+void launch_gemm_staged(E& e, typename E::out_t d, typename E::in_t a, typename E::in_t b,
+                        int N, int K, int M, const std::string& t) {
+  e.pipeline(gemm_staged_kernel_name(t));
+  e.out(d, 0); e.in(a, 1); e.in(b, 2);
+  e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
+  e.dispatch(M / 32, N / 32, 1, 64, 1, 1);  // 64 threads = 2 simdgroups
+}
+
+// ----- attn_multiwarp: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) ; grid (N/32, H, B),
+//        128 threads (4 simdgroups) per threadgroup; shared K/V across warps. -----
+template <class E>
+void launch_attn_multiwarp(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                           typename E::out_t o, unsigned N, unsigned H, int B, int D) {
+  constexpr int NUM_WARPS = 4;
+  e.pipeline(attn_multiwarp_kernel_name(D));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
+  e.bytes(N, 4); e.bytes(H, 5);
+  e.dispatch(static_cast<int>(N) / (8 * NUM_WARPS), static_cast<int>(H), B,
+             32 * NUM_WARPS, 1, 1);
 }
 
 } // namespace tk

@@ -112,3 +112,32 @@ def attn_causal(q, k, v):
     if _is_torch(q):
         return _torch().attn_causal(q, k, v)
     return _mlx().attn_causal(q, k, v)
+
+
+def flux_gelu(x, w, bias):
+    """Fused gelu(x @ w + bias). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().flux_gelu(x, w, bias)
+    return _mlx().flux_gelu(x, w, bias)
+
+
+def flux_gate(x, w, bias, gate, residual):
+    """Fused (x @ w + bias) * gate + residual. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().flux_gate(x, w, bias, gate, residual)
+    return _mlx().flux_gate(x, w, bias, gate, residual)
+
+
+def gemm_staged(x, y):
+    """Multi-simdgroup threadgroup-staged GEMM (x @ y), tile-multiple shapes.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().gemm_staged(x, y)
+    return _mlx().gemm_staged(x, y)
+
+
+def attn_multiwarp(q, k, v):
+    """Multi-warp flash attention forward (shared K/V). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().attn_multiwarp(q, k, v)
+    return _mlx().attn_multiwarp(q, k, v)

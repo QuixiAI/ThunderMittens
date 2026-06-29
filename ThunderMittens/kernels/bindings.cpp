@@ -63,6 +63,9 @@
 #include "rotary/rotary.h"
 #include "gelu/gelu.h"
 #include "attn_causal/attn_causal.h"
+#include "flux/flux.h"
+#include "gemm_staged/gemm_staged.h"
+#include "attn_multiwarp/attn_multiwarp.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -172,5 +175,54 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         causal (lower-triangular) attention forward
+      )");
+
+    m.def(
+      "flux_gelu",
+      &flux_gelu,
+      "x"_a,
+      "w"_a,
+      "bias"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        fused GEMM + GELU: gelu(x @ w + bias)
+      )");
+
+    m.def(
+      "flux_gate",
+      &flux_gate,
+      "x"_a,
+      "w"_a,
+      "bias"_a,
+      "gate"_a,
+      "residual"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        fused GEMM + gate + residual: (x @ w + bias) * gate + residual
+      )");
+
+    m.def(
+      "gemm_staged",
+      &gemm_staged,
+      "x"_a,
+      "y"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        multi-simdgroup threadgroup-staged GEMM: x @ y
+      )");
+
+    m.def(
+      "attn_multiwarp",
+      &attn_multiwarp,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        multi-warp flash attention forward (shared K/V across simdgroups)
       )");
 }

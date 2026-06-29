@@ -22,18 +22,21 @@ Drop async double-buffering for v1. Validate every kernel against an MLX/NumPy o
 | `gelu` | ✅ | bf16, D∈{256,512,768,1024} | `mx.nn.gelu_approx` | Tanh-approx GELU activation. Added `tanh` base_op (via `exp`). `kernels/gelu/` |
 | `matmul_custom` (arbitrary shapes) | `gemm/bf16_h100` | ✅ | `mx.matmul` | Any N/K/M via host zero-pad-to-tile + slice (`tk.matmul_custom`). f32/bf16. |
 | `attn_causal` | `attention/mha_h100` | ✅ | masked SDPA (additive causal) | Causal flash-attn fwd; `make_causal` on the diagonal block. `kernels/attn_causal/` |
+| `flux_gelu` / `flux_gate` | `flux/flux_gelu.cu`, `flux_gate.cu` | ✅ | gelu(x@w+b) / (x@w+b)*g+r | Fused GEMM epilogue (register `add_col`/`mul_col`/`gelu` + tile add). `kernels/flux/` |
+| `gemm_staged` | `gemm/bf16_h100` | ✅ 🏎️ | `mx.matmul` | Multi-simdgroup, threadgroup-staged GEMM (2 warps share the A block via shared mem). Competitive with `matmul_custom` and `mx.matmul`. `kernels/gemm_staged/` |
+| `attn_multiwarp` | `attention/mha_h100` | ✅ 🏎️ | SDPA (scale 1/√D) | Multi-warp flash-attn fwd (4 simdgroups share each K/V block via shared mem). Correct; not yet faster than `attn_fwd` at tested shapes (staging overhead) — perf tuning is future work. `kernels/attn_multiwarp/` |
 
 All kernels ship on **both** backends (MLX + PyTorch MPS) via `tk_launch.h`. Run all:
 `cd ThunderMittens/kernels && python -m pytest */correctness/ tk_torch/tests/ tests_parity/ -q`
-(119 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
+(163 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
+Benchmark the perf kernels: `python time_perf.py`.
 
-## Next tier (remaining work / deferred)
+## Remaining perf-tuning work (correctness complete)
 
-| Item | Status | Notes |
-|---|---|---|
-| flux **fused** gelu+matmul / gate+matmul+residual | ☐ | The GELU *activation* is done (`kernels/gelu/`); the fused flux kernels (matmul+gelu, matmul+gate+residual) still need the GEMM fusion. |
-| GEMM **performance** (shared-tile staging, real general kernel) | ☐ | Arbitrary-shape *correctness* done via padding; a staged/tuned kernel (threadgroup tiles) is the perf follow-up. |
-| Attention **multi-warp / long-context tiling** | ☐ | Causal+non-causal correctness done (warp-level, 8-row query tiles); multi-simdgroup tiling for throughput is the perf follow-up. |
+The multi-simdgroup kernels above are correct and validated; further throughput tuning is open:
+larger threadgroup tiles + double-buffered staging for GEMM, and tuned tile sizes / register
+pressure for multi-warp attention (currently the staging overhead offsets the single-warp version).
+Heavier families (sequence/state-space, quantized, distributed) remain per the inventory below.
 
 ## Later (heavier / hardware-coupled)
 

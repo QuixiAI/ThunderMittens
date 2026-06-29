@@ -154,3 +154,51 @@ def test_matmul_arbitrary_parity(nkm):
     om = tk.matmul_custom(_mk(x, "mlx", "f32"), _mk(y, "mlx", "f32"))
     ot = tk.matmul_custom(_mk(x, "torch", "f32"), _mk(y, "torch", "f32"))
     _assert_parity(om, ot, atol=1e-3)
+
+
+@pytest.mark.parametrize("nkm", [(32, 16, 32), (64, 32, 64)])
+def test_flux_gelu_parity(nkm):
+    N, K, M = nkm
+    rng = np.random.default_rng(0)
+    x = rng.random((N, K), dtype=np.float32)
+    w = rng.random((K, M), dtype=np.float32)
+    b = rng.standard_normal((M,)).astype(np.float32)
+    om = tk.flux_gelu(_mk(x, "mlx"), _mk(w, "mlx"), _mk(b, "mlx"))
+    ot = tk.flux_gelu(_mk(x, "torch"), _mk(w, "torch"), _mk(b, "torch"))
+    _assert_parity(om, ot, atol=2e-2)
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 256, 64), (1, 2, 128, 128)])
+def test_attn_multiwarp_parity(shape):
+    rng = np.random.default_rng(0)
+    q = rng.standard_normal(shape).astype(np.float32)
+    k = rng.standard_normal(shape).astype(np.float32)
+    v = rng.standard_normal(shape).astype(np.float32)
+    om = tk.attn_multiwarp(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"))
+    ot = tk.attn_multiwarp(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"))
+    _assert_parity(om, ot, atol=2e-2)
+
+
+@pytest.mark.parametrize("nkm", [(64, 32, 64), (128, 64, 128)])
+def test_gemm_staged_parity(nkm):
+    N, K, M = nkm
+    rng = np.random.default_rng(0)
+    x = rng.random((N, K), dtype=np.float32)
+    y = rng.random((K, M), dtype=np.float32)
+    om = tk.gemm_staged(_mk(x, "mlx", "f32"), _mk(y, "mlx", "f32"))
+    ot = tk.gemm_staged(_mk(x, "torch", "f32"), _mk(y, "torch", "f32"))
+    _assert_parity(om, ot, atol=1e-3)
+
+
+@pytest.mark.parametrize("nkm", [(32, 16, 32), (64, 32, 64)])
+def test_flux_gate_parity(nkm):
+    N, K, M = nkm
+    rng = np.random.default_rng(0)
+    x = rng.random((N, K), dtype=np.float32)
+    w = rng.random((K, M), dtype=np.float32)
+    b = rng.standard_normal((M,)).astype(np.float32)
+    g = rng.standard_normal((M,)).astype(np.float32)
+    r = rng.standard_normal((N, M)).astype(np.float32)
+    om = tk.flux_gate(_mk(x, "mlx"), _mk(w, "mlx"), _mk(b, "mlx"), _mk(g, "mlx"), _mk(r, "mlx"))
+    ot = tk.flux_gate(_mk(x, "torch"), _mk(w, "torch"), _mk(b, "torch"), _mk(g, "torch"), _mk(r, "torch"))
+    _assert_parity(om, ot, atol=2e-2)

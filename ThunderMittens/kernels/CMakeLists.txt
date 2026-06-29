@@ -39,6 +39,9 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/flux/flux.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/attn_multiwarp/attn_multiwarp.cpp
 )
 
 # Add include headers
@@ -69,6 +72,9 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.metal
         ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.metal
         ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.metal
+        ${CMAKE_CURRENT_LIST_DIR}/flux/flux.metal
+        ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.metal
+        ${CMAKE_CURRENT_LIST_DIR}/attn_multiwarp/attn_multiwarp.metal
         INCLUDE_DIRS
         ${PROJECT_SOURCE_DIR}
         ${MLX_INCLUDE_DIRS}

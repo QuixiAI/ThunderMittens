@@ -45,6 +45,9 @@ inline std::string hedgehog_kernel_name(int D) { return "hedgehog_" + std::to_st
 inline std::string lin_attn_causal_kernel_name(int D) { return "lin_attn_causal_" + std::to_string(D); }
 inline std::string mamba2_kernel_name(int D) { return "mamba2_" + std::to_string(D); }
 inline std::string lin_attn_decay_kernel_name(int D) { return "lin_attn_decay_" + std::to_string(D); }
+inline std::string based_kernel_name(int DQK, int DVO) {
+  return "based_" + std::to_string(DQK) + "_" + std::to_string(DVO);
+}
 inline std::string cmplx_matmul_kernel_name(const std::string& t) { return "cmplx_matmul_" + t; }
 inline std::string fftconv_kernel_name(int S) { return "fftconv_" + std::to_string(S); }
 inline std::string qgemm_kernel_name(const std::string& fmt) { return "qgemm_" + fmt; }
@@ -264,6 +267,17 @@ void launch_lin_attn_decay(E& e, typename E::in_t q, typename E::in_t k, typenam
   e.pipeline(lin_attn_decay_kernel_name(D));
   e.in(q, 0); e.in(k, 1); e.in(v, 2); e.in(cl, 3); e.out(o, 4);
   e.bytes(N, 5); e.bytes(H, 6);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
+// ----- based (Taylor feature-map linear attention): q@0 k@1 (D_QK) v@2 (D_VO) -> o@3 ; N@4 H@5 ;
+//        grid (N/8, H, B) group (32,1,1). q,k (B,H,N,16) v,o (B,H,N,64) bf16. -----
+template <class E>
+void launch_based(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                  typename E::out_t o, unsigned N, unsigned H, int B, int DQK, int DVO) {
+  e.pipeline(based_kernel_name(DQK, DVO));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
+  e.bytes(N, 4); e.bytes(H, 5);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 

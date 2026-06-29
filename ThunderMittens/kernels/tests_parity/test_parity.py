@@ -205,6 +205,18 @@ def test_lin_attn_decay_parity(shape):
     _assert_parity(om, ot, atol=1.0)
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 64), (2, 2, 128)])
+def test_based_parity(shape):
+    B, H, N = shape
+    rng = np.random.default_rng(0)
+    q = (rng.standard_normal((B, H, N, 16)) * 0.5).astype(np.float32)
+    k = (rng.standard_normal((B, H, N, 16)) * 0.5).astype(np.float32)
+    v = (rng.standard_normal((B, H, N, 64)) * 0.5).astype(np.float32)
+    om = tk.based(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"))
+    ot = tk.based(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"))
+    _assert_parity(om, ot, atol=1.0)
+
+
 @pytest.mark.parametrize("shape", [(1, 1, 16), (2, 2, 32)])
 def test_fftconv_parity(shape):
     B, H, S = shape

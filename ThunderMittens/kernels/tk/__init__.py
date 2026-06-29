@@ -189,6 +189,15 @@ def lin_attn_decay(q, k, v, slopes):
     return _mlx().lin_attn_decay(q, k, v, mx.array(cl))
 
 
+def based(q, k, v):
+    """Based 2nd-order Taylor feature-map linear attention (causal):
+    out_i = sum_{j<=i} (1 + x + x^2/2) * v_j, x = (q_i.k_j)/sqrt(D_QK). q,k (B,H,N,16); v (B,H,N,64)
+    bf16 -> (B,H,N,64). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().based(q, k, v)
+    return _mlx().based(q, k, v)
+
+
 def cmplx_matmul(a, b):
     """Complex GEMM D=A@B; operands carry a leading size-2 (real,imag) axis: a (2,N,K),
     b (2,K,M) -> (2,N,M). Accepts mlx.array or torch.Tensor (MPS)."""

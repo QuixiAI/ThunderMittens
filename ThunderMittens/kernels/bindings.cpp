@@ -72,6 +72,7 @@
 #include "lin_attn_causal/lin_attn_causal.h"
 #include "mamba2/mamba2.h"
 #include "lin_attn_decay/lin_attn_decay.h"
+#include "based/based.h"
 #include "cmplx_matmul/cmplx_matmul.h"
 #include "fftconv/fftconv.h"
 #include "qgemm/qgemm.h"
@@ -297,6 +298,16 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         decay/retention linear attention: out_i = sum_{j<=i} exp(cl_i-cl_j) (q_i.k_j) v_j; cl=-slope*pos
+      )");
+
+    m.def(
+      "based",
+      &based,
+      "q"_a, "k"_a, "v"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Based Taylor-map linear attention: out_i = sum_{j<=i} (1 + x + x^2/2) v_j, x=(q.k)/sqrt(D_QK)
       )");
 
     m.def(

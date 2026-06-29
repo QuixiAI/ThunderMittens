@@ -47,6 +47,7 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/lin_attn_causal/lin_attn_causal.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mamba2/mamba2.cpp
     ${CMAKE_CURRENT_LIST_DIR}/lin_attn_decay/lin_attn_decay.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/based/based.cpp
     ${CMAKE_CURRENT_LIST_DIR}/cmplx_matmul/cmplx_matmul.cpp
     ${CMAKE_CURRENT_LIST_DIR}/fftconv/fftconv.cpp
     ${CMAKE_CURRENT_LIST_DIR}/qgemm/qgemm.cpp
@@ -93,6 +94,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/lin_attn_causal/lin_attn_causal.metal
         ${CMAKE_CURRENT_LIST_DIR}/mamba2/mamba2.metal
         ${CMAKE_CURRENT_LIST_DIR}/lin_attn_decay/lin_attn_decay.metal
+        ${CMAKE_CURRENT_LIST_DIR}/based/based.metal
         ${CMAKE_CURRENT_LIST_DIR}/cmplx_matmul/cmplx_matmul.metal
         ${CMAKE_CURRENT_LIST_DIR}/fftconv/fftconv.metal
         ${CMAKE_CURRENT_LIST_DIR}/qgemm/qgemm.metal

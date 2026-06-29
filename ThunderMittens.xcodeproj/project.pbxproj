@@ -138,6 +138,7 @@
 				kernels/linear_attn/linear_attn.cpp,
 				kernels/mamba2/mamba2.cpp,
 				kernels/lin_attn_decay/lin_attn_decay.cpp,
+				kernels/based/based.cpp,
 				kernels/rms_norm/rms_norm.cpp,
 				kernels/rotary/rotary.cpp,
 				kernels/softmax/softmax.cpp,

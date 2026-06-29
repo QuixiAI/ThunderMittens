@@ -384,6 +384,19 @@ static at::Tensor lin_attn_decay_mps(const at::Tensor& q_in, const at::Tensor& k
   return out;
 }
 
+static at::Tensor based_mps(const at::Tensor& q_in, const at::Tensor& k_in, const at::Tensor& v_in) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.scalar_type() == at::kBFloat16, "based: q,k,v bf16 MPS");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
+  TORCH_CHECK(q.dim() == 4, "based: q,k,v expect (B,H,N,D)");
+  const int Bsz = q.size(0), H = q.size(1);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  const int DQK = q.size(3), DVO = v.size(3);
+  TORCH_CHECK(DQK == 16 && DVO == 64 && N % 8 == 0, "based: D_QK=16, D_VO=64, N%8==0");
+  auto out = at::empty_like(v);
+  tk_encode([&](TorchEncoder& e) { tk::launch_based(e, q, k, v, out, N, H, Bsz, DQK, DVO); });
+  return out;
+}
+
 static at::Tensor cmplx_matmul_mps(const at::Tensor& a_in, const at::Tensor& b_in) {
   TORCH_CHECK(a_in.device().is_mps(), "cmplx_matmul: a must be an MPS tensor");
   TORCH_CHECK(a_in.scalar_type() == at::kFloat || a_in.scalar_type() == at::kBFloat16,
@@ -601,6 +614,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lin_attn_causal", &lin_attn_causal_mps, "ThunderMittens causal linear attention (MPS)");
   m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
   m.def("lin_attn_decay", &lin_attn_decay_mps, "ThunderMittens decay/retention linear attention (MPS)");
+  m.def("based", &based_mps, "ThunderMittens Based Taylor-map linear attention (MPS)");
   m.def("cmplx_matmul", &cmplx_matmul_mps, "ThunderMittens complex GEMM (MPS)");
   m.def("fftconv", &fftconv_mps, "ThunderMittens Monarch FFT convolution (MPS)");
   m.def("qgemm", &qgemm_mps, "ThunderMittens quantized GEMM (MPS)");

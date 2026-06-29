@@ -1,14 +1,17 @@
 # Brainstorm: implementing the ThunderKittens kernels with Marlin's methods on Apple
 
-> **Status:** dequant primitive + both kernels + ALL 9 formats landed. `include/.../tile/dequant.metal`
-> (the MMA `BK=32` is decoupled from `block_k`, so any block size works), `kernels/qgemm/` (dequant-to-
-> shared → simdgroup MMA, prefill) and `kernels/qgemv/` (batch-1 decode reduction). Formats (all
-> dual-backend, validated vs `dequantize(Wq)@x`, rel ~1e-3):
-> integer — **q8_0, q4_0, q4_K (256-superblock hierarchical scales), kU4B8 (GPTQ int4 g128), kU4
-> (AWQ int4 g128 + zero-point)**; float — **fp8_e4m3, fp4_e2m1, mxfp8 (e8m0 block scale), nvfp4
-> (e4m3 block scale), mxfp4 (e8m0 block scale + e2m1)**; ternary — **bitnet (BitNet b1.58 {−1,0,+1},
-> group-32 absmean scale, 2-bit codes)**. Float decode is field-extract→widen-to-half; host uses nearest-code-in-codebook
-> so host decode == kernel decode exactly. Host quant + registry in `kernels/tk/quant.py`.
+> **Status:** complete — two substrate dequant primitives + **29 weight formats**, each on three
+> kernels (`qgemm` dequant-direct-to-fragment prefill, `qgemv` decode reduction, `qflux_gelu` fused),
+> dual-backend (MLX + PyTorch MPS), validated kernel-vs-`dequantize(Wq)@x`. Plus an integer-activation
+> decode path (`qgemv_w8a8`/`qgemv_w2a8`) and a GPTQ act-order reordering layer. The dequant substrate
+> is `include/.../tile/dequant.metal` (per-format structs + `dequant_into_shared` / the zero-shuffle
+> `dequant_into_register`); the lattice/codebook tables are auto-generated into `dequant_tables.metal`
+> (+ `tk/quant_tables.py`) from ggml-common.h. Host quant + `QUANT_FORMATS` registry in `kernels/tk/quant.py`.
+>
+> The 29 formats: integer **q8_0, q4_0, q4_1, q5_0, q5_1, q4_K, q5_K, q6_K, q2_K, q3_K, kU4B8 (GPTQ),
+> kU4 (AWQ), hqq**; codebook/i-quant **iq4_nl, iq4_xs, iq2_xxs, iq2_xs, iq3_xxs, iq1_s**; float
+> **fp8_e4m3, e5m2, fp8_block, fp4_e2m1, mxfp8, mxfp4, mxfp6_e3m2, mxfp6_e2m3, nvfp4**; ternary
+> **bitnet**. (Full per-phase detail below.)
 > Phase 6 (retrofit) demonstrated: `kernels/qflux/` — `qflux_gelu` = gelu(dequantize(Wq)@X + bias),
 > the dequant-direct-to-fragment path (zero-shuffle, like qgemm) + flux bias+GELU epilogue, all formats, dual-backend.
 > **Phase 5 DONE and is now the default `qgemm` path:** dequant-direct-to-fragment (Marlin
@@ -16,8 +19,8 @@
 > `simdgroup_matrix` register slots (using the substrate's lane→(row,col) fragment map), skipping the
 > threadgroup tile + barrier. **Bit-identical to the staged path and ~40% faster** (q4_0, 2–8K shapes)
 > — the first multi-simdgroup-style optimization that actually wins on Apple, because quantized GEMM
-> is weight-bandwidth-bound. No offline weight repack needed (per-lane gathered dequant). Remaining
-> (optional): apply the same zero-shuffle to `qflux`; attention quantized-KV.
+> is weight-bandwidth-bound. No offline weight repack needed (per-lane gathered dequant). `qflux_gelu`
+> uses the same zero-shuffle path. (Optional future work: quantized-KV attention.)
 
 > **W·A8 (parity).** Beyond weight-only (W·A16), the activation-quantized schemes work via
 > `tk.qmm(wq, x, w_format, act=...)`: `act="int8"|"fp8"` snaps activations to the 8-bit grid
@@ -33,7 +36,7 @@
 > scale + 6-bit codes packed 4-per-3-bytes). Phase 5 — layout/indexing: **hqq** (int4+zp, group 64;
 > thin kU4 variant) and **GPTQ act-order** (`tk.qgemm_actorder`: gather activations by the g_idx
 > permutation, then the standard qgemm — a load-time reordering, not a new format). All on
-> qgemm(frag)/qgemv/qflux, dual-backend, validated vs dequantize(Wq)@x. **30 weight formats total.**
+> qgemm(frag)/qgemv/qflux, dual-backend, validated vs dequantize(Wq)@x. **29 weight formats total.**
 
 > **Codebook / LUT dequant + GGUF i-quant family [Phase 2, complete].** The second new dequant
 > style: packed bits index a constant table instead of bit arithmetic. Six formats: **iq4_nl**

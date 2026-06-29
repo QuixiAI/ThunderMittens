@@ -84,18 +84,20 @@ single-simdgroup kernels on Apple GPUs, and tuning confirmed this is structural:
 - The dequant-in-register approach makes the whole quantized family feasible on Apple — dequant
   packed weights → `half` → standard `simdgroup_matrix` MMA (GEMM) or simd-reduction (GEMV). See
   `marlin-quant.md` for the plan; references: Marlin `dequant.h`, vLLM-Metal, llama.cpp `kernel_mul_mm`.
-- ✅ Done: `kernels/qgemm/` (dequant-to-shared → MMA, prefill/batched) and `kernels/qgemv/` (batch-1
-  decode, simd-reduction); dequant primitive in `include/.../tile/dequant.metal` (MMA `BK=32`
-  decoupled from `block_k`). `tk.qgemm` auto-routes M==1 → `qgemv`. **All 9 formats**, dual-backend,
-  validated vs `dequantize(Wq)@x`: integer `q8_0, q4_0, q4_K, kU4B8, kU4`; float `fp8_e4m3, fp4_e2m1,
-  mxfp8, nvfp4`.
-- ✅ Activation quant (W·A8 parity): `tk.qmm(wq, x, w_format, act="int8"|"fp8")` → fp8 W8A8, int8
-  W8A8, int8 W4A8 (snap activations to the grid + dequant-to-half GEMM; parity, not speed).
-- ✅ Quantized fused kernel: `kernels/qflux/` `qflux_gelu` = gelu(dequant(Wq)@X + bias), all formats.
-- ✅ **Dequant-direct-to-fragment** (Marlin zero-shuffle) — now the default `qgemm` path
+- ✅ Done: `kernels/qgemm/` (prefill/batched) + `kernels/qgemv/` (batch-1 decode) + `kernels/qflux/`
+  `qflux_gelu` (fused gelu(dequant(Wq)@X+bias)); dequant primitive in `include/.../tile/dequant.metal`
+  (MMA `BK=32` decoupled from `block_k`). `tk.qgemm` auto-routes M==1 → `qgemv`. **29 weight formats**,
+  dual-backend, validated vs `dequantize(Wq)@x` — integer `q8_0/q4_0/q4_1/q5_0/q5_1/q4_K/q5_K/q6_K/
+  q2_K/q3_K/kU4B8/kU4/hqq`, codebook+lattice `iq4_nl/iq4_xs/iq2_xxs/iq2_xs/iq3_xxs/iq1_s`, float
+  `fp8_e4m3/e5m2/fp8_block/fp4_e2m1/mxfp8/mxfp4/mxfp6_e3m2/mxfp6_e2m3/nvfp4`, ternary `bitnet`.
+- ✅ Activation quant: W·A8 parity via `tk.qmm(wq, x, w_format, act="int8"|"fp8")` (dequant-to-half),
+  AND a true integer-dot decode path (`idot4` primitive → `qgemv_w8a8` SmoothQuant / `qgemv_w2a8`
+  BitNet; int8×int8→int32, validated vs the integer oracle, faster than dequant-to-half on large shapes).
+- ✅ **Dequant-direct-to-fragment** (Marlin zero-shuffle) — the default `qgemm` AND `qflux_gelu` path
   (`dequant_into_register`); bit-identical to staged, **~40% faster**. The one multi-simdgroup
   optimization that wins on Apple (quantized GEMM is weight-bandwidth-bound).
-- ☐ Optional: same zero-shuffle for `qflux`; attention quantized-KV.
+- ✅ Layout/indexing: GPTQ act-order (`tk.qgemm_actorder`, g_idx reorder layer), HQQ (int4+zp g64).
+- ☐ Optional future work: quantized-KV attention.
 
 **Not applicable on Apple:**
 - `parallel/*` (`ag_gemm`, `all_reduce`, `all_gather`, `ring_attn`, `ulysses_attn`, `gemm_rs`, …) —

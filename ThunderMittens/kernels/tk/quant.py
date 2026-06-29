@@ -983,6 +983,30 @@ def dequantize_q6_K(packed):
     return out.reshape(N, nb * 256)
 
 
+# ================= Phase 5: layout/indexing variants =============================================
+# ---- hqq : HQQ int4 + per-group zero-point, group 64. { half scale; half zp; uint8 qs[32]; } = 36. ----
+def quantize_hqq(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 64
+    Wb = W.reshape(N, nb, 64); mn, mx = Wb.min(2), Wb.max(2)
+    scale = ((mx - mn) / 15.0).astype(np.float32); ssafe = np.where(scale == 0, 1.0, scale)
+    zp = np.clip(np.rint(-mn / ssafe), 0, 15).astype(np.float32)
+    q = np.clip(np.rint(Wb / ssafe[..., None] + zp[..., None]), 0, 15).astype(np.uint8)
+    out = np.zeros((N, nb, 36), np.uint8)
+    out[:, :, 0:2] = scale.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 2:4] = zp.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 4:36] = (q[:, :, 0:32] | (q[:, :, 32:64] << 4)).astype(np.uint8)
+    return out
+
+
+def dequantize_hqq(packed):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    scale = np.ascontiguousarray(p[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    zp = np.ascontiguousarray(p[:, :, 2:4]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    qs = p[:, :, 4:36].astype(np.int32)
+    nib = np.concatenate([qs & 0x0F, qs >> 4], axis=2).astype(np.float32)
+    return (scale * (nib - zp)).reshape(N, nb * 64)
+
+
 # ================= Phase 4: float sub-formats ====================================================
 def _e5m2_decode_arr(b):
     b = b.astype(np.int32); s = (b >> 7) & 1; e = (b >> 2) & 0x1F; m = b & 3
@@ -1104,6 +1128,7 @@ QUANT_FORMATS = {
     "fp8_block": (quantize_fp8_block, dequantize_fp8_block),
     "mxfp6_e3m2": (quantize_mxfp6_e3m2, dequantize_mxfp6_e3m2),
     "mxfp6_e2m3": (quantize_mxfp6_e2m3, dequantize_mxfp6_e2m3),
+    "hqq": (quantize_hqq, dequantize_hqq),
     "iq2_xs": (quantize_iq2_xs, dequantize_iq2_xs),
     "iq3_xxs": (quantize_iq3_xxs, dequantize_iq3_xxs),
     "iq1_s": (quantize_iq1_s, dequantize_iq1_s),

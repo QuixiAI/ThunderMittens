@@ -247,6 +247,19 @@ struct kU4 {
     }
 };
 
+// ---- hqq : HQQ int4 + per-group zero-point, group 64 (a thin kU4 variant at a finer group size).
+//   { half scale; half zp; uint8 qs[32]; } — 36 bytes. value = scale*(nibble - zp). ----
+struct hqq {
+    constant static constexpr const int block_k = 64, block_bytes = 36;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half scale = ((device const half*)base)[0];
+        const half zp    = ((device const half*)base)[1];
+        device const uchar* qs = base + 4;
+        const int nib = (col < 32) ? (qs[col] & 0x0F) : (qs[col - 32] >> 4);
+        return scale * (half(nib) - zp);
+    }
+};
+
 // ---- float-code decoders (pure IEEE bit/field math; widen to half) ----
 // fp8 e4m3 (1-4-3, bias 7, no inf): value = (-1)^s * (1 + m/8) * 2^(e-7), subnormal at e==0.
 METAL_FUNC half tk_e4m3_decode(uchar v) {

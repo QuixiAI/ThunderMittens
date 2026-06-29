@@ -207,6 +207,20 @@ def qgemm_direct(wq, x, format="q8_0"):
     return _mlx().qgemm_direct(wq, x, format=format)
 
 
+def qgemm_actorder(wq, x, perm, w_format="kU4B8"):
+    """GPTQ act-order (desc_act): the weight is quantized in g_idx-permuted column (K) order so its
+    groups are contiguous; recover W@X by gathering the activation rows by the same permutation, then
+    running the standard qgemm. `perm` is a length-K index array (= argsort(g_idx)). A load-time
+    reordering layer, not a new format. Accepts mlx.array or torch.Tensor (MPS)."""
+    import numpy as np
+    if _is_torch(x):
+        import torch
+        idx = torch.as_tensor(np.asarray(perm), dtype=torch.long, device=x.device)
+        return qgemm(wq, x.index_select(0, idx), w_format)
+    import mlx.core as mx
+    return qgemm(wq, mx.take(x, mx.array(np.asarray(perm, np.int32)), axis=0), w_format)
+
+
 def qgemv_w8a8(wq, xq, w_scale, a_scale):
     """W8A8/SmoothQuant decode GEMV: int8 weight (N,K) x int8 act (K,1) -> int32, *w_scale[n]*a_scale.
     w_scale (N,) half, a_scale (1,) half -> (N,1) half. Accepts mlx.array or torch.Tensor (MPS)."""

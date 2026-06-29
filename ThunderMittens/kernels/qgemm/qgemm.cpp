@@ -26,6 +26,7 @@ namespace mlx::core {
 static int format_block_k(const std::string& fmt) {
   if (fmt == "q4_K" || fmt == "iq4_xs" || fmt == "iq2_xxs" || fmt == "iq2_xs" || fmt == "iq3_xxs" || fmt == "iq1_s" || fmt == "q2_K" || fmt == "q3_K" || fmt == "q5_K" || fmt == "q6_K") return 256;
   if (fmt == "kU4B8" || fmt == "kU4" || fmt == "fp8_block") return 128;
+  if (fmt == "hqq") return 64;
   if (fmt == "nvfp4") return 16;
   return 32;  // q8_0, q4_0, fp8_e4m3, fp4_e2m1, mxfp8
 }

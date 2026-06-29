@@ -25,6 +25,16 @@
 > reproducing **fp8 W8A8, int8 W8A8, int8 W4A8** fake-quant numerics. Apple has no int8/fp8 matmul,
 > so this is parity, not speed. W4A16 / W8A16 are just `act=None`.
 
+> **Fan-out [Phases 3–5, complete].** Phase 3 — GGUF k-quant + legacy: **q2_K, q3_K, q5_K, q6_K**
+> (256-superblock; q3_K's 16 6-bit signed scales via kmask packing, q5_K reuses q4_K's
+> get_scale_min_k4, q6_K int8 scales) and **q4_1, q5_0, q5_1** (legacy 32-block; `_1` asymmetric
+> d*q+m; q5_* 5th bit in a qh uint32). Phase 4 — float sub-formats: **e5m2** (fp8 1-5-2),
+> **fp8_block** (128×128 block-scaled e4m3, tile scale replicated per row), **mxfp6 e3m2/e2m3** (e8m0
+> scale + 6-bit codes packed 4-per-3-bytes). Phase 5 — layout/indexing: **hqq** (int4+zp, group 64;
+> thin kU4 variant) and **GPTQ act-order** (`tk.qgemm_actorder`: gather activations by the g_idx
+> permutation, then the standard qgemm — a load-time reordering, not a new format). All on
+> qgemm(frag)/qgemv/qflux, dual-backend, validated vs dequantize(Wq)@x. **30 weight formats total.**
+
 > **Codebook / LUT dequant + GGUF i-quant family [Phase 2, complete].** The second new dequant
 > style: packed bits index a constant table instead of bit arithmetic. Six formats: **iq4_nl**
 > (16-entry non-linear int4 codebook), **iq4_xs** (256-superblock iq4_nl, 6-bit sub-scales), and the

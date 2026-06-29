@@ -251,4 +251,59 @@ template [[host_name("qgemm_blockscale_fp8_raw")]] [[kernel]] void qgemm_blocksc
     const constant int &M [[buffer(6)]],
     uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
 
+// ---- qgemm_fp8_scaled: BOTH operands fp8 e4m3 (codes only), rank-1 scaled. W is fp8 (N,K), X is fp8
+// (K,M); both are decoded to half into the fragment, a standard half MMA, then the output is scaled by
+// w_scale[n] (per output channel) * a_scale[m] (per token) — the SmoothQuant/fp8-scaled epilogue. The
+// scale is applied in the d_reg epilogue (per-element row/col index) to avoid tile-vector orientation. ----
+kernel void qgemm_fp8_scaled(
+    device   half*  D       [[buffer(0)]],
+    device   uchar* Wq      [[buffer(1)]],   // (N, K) fp8 e4m3 codes
+    device   uchar* Xq      [[buffer(2)]],   // (K, M) fp8 e4m3 codes
+    device   half*  w_scale [[buffer(3)]],   // (N,) per output channel
+    device   half*  a_scale [[buffer(4)]],   // (M,) per token
+    const constant int &N [[buffer(5)]],
+    const constant int &K [[buffer(6)]],
+    const constant int &M [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr const int BN = 32, BK = 32, BM = 32;
+    using gl_h = gl<half, 1, 1, -1, -1>;
+    gl_h gl_d(D, nullptr, nullptr, N, M);
+    rt<half, BN, BK> w_reg;
+    rt<half, BK, BM> x_reg;
+    rt<float, BN, BM> d_reg;
+    zero(d_reg);
+    const int by = tgid.y, bx = tgid.x;
+    const int qid = (int)lane / 4;
+    const int simd_y = (qid & 4) + ((int)lane / 2) % 4;
+    const int simd_x = (qid & 2) * 2 + ((int)lane % 2) * 2;
+    for (int kb = 0; kb < K / BK; kb++) {
+        dequant_into_register<fp8_raw>(w_reg, Wq, N, K, by, kb, lane);   // W fp8 -> half fragment
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < x_reg.height; i++) {
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < x_reg.width; j++) {
+                const int kr = kb * BK + i * mittens::TILE_DIM + simd_y;
+                const int col = bx * BM + j * mittens::TILE_DIM + simd_x;
+                x_reg.tiles[i][j].data.thread_elements()[0] = tk_e4m3_decode(Xq[(uint)kr * M + col]);
+                x_reg.tiles[i][j].data.thread_elements()[1] = tk_e4m3_decode(Xq[(uint)kr * M + col + 1]);
+            }
+        }
+        mma_AB(d_reg, w_reg, x_reg, d_reg);
+    }
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < d_reg.height; i++) {
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < d_reg.width; j++) {
+            const int row = by * BN + i * mittens::TILE_DIM + simd_y;
+            const int col = bx * BM + j * mittens::TILE_DIM + simd_x;
+            const float ws = (float)w_scale[row];
+            d_reg.tiles[i][j].data.thread_elements()[0] *= ws * (float)a_scale[col];
+            d_reg.tiles[i][j].data.thread_elements()[1] *= ws * (float)a_scale[col + 1];
+        }
+    }
+    store(gl_d, d_reg, {0, 0, by, bx}, lane);
+}
+// non-template kernel: Metal symbol is the namespaced "mittens::qgemm_fp8_scaled" (see launcher).
+
 }

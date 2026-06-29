@@ -265,6 +265,15 @@ def qgemm_fp8_block2d(wq, x, scale2d):
     return _mlx().qgemm_blockscale(wq, x, scale2d)
 
 
+def qgemm_fp8_scaled(wq, xq, w_scale, a_scale):
+    """fp8 rank-1 scaled GEMM: BOTH operands fp8 e4m3 codes (wq (N,K), xq (K,M)), per-channel w_scale (N,)
+    and per-token a_scale (M,) f16 -> (N,M) f16. out[n,m]=w_scale[n]*a_scale[m]*sum_k dequant·dequant.
+    The fp8 analog of W8A8/SmoothQuant. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(wq):
+        return _torch().qgemm_fp8_scaled(wq, xq, w_scale, a_scale)
+    return _mlx().qgemm_fp8_scaled(wq, xq, w_scale, a_scale)
+
+
 def qgemv_w8a8(wq, xq, w_scale, a_scale):
     """W8A8/SmoothQuant decode GEMV: int8 weight (N,K) x int8 act (K,1) -> int32, *w_scale[n]*a_scale.
     w_scale (N,) half, a_scale (1,) half -> (N,1) half. Accepts mlx.array or torch.Tensor (MPS)."""

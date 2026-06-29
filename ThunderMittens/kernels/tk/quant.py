@@ -409,6 +409,16 @@ def quantize_act_fp8(X):
     return (_e4m3_decode_arr(codes) * s), codes, s
 
 
+def quantize_fp8_scaled(W):
+    """fp8 e4m3 weight with a per-output-channel (per-row) scale, for the rank-1 fp8-scaled GEMM.
+    W (N,K) -> codes (N,K) uint8, w_scale (N,) f16; reconstruct as w_scale[:,None] * e4m3(codes)."""
+    W = np.ascontiguousarray(W, np.float32)
+    s = (np.abs(W).max(axis=1) / 448.0).astype(np.float32)                  # (N,) per channel
+    ssafe = np.where(s == 0, 1.0, s)
+    codes = _nearest(W / ssafe[:, None], _E4M3_CODES, _E4M3_VALS)           # (N,K) uint8
+    return codes.astype(np.uint8), s.astype(np.float16)
+
+
 ACT_FORMATS = {"int8": quantize_act_int8, "fp8": quantize_act_fp8}
 
 

@@ -203,6 +203,11 @@ def qgemm_blockscale(wq, x, scale2d):
     return _ext.qgemm_blockscale(wq, x, scale2d)
 
 
+def qgemm_fp8_scaled(wq, xq, w_scale, a_scale):
+    """fp8 rank-1 scaled GEMM: both operands fp8 e4m3 codes; w_scale (N,), a_scale (M,) f16. MPS."""
+    return _ext.qgemm_fp8_scaled(wq, xq, w_scale, a_scale)
+
+
 def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
     """Quantized GEMV (batch-1 decode): out = dequantize(wq) @ x. x (K, 1) float16 -> (N, 1). MPS."""
     return _ext.qgemv(wq, x, format)

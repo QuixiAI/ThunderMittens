@@ -296,6 +296,24 @@ def test_qgemv_w2a8_parity(nk):
     _assert_parity(om, ot, atol=atol)
 
 
+@pytest.mark.parametrize("nkm", [(64, 256, 64), (128, 512, 128)])
+def test_qgemm_fp8_scaled_parity(nkm):
+    from tk.quant import quantize_fp8_scaled, quantize_act_fp8
+    N, K, M = nkm
+    rng = np.random.default_rng(0)
+    W = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    X = rng.standard_normal((K, M)).astype(np.float32)
+    wq, ws = quantize_fp8_scaled(W)
+    _, xq, s = quantize_act_fp8(X)
+    asc = s[0, :].astype(np.float16)
+    om = tk.qgemm_fp8_scaled(mx.array(wq), mx.array(xq), mx.array(ws), mx.array(asc))
+    ot = tk.qgemm_fp8_scaled(torch.from_numpy(wq).to("mps"), torch.from_numpy(xq).to("mps"),
+                             torch.from_numpy(ws).to("mps"), torch.from_numpy(asc).to("mps"))
+    mx.eval(om)
+    atol = max(1e-2, 3e-3 * float(mx.max(mx.abs(om)).item()))
+    _assert_parity(om, ot, atol=atol)
+
+
 @pytest.mark.parametrize("nkm", [(32, 16, 32), (64, 32, 64)])
 def test_cmplx_matmul_parity(nkm):
     N, K, M = nkm

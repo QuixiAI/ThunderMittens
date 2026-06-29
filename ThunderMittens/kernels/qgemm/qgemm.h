@@ -30,6 +30,24 @@ array qgemm_actorder_k(const array& wq, const array& x, const array& perm,
 // x (K,M) f16 -> (N,M) f16. The storage-optimal fp8_block (no per-row scale replication).
 array qgemm_blockscale(const array& wq, const array& x, const array& scale2d, StreamOrDevice s = {});
 
+// fp8 rank-1 scaled GEMM: both operands fp8 e4m3 codes (wq (N,K), xq (K,M)), per-channel w_scale (N,)
+// and per-token a_scale (M,) fp16 -> (N,M) f16. out[n,m] = w_scale[n]*a_scale[m]*sum_k dequant·dequant.
+array qgemm_fp8_scaled(const array& wq, const array& xq, const array& w_scale, const array& a_scale,
+                       StreamOrDevice s = {});
+
+class QGemmFp8Scaled : public Primitive {
+ public:
+  explicit QGemmFp8Scaled(Stream stream) : Primitive(stream) {};
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(const std::vector<array>&, const std::vector<int>&) override;
+  void print(std::ostream& os) override { os << "QGemmFp8Scaled"; }
+  bool is_equivalent(const Primitive& other) const override { return typeid(*this) == typeid(other); }
+  void eval(const std::vector<array>&, std::vector<array>&);
+};
+
 class QGemmBlockScale : public Primitive {
  public:
   explicit QGemmBlockScale(Stream stream) : Primitive(stream) {};

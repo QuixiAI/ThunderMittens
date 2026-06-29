@@ -432,6 +432,20 @@ static at::Tensor qgemm_blockscale_mps(const at::Tensor& wq_in, const at::Tensor
   return out;
 }
 
+static at::Tensor qgemm_fp8_scaled_mps(const at::Tensor& wq_in, const at::Tensor& xq_in,
+                                       const at::Tensor& ws_in, const at::Tensor& as_in) {
+  TORCH_CHECK(wq_in.device().is_mps() && wq_in.scalar_type() == at::kByte && xq_in.scalar_type() == at::kByte,
+              "qgemm_fp8_scaled: wq, xq must be uint8 (fp8 codes) MPS");
+  TORCH_CHECK(ws_in.scalar_type() == at::kHalf && as_in.scalar_type() == at::kHalf,
+              "qgemm_fp8_scaled: w_scale, a_scale f16");
+  auto wq = wq_in.contiguous(), xq = xq_in.contiguous(), ws = ws_in.contiguous(), as = as_in.contiguous();
+  const int N = wq.size(0), K = wq.size(1), M = xq.size(1);
+  TORCH_CHECK(xq.size(0) == K && N % 32 == 0 && M % 32 == 0 && K % 32 == 0, "qgemm_fp8_scaled: shapes");
+  auto out = at::empty({N, M}, ws.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_qgemm_fp8_scaled(e, out, wq, xq, ws, as, N, K, M); });
+  return out;
+}
+
 static at::Tensor qgemm_actorder_k_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
                                        const at::Tensor& perm_in, const std::string& format) {
   TORCH_CHECK(wq_in.device().is_mps() && wq_in.scalar_type() == at::kByte, "qgemm_actorder_k: wq uint8 MPS");
@@ -575,6 +589,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fftconv", &fftconv_mps, "ThunderMittens Monarch FFT convolution (MPS)");
   m.def("qgemm", &qgemm_mps, "ThunderMittens quantized GEMM (MPS)");
   m.def("qgemm_blockscale", &qgemm_blockscale_mps, "ThunderMittens fp8_block2d GEMM (MPS)");
+  m.def("qgemm_fp8_scaled", &qgemm_fp8_scaled_mps, "ThunderMittens fp8 rank-1 scaled GEMM (MPS)");
   m.def("qgemm_actorder_k", &qgemm_actorder_k_mps, "ThunderMittens GPTQ act-order qgemm, in-kernel gather (MPS)");
   m.def("qgemv", &qgemv_mps, "ThunderMittens quantized GEMV decode (MPS)");
   m.def("qflux_gelu", &qflux_gelu_mps, "ThunderMittens quantized fused GEMM+GELU (MPS)");

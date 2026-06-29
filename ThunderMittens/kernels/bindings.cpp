@@ -333,6 +333,12 @@ NB_MODULE(_ext, m) {
       R"(fp8_block2d: codes-only fp8 weights + separate (N/128,K/128) tile scale -> dequant @ x)");
 
     m.def(
+      "qgemm_fp8_scaled", &qgemm_fp8_scaled,
+      "wq"_a, "xq"_a, "w_scale"_a, "a_scale"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fp8 rank-1 scaled GEMM: both operands fp8 e4m3 -> dequant @ dequant, *w_scale[n]*a_scale[m])");
+
+    m.def(
       "qgemm_actorder_k", &qgemm_actorder_k,
       "wq"_a, "x"_a, "perm"_a, "format"_a = "kU4B8",
       nb::kw_only(), "stream"_a = nb::none(),

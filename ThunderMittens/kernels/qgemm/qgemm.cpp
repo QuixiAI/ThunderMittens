@@ -82,6 +82,37 @@ array qgemm_blockscale(const array& wq, const array& x, const array& scale2d, St
                std::make_shared<QGemmBlockScale>(to_stream(s)), {wq, x, scale2d});
 }
 
+array qgemm_fp8_scaled(const array& wq, const array& xq, const array& w_scale, const array& a_scale,
+                       StreamOrDevice s) {
+  assert(wq.dtype() == uint8 && xq.dtype() == uint8);
+  assert(w_scale.dtype() == float16 && a_scale.dtype() == float16);
+  assert(wq.ndim() == 2 && xq.ndim() == 2);
+  const int N = wq.shape(0), K = wq.shape(1), M = xq.shape(1);
+  assert(xq.shape(0) == K && N % 32 == 0 && M % 32 == 0 && K % 32 == 0);
+  (void)N; (void)K; (void)M;
+  return array({N, M}, float16,
+               std::make_shared<QGemmFp8Scaled>(to_stream(s)), {wq, xq, w_scale, a_scale});
+}
+
+void QGemmFp8Scaled::eval(const std::vector<array>&, std::vector<array>&) { assert(false); }
+void QGemmFp8Scaled::eval_cpu(const std::vector<array>& in, std::vector<array>& out) { eval(in, out); }
+void QGemmFp8Scaled::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& wq = inputs[0]; auto& xq = inputs[1]; auto& ws = inputs[2]; auto& as = inputs[3];
+  auto& out = outputs[0];
+  auto& s = stream(); auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int N = wq.shape(0), K = wq.shape(1), M = xq.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_qgemm_fp8_scaled(enc, out, wq, xq, ws, as, N, K, M);
+}
+std::vector<array> QGemmFp8Scaled::jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("QGemmFp8Scaled has no jvp."); }
+std::vector<array> QGemmFp8Scaled::vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("QGemmFp8Scaled has no vjp."); }
+std::pair<std::vector<array>, std::vector<int>> QGemmFp8Scaled::vmap(const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("QGemmFp8Scaled has no vmap."); }
+
 void QGemmBlockScale::eval(const std::vector<array>&, std::vector<array>&) { assert(false); }
 void QGemmBlockScale::eval_cpu(const std::vector<array>& in, std::vector<array>& out) { eval(in, out); }
 void QGemmBlockScale::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {

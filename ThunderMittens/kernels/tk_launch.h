@@ -303,6 +303,17 @@ void launch_qgemm_actorder(E& e, typename E::out_t d, typename E::in_t wq, typen
   e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
 }
 
+// ----- qgemm_fp8_scaled: both operands fp8 e4m3, rank-1 scaled. D@0 Wq@1(N,K fp8) Xq@2(K,M fp8)
+//        w_scale@3(N) a_scale@4(M) ; N@5 K@6 M@7 ; grid (M/32, N/32, 1), 32 threads. -----
+template <class E>
+void launch_qgemm_fp8_scaled(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t xq,
+                             typename E::in_t wscale, typename E::in_t ascale, int N, int K, int M) {
+  e.pipeline("mittens::qgemm_fp8_scaled");
+  e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(wscale, 3); e.in(ascale, 4);
+  e.bytes(N, 5); e.bytes(K, 6); e.bytes(M, 7);
+  e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
+}
+
 // ----- qgemm_blockscale (fp8_block2d): D@0 Wq@1(codes) X@2 scale2d@3 ; N@4 K@5 M@6 ; grid
 //        (M/32, N/32, 1), 32 threads. Separate (N/128,K/128) tile scale. -----
 template <class E>

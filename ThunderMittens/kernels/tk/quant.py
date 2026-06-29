@@ -557,29 +557,64 @@ def dequantize_iq2_xxs(packed):
     return out.reshape(N, nb * 256)
 
 
+def _even_parity_signs(seg):
+    """seg (...,8): return 7-bit sign index with even total parity (ggml flips the smallest-|x|
+    element when the negative count is odd, so the decoder's parity bit reconstructs exactly)."""
+    neg = (seg < 0)
+    patt = np.zeros(seg.shape[:-1], np.uint32)
+    for i in range(8):
+        patt |= (neg[..., i].astype(np.uint32) << i)
+    pc = np.zeros(seg.shape[:-1], np.int32)
+    for i in range(8):
+        pc += ((patt >> i) & 1).astype(np.int32)
+    odd = (pc & 1) == 1
+    imin = np.abs(seg).argmin(-1)                                # smallest |x| element
+    flip = (np.uint32(1) << imin.astype(np.uint32))
+    patt = np.where(odd, patt ^ flip, patt)
+    return (patt & 0x7F)
+
+
+def _iq_grid_scale(magB, gmag, n_oct, init_div, iters=3):
+    """Fit a per-block scale dl and per-octet grid index by alternating nearest-grid / LS refit.
+    magB (...,32) block magnitudes; gmag (G,8); returns dl (...,), gidx list of n_oct arrays (...,)."""
+    csz = magB.shape[-1] // n_oct                                # coords per octet (8 for iq2, 4 for iq3)
+    amax = magB.max(-1)
+    dl = (amax / init_div).astype(np.float32)
+    oct = magB.reshape(magB.shape[:-1] + (n_oct, csz))
+    gidx = None
+    for _ in range(iters):
+        dls = np.where(dl == 0, 1.0, dl)
+        sumxq = np.zeros(dl.shape, np.float32); sumq2 = np.zeros(dl.shape, np.float32); gidx = []
+        for s in range(n_oct):
+            oseg = oct[..., s, :]
+            tgt = oseg / dls[..., None]
+            g = ((tgt[..., None, :] - gmag) ** 2).sum(-1).argmin(-1)   # (...,) nearest grid index
+            q = gmag[g]
+            sumxq += (oseg * q).sum(-1); sumq2 += (q * q).sum(-1)
+            gidx.append(g)
+        dl = np.where(sumq2 > 0, sumxq / np.where(sumq2 == 0, 1.0, sumq2), dl).astype(np.float32)
+    return dl, gidx
+
+
 def quantize_iq2_xxs(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
-    Wsb = W.reshape(N, nb, 8, 32)
-    dl_target = (np.abs(Wsb).mean(axis=3) / 8.0).astype(np.float32)               # ~ mean grid mag 8
-    d = (4.0 * dl_target).max(axis=2) / 15.5                                      # (N,nb) super scale
-    dsafe = np.where(d == 0, 1.0, d).astype(np.float32)
-    s4 = np.clip(np.rint(4.0 * dl_target / dsafe[..., None] - 0.5), 0, 15).astype(np.int32)
-    dl = dsafe[..., None] * (0.5 + s4) * 0.25
-    dlsafe = np.where(dl == 0, 1.0, dl)
+    Wsb = W.reshape(N, nb, 8, 32); mag = np.abs(Wsb)
+    dl, _ = _iq_grid_scale(mag, _IQ2XXS_GMAG, 4, 43.0)            # (N,nb,8) effective sub-scale
+    d = (dl.max(-1) / 3.875).astype(np.float32)                  # dl = d*(0.5+s4)*0.25, s4<=15 -> 3.875
+    dsafe = np.where(d == 0, 1.0, d)
+    s4 = np.clip(np.rint(dl / dsafe[..., None] / 0.25 - 0.5), 0, 15).astype(np.int32)
+    d16 = d.astype(np.float16).astype(np.float32)
+    dl_q = d16[..., None] * (0.5 + s4) * 0.25; dls = np.where(dl_q == 0, 1.0, dl_q)
     qs = np.zeros((N, nb, 32), np.uint16)
     for ib in range(8):
         aux_s = (s4[:, :, ib].astype(np.uint32) << 28)
         aux_g = np.zeros((N, nb), np.uint32)
         for sub in range(4):
-            seg = Wsb[:, :, ib, sub * 8:sub * 8 + 8]                              # (N,nb,8)
-            target = np.abs(seg) / dlsafe[:, :, ib, None]
-            dist = ((target[..., None, :] - _IQ2XXS_GMAG[None, None, :, :]) ** 2).sum(-1)  # (N,nb,256)
-            g = dist.argmin(-1).astype(np.uint32)
+            seg = Wsb[:, :, ib, sub * 8:sub * 8 + 8]
+            tgt = np.abs(seg) / dls[:, :, ib, None]
+            g = ((tgt[..., None, :] - _IQ2XXS_GMAG[None, None]) ** 2).sum(-1).argmin(-1).astype(np.uint32)
             aux_g |= (g << (8 * sub))
-            patt = np.zeros((N, nb), np.uint32)
-            for i in range(8):
-                patt |= ((seg[..., i] < 0).astype(np.uint32) << i)
-            aux_s |= ((patt & 0x7F) << (7 * sub))
+            aux_s |= (_even_parity_signs(seg).astype(np.uint32) << (7 * sub))
         qs[:, :, 4 * ib + 0] = (aux_g & 0xFFFF).astype(np.uint16)
         qs[:, :, 4 * ib + 1] = (aux_g >> 16).astype(np.uint16)
         qs[:, :, 4 * ib + 2] = (aux_s & 0xFFFF).astype(np.uint16)
@@ -628,26 +663,23 @@ def dequantize_iq2_xs(packed):
 
 def quantize_iq2_xs(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
-    Wsb = W.reshape(N, nb, 8, 32)
-    Whalf = Wsb.reshape(N, nb, 8, 2, 16)
-    dl_t = (np.abs(Whalf).mean(axis=4) / 8.0).astype(np.float32)                   # (N,nb,8,2)
-    d = (4.0 * dl_t).reshape(N, nb, 16).max(axis=2) / 15.5
-    dsafe = np.where(d == 0, 1.0, d).astype(np.float32)
-    sc4 = np.clip(np.rint(4.0 * dl_t / dsafe[..., None, None] - 0.5), 0, 15).astype(np.int32)
-    dl = dsafe[..., None, None] * (0.5 + sc4) * 0.25
+    Wsb = W.reshape(N, nb, 8, 32); mag = np.abs(Wsb)
+    dl_t, _ = _iq_grid_scale(mag.reshape(N, nb, 16, 16), _IQ2XS_GMAG, 2, 43.0)     # per 16-half (N,nb,16)
+    dl_t = dl_t.reshape(N, nb, 8, 2)
+    d = (dl_t.reshape(N, nb, 16).max(-1) / 3.875).astype(np.float32)
+    dsafe = np.where(d == 0, 1.0, d)
+    sc4 = np.clip(np.rint(dl_t / dsafe[..., None, None] / 0.25 - 0.5), 0, 15).astype(np.int32)
+    d16 = d.astype(np.float16).astype(np.float32)
+    dl = d16[..., None, None] * (0.5 + sc4) * 0.25; dls = np.where(dl == 0, 1.0, dl)
     qs = np.zeros((N, nb, 32), np.uint16); scales = np.zeros((N, nb, 8), np.uint8)
     for ib in range(8):
         for il in range(2):
             scales[:, :, ib] |= (sc4[:, :, ib, il].astype(np.uint8) << (4 * il))
             for sub2 in range(2):
                 seg = Wsb[:, :, ib, il * 16 + sub2 * 8: il * 16 + sub2 * 8 + 8]
-                dlh = dl[:, :, ib, il][..., None]
-                target = np.abs(seg) / np.where(dlh == 0, 1.0, dlh)
-                g = (((target[..., None, :] - _IQ2XS_GMAG[None, None]) ** 2).sum(-1)).argmin(-1).astype(np.uint32)
-                patt = np.zeros((N, nb), np.uint32)
-                for i in range(8):
-                    patt |= ((seg[..., i] < 0).astype(np.uint32) << i)
-                qs[:, :, 4 * ib + 2 * il + sub2] = ((g & 511) | ((patt & 0x7F) << 9)).astype(np.uint16)
+                tgt = np.abs(seg) / dls[:, :, ib, il, None]
+                g = (((tgt[..., None, :] - _IQ2XS_GMAG[None, None]) ** 2).sum(-1)).argmin(-1).astype(np.uint32)
+                qs[:, :, 4 * ib + 2 * il + sub2] = ((g & 511) | (_even_parity_signs(seg).astype(np.uint32) << 9)).astype(np.uint16)
     out = np.zeros((N, nb, 74), np.uint8)
     out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
     out[:, :, 2:66] = qs.view(np.uint8).reshape(N, nb, 64)
@@ -677,13 +709,13 @@ def dequantize_iq3_xxs(packed):
 
 def quantize_iq3_xxs(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
-    Wsb = W.reshape(N, nb, 8, 32)
-    mg = float(_IQ3XXS_GMAG.mean())
-    dl_t = (np.abs(Wsb).mean(axis=3) / mg).astype(np.float32)                       # (N,nb,8)
-    d = (2.0 * dl_t).max(axis=2) / 15.5
-    dsafe = np.where(d == 0, 1.0, d).astype(np.float32)
-    s4 = np.clip(np.rint(2.0 * dl_t / dsafe[..., None] - 0.5), 0, 15).astype(np.int32)
-    dl = dsafe[..., None] * (0.5 + s4) * 0.5
+    Wsb = W.reshape(N, nb, 8, 32); mag = np.abs(Wsb)
+    dl_t, _ = _iq_grid_scale(mag, _IQ3XXS_GMAG, 8, 62.0)                            # per block-of-32 (8 quads of 4)
+    d = (dl_t.max(-1) / (15.5 * 0.5)).astype(np.float32)                           # dl = d*(0.5+s4)*0.5
+    dsafe = np.where(d == 0, 1.0, d)
+    s4 = np.clip(np.rint(dl_t / dsafe[..., None] / 0.5 - 0.5), 0, 15).astype(np.int32)
+    d16 = d.astype(np.float16).astype(np.float32)
+    dl = d16[..., None] * (0.5 + s4) * 0.5
     q3 = np.zeros((N, nb, 64), np.uint8); gas = np.zeros((N, nb, 16), np.uint16)
     for ib in range(8):
         aux32 = (s4[:, :, ib].astype(np.uint32) << 28)
@@ -694,14 +726,9 @@ def quantize_iq3_xxs(W):
                 target = np.abs(seg) / dlsafe
                 g = (((target[..., None, :] - _IQ3XXS_GMAG[None, None]) ** 2).sum(-1)).argmin(-1)
                 q3[:, :, 8 * ib + 4 * il + r] = g.astype(np.uint8)
-            for h in range(2):
-                patt = np.zeros((N, nb), np.uint32)
-                for sub_r in range(2):
-                    r = 2 * h + sub_r
-                    seg = Wsb[:, :, ib, il * 16 + r * 4: il * 16 + r * 4 + 4]
-                    for i in range(4):
-                        patt |= ((seg[..., i] < 0).astype(np.uint32) << (i + 4 * sub_r))
-                aux32 |= ((patt & 0x7F) << (14 * il + 7 * h))
+            for h in range(2):                                                     # 7-bit signs per octet (2 quads)
+                seg8 = Wsb[:, :, ib, il * 16 + h * 8: il * 16 + h * 8 + 8]
+                aux32 |= (_even_parity_signs(seg8).astype(np.uint32) << (14 * il + 7 * h))
         gas[:, :, 2 * ib] = (aux32 & 0xFFFF).astype(np.uint16)
         gas[:, :, 2 * ib + 1] = (aux32 >> 16).astype(np.uint16)
     out = np.zeros((N, nb, 98), np.uint8)
@@ -737,27 +764,30 @@ def dequantize_iq1_s(packed):
 def quantize_iq1_s(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
     Wsb = W.reshape(N, nb, 8, 32)
-    # 3-bit scale: dl = d*(2*sc+1), sc in 0..7. ml ~ -dl. target nibble ~ (w - ml)/dl ~ w/dl + 1.
-    dl_t = (np.abs(Wsb).max(axis=3) / 7.0).astype(np.float32)                       # rough
-    d = dl_t.max(axis=2) / 15.0
+    # value = dl*nib + ml, nib in {0,1,2} (grid), ml = dl*(-1 +/- DELTA); dl = d*(2*sc+1), sc 0..7.
+    # So levels ~ {-1,0,+1}*dl: dl ~ amax. Fit grids at the neutral ml=-dl, then pick the +/-DELTA sign.
+    amax = np.abs(Wsb).max(axis=3)                                                  # (N,nb,8) ~ dl
+    d = (amax.max(axis=2) / 15.0).astype(np.float32)
     dsafe = np.where(d == 0, 1.0, d).astype(np.float32)
-    sc = np.clip(np.rint((dl_t / dsafe[..., None] - 1) / 2), 0, 7).astype(np.int32)  # (N,nb,8)
-    dl = dsafe[..., None] * (2 * sc + 1)
+    sc = np.clip(np.rint((amax / dsafe[..., None] - 1) / 2), 0, 7).astype(np.int32)  # (N,nb,8)
+    d16 = d.astype(np.float16).astype(np.float32)
+    dl = d16[..., None] * (2 * sc + 1)                                             # (N,nb,8)
     qs = np.zeros((N, nb, 32), np.uint8); qh = np.zeros((N, nb, 8), np.uint16)
     for ib in range(8):
-        dlsafe = np.where(dl[:, :, ib] == 0, 1.0, dl[:, :, ib])[..., None]
-        ml = -dl[:, :, ib][..., None] * (1.0 - IQ1S_DELTA)                          # sign bit = 0
-        qhv = (sc[:, :, ib].astype(np.uint32) << 12)                                # scale bits
+        dlb = dl[:, :, ib]; dlsafe = np.where(dlb == 0, 1.0, dlb)[..., None]
+        ml0 = -dlb[..., None]                                                       # neutral offset
+        qhv = (sc[:, :, ib].astype(np.uint32) << 12)
+        sum_base = np.zeros((N, nb), np.float32)
         for il in range(2):
-            for grid_sel in range(2):                                              # two grid entries
-                cols = (il * 16 + grid_sel * 8)
-                seg = Wsb[:, :, ib, cols: cols + 8]                                # 8 weights
-                target = (seg - ml) / dlsafe                                       # ~ nibble
+            for grid_sel in range(2):
+                cols = il * 16 + grid_sel * 8
+                seg = Wsb[:, :, ib, cols: cols + 8]
+                target = (seg - ml0) / dlsafe
                 g = (((target[..., None, :] - _IQ1S_NIB[None, None]) ** 2).sum(-1)).argmin(-1).astype(np.uint32)
                 qs[:, :, 4 * ib + 2 * il + grid_sel] = (g & 0xFF).astype(np.uint8)
-                gh = (g >> 8) & 0x7                                                # 3 high bits
-                shift = (0 if grid_sel == 0 else 3) + 6 * il
-                qhv |= (gh << shift)
+                qhv |= (((g >> 8) & 0x7) << ((0 if grid_sel == 0 else 3) + 6 * il))
+                sum_base += (dlb[..., None] * _IQ1S_NIB[g] + ml0 - seg).sum(-1)     # err gradient wrt sign
+        qhv |= (np.where(sum_base > 0, 1, 0).astype(np.uint32) << 15)               # sign bit: -DELTA if base>0
         qh[:, :, ib] = qhv.astype(np.uint16)
     out = np.zeros((N, nb, 50), np.uint8)
     out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)

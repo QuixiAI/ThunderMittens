@@ -172,10 +172,58 @@ static at::Tensor attn_fwd_mps(const at::Tensor& q_in, const at::Tensor& k_in,
   return out;
 }
 
+static at::Tensor rms_norm_mps(const at::Tensor& x_in, const at::Tensor& w_in, double eps) {
+  TORCH_CHECK(x_in.device().is_mps(), "rms_norm: x must be an MPS tensor");
+  TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "rms_norm: x must be bfloat16");
+  auto x = x_in.contiguous(), w = w_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(D == 256 || D == 512 || D == 768 || D == 1024,
+              "rms_norm: last dim must be 256/512/768/1024");
+  const uint32_t M = static_cast<uint32_t>(x.numel() / D);
+  auto out = at::empty_like(x);
+  const float eps_f = static_cast<float>(eps);
+  tk_encode([&](TorchEncoder& e) { tk::launch_rms_norm(e, x, w, out, M, D, eps_f); });
+  return out;
+}
+
+static at::Tensor softmax_mps(const at::Tensor& x_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "softmax: x must be an MPS tensor");
+  TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "softmax: x must be bfloat16");
+  auto x = x_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(D == 256 || D == 512 || D == 768 || D == 1024,
+              "softmax: last dim must be 256/512/768/1024");
+  const uint32_t M = static_cast<uint32_t>(x.numel() / D);
+  auto out = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) { tk::launch_softmax(e, x, out, M, D); });
+  return out;
+}
+
+static at::Tensor rotary_mps(const at::Tensor& x_in, const at::Tensor& cos_in,
+                             const at::Tensor& sin_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "rotary: x must be an MPS tensor");
+  TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "rotary: x must be bfloat16");
+  TORCH_CHECK(x_in.dim() == 4, "rotary: x must be (B,H,N,D)");
+  auto x = x_in.contiguous(), cos = cos_in.contiguous(), sin = sin_in.contiguous();
+  const int D = x.size(-1);
+  const unsigned N = static_cast<unsigned>(x.size(-2));
+  TORCH_CHECK(D == 64 || D == 128, "rotary: head dim must be 64 or 128");
+  TORCH_CHECK(cos.size(-1) == D / 2 && sin.size(-1) == D / 2 &&
+              cos.size(-2) == (int64_t)N && sin.size(-2) == (int64_t)N,
+              "rotary: cos/sin must be (N, D/2)");
+  const uint32_t M = static_cast<uint32_t>(x.numel() / D);
+  auto out = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) { tk::launch_rotary(e, x, cos, sin, out, M, N, D); });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
   m.def("add_rt", &add_rt_mps, "ThunderMittens add_rt elementwise add (MPS)");
   m.def("matmul_custom", &matmul_custom_mps, "ThunderMittens matmul_custom GEMM (MPS)");
   m.def("attn_fwd", &attn_fwd_mps, "ThunderMittens attention forward (MPS)");
+  m.def("rms_norm", &rms_norm_mps, "ThunderMittens RMSNorm (MPS)");
+  m.def("softmax", &softmax_mps, "ThunderMittens softmax (MPS)");
+  m.def("rotary", &rotary_mps, "ThunderMittens rotary/RoPE (MPS)");
 }

@@ -34,6 +34,9 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/attn_fwd/attn_fwd.cpp
     ${CMAKE_CURRENT_LIST_DIR}/matmul_custom/matmul_custom.cpp
     ${CMAKE_CURRENT_LIST_DIR}/layernorm/layernorm.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/rms_norm/rms_norm.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/softmax/softmax.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.cpp
 )
 
 # Add include headers
@@ -59,6 +62,9 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/attn_fwd/attn_fwd.metal
         ${CMAKE_CURRENT_LIST_DIR}/matmul_custom/matmul_custom.metal
         ${CMAKE_CURRENT_LIST_DIR}/layernorm/layernorm.metal
+        ${CMAKE_CURRENT_LIST_DIR}/rms_norm/rms_norm.metal
+        ${CMAKE_CURRENT_LIST_DIR}/softmax/softmax.metal
+        ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.metal
         INCLUDE_DIRS
         ${PROJECT_SOURCE_DIR}
         ${MLX_INCLUDE_DIRS}

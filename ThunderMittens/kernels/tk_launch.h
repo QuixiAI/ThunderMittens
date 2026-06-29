@@ -28,6 +28,9 @@ inline std::string layernorm_kernel_name(int D) { return "layernorm_" + std::to_
 inline std::string attn_fwd_kernel_name(int D) { return "attn_fwd_" + std::to_string(D); }
 inline std::string add_rt_kernel_name(const std::string& t) { return "add_rt_" + t; }
 inline std::string matmul_custom_kernel_name(const std::string& t) { return "matmul_custom_" + t; }
+inline std::string rms_norm_kernel_name(int D) { return "rms_norm_" + std::to_string(D); }
+inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_string(D); }
+inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string(D); }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -68,6 +71,37 @@ void launch_attn_fwd(E& e, typename E::in_t q, typename E::in_t k, typename E::i
   e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
   e.bytes(N, 4); e.bytes(H, 5);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
+// ----- rms_norm: x@0 w@1 -> o@2 ; M@3(u32) eps@4(f32) ; grid (M,1,1) group (32,1,1) -----
+template <class E>
+void launch_rms_norm(E& e, typename E::in_t x, typename E::in_t w,
+                     typename E::out_t o, uint32_t M, int D, float eps) {
+  e.pipeline(rms_norm_kernel_name(D));
+  e.in(x, 0); e.in(w, 1); e.out(o, 2);
+  e.bytes(M, 3); e.bytes(eps, 4);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- softmax (last axis): x@0 -> o@1 ; M@2(u32) ; grid (M,1,1) group (32,1,1) -----
+template <class E>
+void launch_softmax(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, int D) {
+  e.pipeline(softmax_kernel_name(D));
+  e.in(x, 0); e.out(o, 1);
+  e.bytes(M, 2);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- rotary (split-half RoPE): x@0 cos@1 sin@2 -> o@3 ; N@4(u32) ;
+//        grid (M,1,1) group (32,1,1). x is (M=B*H*N, D) flattened; cos/sin are
+//        (N, D/2); each row uses seq position n = row % N. -----
+template <class E>
+void launch_rotary(E& e, typename E::in_t x, typename E::in_t cos, typename E::in_t sin,
+                   typename E::out_t o, uint32_t M, unsigned N, int D) {
+  e.pipeline(rotary_kernel_name(D));
+  e.in(x, 0); e.in(cos, 1); e.in(sin, 2); e.out(o, 3);
+  e.bytes(N, 4);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
 
 } // namespace tk

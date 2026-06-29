@@ -58,6 +58,9 @@
 #include "attn_fwd/attn_fwd.h"
 #include "matmul_custom/matmul_custom.h"
 #include "layernorm/layernorm.h"
+#include "rms_norm/rms_norm.h"
+#include "softmax/softmax.h"
+#include "rotary/rotary.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -111,5 +114,39 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         layernorm over the last axis: (x - mean) * rsqrt(var + eps) * weight + bias
+      )");
+
+    m.def(
+      "rms_norm",
+      &rms_norm,
+      "x"_a,
+      "weight"_a,
+      nb::kw_only(),
+      "eps"_a = 1e-5f,
+      "stream"_a = nb::none(),
+      R"(
+        rms_norm over the last axis: x * rsqrt(mean(x^2) + eps) * weight
+      )");
+
+    m.def(
+      "softmax",
+      &softmax_tk,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        softmax over the last axis
+      )");
+
+    m.def(
+      "rotary",
+      &rotary,
+      "x"_a,
+      "cos"_a,
+      "sin"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        rotary positional embedding (split-half / GPT-NeoX); x is (B,H,N,D), cos/sin are (N,D/2)
       )");
 }

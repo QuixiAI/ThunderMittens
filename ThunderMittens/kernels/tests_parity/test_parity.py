@@ -91,3 +91,37 @@ def test_attn_fwd_parity(shape):
     om = tk.attn_fwd(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"))
     ot = tk.attn_fwd(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"))
     _assert_parity(om, ot, atol=1e-2)
+
+
+@pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
+def test_rms_norm_parity(shape):
+    D = shape[-1]
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(shape).astype(np.float32)
+    w = rng.standard_normal((D,)).astype(np.float32)
+    om = tk.rms_norm(_mk(x, "mlx"), _mk(w, "mlx"))
+    ot = tk.rms_norm(_mk(x, "torch"), _mk(w, "torch"))
+    _assert_parity(om, ot, atol=1e-2)
+
+
+@pytest.mark.parametrize("shape", [(2, 128, 1024), (1, 256, 768)])
+def test_softmax_parity(shape):
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(shape).astype(np.float32)
+    om = tk.softmax(_mk(x, "mlx"))
+    ot = tk.softmax(_mk(x, "torch"))
+    _assert_parity(om, ot, atol=1e-2)
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 256, 64), (1, 2, 128, 128)])
+def test_rotary_parity(shape):
+    B, H, N, D = shape
+    rng = np.random.default_rng(0)
+    base = 10000.0
+    inv_freq = base ** (-(np.arange(0, D, 2).astype(np.float32) / D))
+    ang = np.arange(N, dtype=np.float32)[:, None] * inv_freq[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    x = rng.standard_normal((B, H, N, D)).astype(np.float32)
+    om = tk.rotary(_mk(x, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"))
+    ot = tk.rotary(_mk(x, "torch"), _mk(cos, "torch"), _mk(sin, "torch"))
+    _assert_parity(om, ot, atol=1e-2)

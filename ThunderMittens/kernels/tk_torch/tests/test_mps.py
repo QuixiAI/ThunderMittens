@@ -69,6 +69,51 @@ def test_attn_fwd(shape):
     assert _maxdiff(got, exp) < 0.06
 
 
+@pytest.mark.parametrize("shape", [(2, 128, 1024), (4, 64, 512), (1, 256, 768), (8, 256)])
+def test_rms_norm(shape):
+    D = shape[-1]
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    w = torch.randn(D, dtype=torch.bfloat16, device="mps")
+    eps = 1e-5
+    got = tk_torch.rms_norm(x, w, eps)
+    xf = x.float()
+    exp = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w.float()).to(torch.bfloat16)
+    assert _maxdiff(got, exp) < 0.03
+
+
+@pytest.mark.parametrize("shape", [(2, 128, 1024), (4, 64, 512), (1, 256, 768), (8, 256)])
+def test_softmax(shape):
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    got = tk_torch.softmax(x)
+    exp = F.softmax(x.float(), dim=-1).to(torch.bfloat16)
+    assert _maxdiff(got, exp) < 0.02
+
+
+def _cos_sin(N, D, device, base=10000.0):
+    i = torch.arange(0, D, 2, dtype=torch.float32)
+    inv_freq = base ** (-(i / D))                       # (D/2,)
+    pos = torch.arange(N, dtype=torch.float32)[:, None]  # (N,1)
+    ang = pos * inv_freq[None, :]                        # (N,D/2)
+    return (torch.cos(ang).to(torch.bfloat16).to(device),
+            torch.sin(ang).to(torch.bfloat16).to(device))
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 256, 64), (2, 4, 128, 64), (1, 2, 256, 128)])
+def test_rotary(shape):
+    B, H, N, D = shape
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    cos, sin = _cos_sin(N, D, "mps")
+    got = tk_torch.rotary(x, cos, sin)
+    xf = x.float()
+    x1, x2 = xf[..., :D // 2], xf[..., D // 2:]
+    c, s = cos.float()[None, None], sin.float()[None, None]
+    exp = torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1).to(torch.bfloat16)
+    assert _maxdiff(got, exp) < 0.03
+
+
 def test_dispatch_routes_torch_to_mps():
     """tk.<kernel>(torch.Tensor) routes to the MPS backend (no MLX needed)."""
     import tk

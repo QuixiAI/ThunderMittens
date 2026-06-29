@@ -25,6 +25,9 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "attn_fwd", "attn_fwd.metal"),
     os.path.join(_KERNELS, "matmul_custom", "matmul_custom.metal"),
     os.path.join(_KERNELS, "layernorm", "layernorm.metal"),
+    os.path.join(_KERNELS, "rms_norm", "rms_norm.metal"),
+    os.path.join(_KERNELS, "softmax", "softmax.metal"),
+    os.path.join(_KERNELS, "rotary", "rotary.metal"),
 ]
 
 
@@ -72,3 +75,18 @@ def matmul_custom(x: torch.Tensor, y: torch.Tensor):
 def attn_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     """Non-causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""
     return _ext.attn_fwd(q, k, v)
+
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
+    """RMSNorm over the last axis. bf16 MPS tensors; D in {256,512,768,1024}."""
+    return _ext.rms_norm(x, weight, float(eps))
+
+
+def softmax(x: torch.Tensor):
+    """Softmax over the last axis. bf16 MPS tensors; D in {256,512,768,1024}."""
+    return _ext.softmax(x)
+
+
+def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """RoPE (split-half). x bf16 (B,H,N,D); cos/sin bf16 (N,D/2); D in {64,128}."""
+    return _ext.rotary(x, cos, sin)

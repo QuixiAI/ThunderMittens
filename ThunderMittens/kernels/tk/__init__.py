@@ -61,3 +61,24 @@ def attn_fwd(q, k, v):
     if _is_torch(q):
         return _torch().attn_fwd(q, k, v)
     return _mlx().attn_fwd(q, k, v)
+
+
+def rms_norm(x, weight, eps=1e-5):
+    """RMSNorm over the last axis. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().rms_norm(x, weight, eps)
+    return _mlx().rms_norm(x, weight, eps=eps)
+
+
+def softmax(x):
+    """Softmax over the last axis. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().softmax(x)
+    return _mlx().softmax(x)
+
+
+def rotary(x, cos, sin):
+    """RoPE (split-half). x is (B,H,N,D), cos/sin (N,D/2). mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().rotary(x, cos, sin)
+    return _mlx().rotary(x, cos, sin)

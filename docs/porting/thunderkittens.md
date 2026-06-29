@@ -16,17 +16,19 @@ Drop async double-buffering for v1. Validate every kernel against an MLX/NumPy o
 | `matmul_custom` | ✅ | f32/bf16, N%32,M%32,K%16 | `x @ y` | Naive blocked GEMM, fixed `<4,2,4>` tiling. Generalizing shapes is future work. `kernels/matmul_custom/` |
 | `attn_fwd` | ✅ | bf16, D∈{64,128}, non-causal | `mx.fast.scaled_dot_product_attention` (scale=1/√D) | Warp-level flash-attn forward. `kernels/attn_fwd/` |
 | `layernorm` | ✅ | bf16, D∈{256,512,768,1024} | `mx.fast.layer_norm` | Worked-example port. fp32 compute, inline `metal::rsqrt`. `kernels/layernorm/` |
+| `rms_norm` | ✅ | bf16, D∈{256,512,768,1024} | `mx.fast.rms_norm` | layernorm minus mean/bias. `kernels/rms_norm/` |
+| `softmax` | ✅ | bf16, D∈{256,512,768,1024} | `mx.softmax` | Standalone row-softmax (attn_fwd's inline softmax extracted). `kernels/softmax/` |
+| `rotary` | ✅ | bf16, D∈{64,128} | `mx.fast.rope(traditional=False)` | Split-half RoPE; precomputed cos/sin inputs. `kernels/rotary/` |
 
-Run all: `cd ThunderMittens/kernels && python -m pytest */correctness/ -v`.
+All kernels ship on **both** backends (MLX + PyTorch MPS) via `tk_launch.h`. Run all:
+`cd ThunderMittens/kernels && python -m pytest */correctness/ tk_torch/tests/ tests_parity/ -q`
+(92 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (108 passing).
 
 ## Next tier (difficulty order)
 
 | Kernel | TK reference | Status | Oracle | Notes |
 |---|---|---|---|---|
-| rotary (RoPE) | `kernels/rotary/rotary.cu` | ☐ | `mx.fast.rope` | Mostly tile arithmetic; load sin/cos, rotate. |
-| softmax | (within attention) | ☐ | `mx.softmax` | Row-softmax as a standalone kernel. |
-| rms_norm | — (TK has fused LN) | ☐ | `mx.fast.rms_norm` | Trivial variant of layernorm; good `rsqrt`-vector follow-up. |
-| flux gelu / gate | `kernels/flux/flux_gelu.cu`, `flux_gate.cu` | ☐ | NumPy GELU | Elementwise + gating. |
+| flux gelu / gate | `kernels/flux/flux_gelu.cu`, `flux_gate.cu` | ☐ | `mx.nn.gelu_approx` | Needs a new `tanh` base_op; larger fused kernel. |
 | GEMM bf16 parity | `kernels/gemm/bf16_h100/bf16_h100_gemm.cu` | ☐ | `mx.matmul` | Generalize `matmul_custom` to arbitrary shapes + shared-tile staging. |
 | attention (causal / multi-warp) | `kernels/attention/mha_h100/` | ☐ | masked SDPA | Extend `attn_fwd`: causal mask, multi-simdgroup tiling. |
 

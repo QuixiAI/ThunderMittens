@@ -552,6 +552,182 @@ def quantize_iq2_xxs(W):
     return out
 
 
+# ---- iq2_xs / iq3_xxs / iq1_s : the rest of the GGUF E8-lattice family. Decoders mirror the
+# ggml-metal kernels exactly; encoders produce valid packed blocks (nearest grid entry per group),
+# which is all the kernel-vs-oracle test needs. ----
+from .quant_tables import (IQ2XS_GRID, IQ3XXS_GRID, IQ1S_GRID_GPU, IQ1S_DELTA)
+
+_IQ2XS_GMAG = np.stack([((IQ2XS_GRID >> (8 * e)) & 0xFF).astype(np.float32) for e in range(8)], axis=1)   # (512,8)
+_IQ3XXS_GMAG = np.stack([((IQ3XXS_GRID >> np.uint32(8 * e)) & np.uint32(0xFF)).astype(np.float32) for e in range(4)], axis=1)  # (256,4)
+# iq1s grid: 8 nibbles per entry in weight order [b0&f,b1&f,b2&f,b3&f,b0>>4,b1>>4,b2>>4,b3>>4]
+_IQ1S_NIB = np.zeros((len(IQ1S_GRID_GPU), 8), np.float32)
+for _b in range(4):
+    _byte = ((IQ1S_GRID_GPU >> np.uint32(8 * _b)) & np.uint32(0xF)).astype(np.float32)
+    _IQ1S_NIB[:, _b] = ((IQ1S_GRID_GPU >> np.uint32(8 * _b)) & np.uint32(0xF)).astype(np.float32)
+    _IQ1S_NIB[:, _b + 4] = ((IQ1S_GRID_GPU >> np.uint32(8 * _b + 4)) & np.uint32(0xF)).astype(np.float32)
+
+
+def dequantize_iq2_xs(packed):
+    packed = np.ascontiguousarray(packed, np.uint8); N, nb, _ = packed.shape
+    d = np.ascontiguousarray(packed[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    qs = np.ascontiguousarray(packed[:, :, 2:66]).reshape(N, nb * 64).view(np.uint16).reshape(N, nb, 32).astype(np.uint32)
+    scales = packed[:, :, 66:74].astype(np.int32)
+    out = np.zeros((N, nb, 256), np.float32)
+    for ib in range(8):
+        for il in range(2):
+            sc = (scales[:, :, ib] >> (4 * il)) & 0xF
+            dl = d * (0.5 + sc.astype(np.float32)) * 0.25
+            for sub2 in range(2):
+                idx16 = qs[:, :, 4 * ib + 2 * il + sub2]
+                ge = IQ2XS_GRID[idx16 & 511]
+                signs = KSIGNS_IQ2XS[(idx16 >> 9) & 127].astype(np.int32)
+                for e in range(8):
+                    gv = ((ge >> np.uint64(8 * e)) & np.uint64(0xFF)).astype(np.float32)
+                    sgn = np.where(signs & int(KMASK_IQ2XS[e]), -1.0, 1.0)
+                    out[:, :, ib * 32 + il * 16 + sub2 * 8 + e] = dl * gv * sgn
+    return out.reshape(N, nb * 256)
+
+
+def quantize_iq2_xs(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
+    Wsb = W.reshape(N, nb, 8, 32)
+    Whalf = Wsb.reshape(N, nb, 8, 2, 16)
+    dl_t = (np.abs(Whalf).mean(axis=4) / 8.0).astype(np.float32)                   # (N,nb,8,2)
+    d = (4.0 * dl_t).reshape(N, nb, 16).max(axis=2) / 15.5
+    dsafe = np.where(d == 0, 1.0, d).astype(np.float32)
+    sc4 = np.clip(np.rint(4.0 * dl_t / dsafe[..., None, None] - 0.5), 0, 15).astype(np.int32)
+    dl = dsafe[..., None, None] * (0.5 + sc4) * 0.25
+    qs = np.zeros((N, nb, 32), np.uint16); scales = np.zeros((N, nb, 8), np.uint8)
+    for ib in range(8):
+        for il in range(2):
+            scales[:, :, ib] |= (sc4[:, :, ib, il].astype(np.uint8) << (4 * il))
+            for sub2 in range(2):
+                seg = Wsb[:, :, ib, il * 16 + sub2 * 8: il * 16 + sub2 * 8 + 8]
+                dlh = dl[:, :, ib, il][..., None]
+                target = np.abs(seg) / np.where(dlh == 0, 1.0, dlh)
+                g = (((target[..., None, :] - _IQ2XS_GMAG[None, None]) ** 2).sum(-1)).argmin(-1).astype(np.uint32)
+                patt = np.zeros((N, nb), np.uint32)
+                for i in range(8):
+                    patt |= ((seg[..., i] < 0).astype(np.uint32) << i)
+                qs[:, :, 4 * ib + 2 * il + sub2] = ((g & 511) | ((patt & 0x7F) << 9)).astype(np.uint16)
+    out = np.zeros((N, nb, 74), np.uint8)
+    out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 2:66] = qs.view(np.uint8).reshape(N, nb, 64)
+    out[:, :, 66:74] = scales
+    return out
+
+
+def dequantize_iq3_xxs(packed):
+    packed = np.ascontiguousarray(packed, np.uint8); N, nb, _ = packed.shape
+    d = np.ascontiguousarray(packed[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    q3 = packed[:, :, 2:66].astype(np.uint32)                                      # grid indices
+    gas = np.ascontiguousarray(packed[:, :, 66:98]).reshape(N, nb * 32).view(np.uint16).reshape(N, nb, 16).astype(np.uint32)
+    out = np.zeros((N, nb, 256), np.float32)
+    for ib in range(8):
+        aux32 = gas[:, :, 2 * ib] | (gas[:, :, 2 * ib + 1] << 16)
+        dl = d * (0.5 + (aux32 >> 28).astype(np.float32)) * 0.5
+        for il in range(2):
+            for r in range(4):
+                ge = IQ3XXS_GRID[q3[:, :, 8 * ib + 4 * il + r]]
+                signs = KSIGNS_IQ2XS[(aux32 >> (14 * il + 7 * (r >> 1))) & 127].astype(np.int32)
+                for i in range(4):
+                    gv = ((ge >> np.uint32(8 * i)) & np.uint32(0xFF)).astype(np.float32)
+                    sgn = np.where(signs & int(KMASK_IQ2XS[i + 4 * (r & 1)]), -1.0, 1.0)
+                    out[:, :, ib * 32 + il * 16 + r * 4 + i] = dl * gv * sgn
+    return out.reshape(N, nb * 256)
+
+
+def quantize_iq3_xxs(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
+    Wsb = W.reshape(N, nb, 8, 32)
+    mg = float(_IQ3XXS_GMAG.mean())
+    dl_t = (np.abs(Wsb).mean(axis=3) / mg).astype(np.float32)                       # (N,nb,8)
+    d = (2.0 * dl_t).max(axis=2) / 15.5
+    dsafe = np.where(d == 0, 1.0, d).astype(np.float32)
+    s4 = np.clip(np.rint(2.0 * dl_t / dsafe[..., None] - 0.5), 0, 15).astype(np.int32)
+    dl = dsafe[..., None] * (0.5 + s4) * 0.5
+    q3 = np.zeros((N, nb, 64), np.uint8); gas = np.zeros((N, nb, 16), np.uint16)
+    for ib in range(8):
+        aux32 = (s4[:, :, ib].astype(np.uint32) << 28)
+        dlsafe = np.where(dl[:, :, ib] == 0, 1.0, dl[:, :, ib])[..., None]
+        for il in range(2):
+            for r in range(4):
+                seg = Wsb[:, :, ib, il * 16 + r * 4: il * 16 + r * 4 + 4]
+                target = np.abs(seg) / dlsafe
+                g = (((target[..., None, :] - _IQ3XXS_GMAG[None, None]) ** 2).sum(-1)).argmin(-1)
+                q3[:, :, 8 * ib + 4 * il + r] = g.astype(np.uint8)
+            for h in range(2):
+                patt = np.zeros((N, nb), np.uint32)
+                for sub_r in range(2):
+                    r = 2 * h + sub_r
+                    seg = Wsb[:, :, ib, il * 16 + r * 4: il * 16 + r * 4 + 4]
+                    for i in range(4):
+                        patt |= ((seg[..., i] < 0).astype(np.uint32) << (i + 4 * sub_r))
+                aux32 |= ((patt & 0x7F) << (14 * il + 7 * h))
+        gas[:, :, 2 * ib] = (aux32 & 0xFFFF).astype(np.uint16)
+        gas[:, :, 2 * ib + 1] = (aux32 >> 16).astype(np.uint16)
+    out = np.zeros((N, nb, 98), np.uint8)
+    out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 2:66] = q3
+    out[:, :, 66:98] = gas.view(np.uint8).reshape(N, nb, 32)
+    return out
+
+
+def dequantize_iq1_s(packed):
+    packed = np.ascontiguousarray(packed, np.uint8); N, nb, _ = packed.shape
+    d = np.ascontiguousarray(packed[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    qs = packed[:, :, 2:34].astype(np.uint32)
+    qh = np.ascontiguousarray(packed[:, :, 34:50]).reshape(N, nb * 16).view(np.uint16).reshape(N, nb, 8).astype(np.uint32)
+    out = np.zeros((N, nb, 256), np.float32)
+    for ib in range(8):
+        qhv = qh[:, :, ib]
+        dl = d * (2 * ((qhv >> 12) & 7) + 1).astype(np.float32)
+        ml = dl * np.where(qhv & 0x8000, -1.0 - IQ1S_DELTA, -1.0 + IQ1S_DELTA)
+        for il in range(2):
+            h = qhv >> (6 * il)
+            gi1 = qs[:, :, 4 * ib + 2 * il + 0] | ((h << 8) & 0x700)
+            gi2 = qs[:, :, 4 * ib + 2 * il + 1] | ((h << 5) & 0x700)
+            for which in range(4):
+                ge = IQ1S_GRID_GPU[gi1] if which < 2 else IQ1S_GRID_GPU[gi2]
+                for i in range(4):
+                    b = (ge >> np.uint32(8 * i)) & np.uint32(0xFF)
+                    nib = ((b >> np.uint32(4)) if (which & 1) else (b & np.uint32(0xF))).astype(np.float32)
+                    out[:, :, ib * 32 + il * 16 + which * 4 + i] = dl * nib + ml
+    return out.reshape(N, nb * 256)
+
+
+def quantize_iq1_s(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
+    Wsb = W.reshape(N, nb, 8, 32)
+    # 3-bit scale: dl = d*(2*sc+1), sc in 0..7. ml ~ -dl. target nibble ~ (w - ml)/dl ~ w/dl + 1.
+    dl_t = (np.abs(Wsb).max(axis=3) / 7.0).astype(np.float32)                       # rough
+    d = dl_t.max(axis=2) / 15.0
+    dsafe = np.where(d == 0, 1.0, d).astype(np.float32)
+    sc = np.clip(np.rint((dl_t / dsafe[..., None] - 1) / 2), 0, 7).astype(np.int32)  # (N,nb,8)
+    dl = dsafe[..., None] * (2 * sc + 1)
+    qs = np.zeros((N, nb, 32), np.uint8); qh = np.zeros((N, nb, 8), np.uint16)
+    for ib in range(8):
+        dlsafe = np.where(dl[:, :, ib] == 0, 1.0, dl[:, :, ib])[..., None]
+        ml = -dl[:, :, ib][..., None] * (1.0 - IQ1S_DELTA)                          # sign bit = 0
+        qhv = (sc[:, :, ib].astype(np.uint32) << 12)                                # scale bits
+        for il in range(2):
+            for grid_sel in range(2):                                              # two grid entries
+                cols = (il * 16 + grid_sel * 8)
+                seg = Wsb[:, :, ib, cols: cols + 8]                                # 8 weights
+                target = (seg - ml) / dlsafe                                       # ~ nibble
+                g = (((target[..., None, :] - _IQ1S_NIB[None, None]) ** 2).sum(-1)).argmin(-1).astype(np.uint32)
+                qs[:, :, 4 * ib + 2 * il + grid_sel] = (g & 0xFF).astype(np.uint8)
+                gh = (g >> 8) & 0x7                                                # 3 high bits
+                shift = (0 if grid_sel == 0 else 3) + 6 * il
+                qhv |= (gh << shift)
+        qh[:, :, ib] = qhv.astype(np.uint16)
+    out = np.zeros((N, nb, 50), np.uint8)
+    out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 2:34] = qs
+    out[:, :, 34:50] = qh.view(np.uint8).reshape(N, nb, 16)
+    return out
+
+
 # Format registry: name -> (quantize, dequantize). Drives the parametrized tests.
 QUANT_FORMATS = {
     "q8_0": (quantize_q8_0, dequantize_q8_0),
@@ -568,4 +744,7 @@ QUANT_FORMATS = {
     "iq4_nl": (quantize_iq4_nl, dequantize_iq4_nl),
     "iq4_xs": (quantize_iq4_xs, dequantize_iq4_xs),
     "iq2_xxs": (quantize_iq2_xxs, dequantize_iq2_xxs),
+    "iq2_xs": (quantize_iq2_xs, dequantize_iq2_xs),
+    "iq3_xxs": (quantize_iq3_xxs, dequantize_iq3_xxs),
+    "iq1_s": (quantize_iq1_s, dequantize_iq1_s),
 }

@@ -97,6 +97,74 @@ struct iq2_xxs {
     }
 };
 
+// ---- iq2_xs : E8-lattice 2.3125 bpw. { half d; uint16 qs[32]; uint8 scales[8]; } = 74 bytes, 256
+//   weights. Each uint16: low 9 bits = iq2xs_grid index (512), high 7 = ksigns index; 4-bit
+//   per-half scale from scales[ib32]. (ggml-metal dequantize_iq2_xs.) ----
+struct iq2_xs {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 74;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        device const ushort* qs = (device const ushort*)(base + 2);
+        device const uchar* scales = base + 66;
+        const int ib32 = col >> 5, p = col & 31, il = p >> 4, sub2 = (p & 15) >> 3, elem = p & 7;
+        const ushort idx16 = qs[4 * ib32 + 2 * il + sub2];
+        const uint g = idx16 & 511;
+        const uchar signs = ksigns_iq2xs[idx16 >> 9];
+        const int sc = (scales[ib32] >> (4 * il)) & 0xF;
+        const half dl = d * (0.5h + half(sc)) * 0.25h;
+        const uint gv = (uint)((iq2xs_grid[g] >> (8 * elem)) & 0xffUL);
+        const half sgn = (signs & kmask_iq2xs[elem]) ? -1.0h : 1.0h;
+        return dl * half(gv) * sgn;
+    }
+};
+
+// ---- iq3_xxs : E8-lattice 3.0625 bpw. { half d; uint8 qs[96]; } = 98 bytes, 256 weights. First
+//   64 bytes of qs = 8-bit grid indices (8 per block-of-32); the next 32 = uint16 sign/scale (gas).
+//   Each iq3xxs_grid entry is a uint32 of 4 magnitudes. (ggml-metal dequantize_iq3_xxs.) ----
+struct iq3_xxs {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 98;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        device const uchar* qs = base + 2;
+        const int ib32 = col >> 5, p = col & 31, il = p >> 4, w = p & 15, r = w >> 2, i = w & 3;
+        device const uchar* q3 = qs + 8 * ib32;
+        device const ushort* gas = (device const ushort*)(qs + 64) + 2 * ib32;
+        const uint aux32 = (uint)gas[0] | ((uint)gas[1] << 16);
+        const uint gv = (iq3xxs_grid[q3[4 * il + r]] >> (8 * i)) & 0xff;
+        const uchar signs = ksigns_iq2xs[(aux32 >> (14 * il + 7 * (r >> 1))) & 127];
+        const half dl = d * (0.5h + half(aux32 >> 28)) * 0.5h;
+        const half sgn = (signs & kmask_iq2xs[i + 4 * (r & 1)]) ? -1.0h : 1.0h;
+        return dl * half(gv) * sgn;
+    }
+};
+
+// ---- iq1_s : 1.5625 bpw. { half d; uint8 qs[32]; uint16 qh[8]; } = 50 bytes, 256 weights. Per
+//   half: two iq1s_grid_gpu entries (index = qs byte | high bits from qh); 3-bit scale + a sign in
+//   qh give dl and the ml offset (value = dl·nibble + ml). (ggml-metal dequantize_iq1_s.) ----
+struct iq1_s {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 50;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        device const uchar* qs = base + 2;
+        device const ushort* qh = (device const ushort*)(base + 34);
+        const int ib32 = col >> 5, p = col & 31, il = p >> 4, w = p & 15;
+        const int which = w >> 2, i = w & 3;        // which: 0/1 -> grid1 lo/hi, 2/3 -> grid2 lo/hi
+        device const uchar* qsp = qs + 4 * ib32 + 2 * il;
+        const ushort qhv = qh[ib32];
+        const half dl = d * half(2 * ((qhv >> 12) & 7) + 1);
+        const half ml = dl * ((qhv & 0x8000) ? half(-1.0h - IQ1S_DELTA) : half(-1.0h + IQ1S_DELTA));
+        const uint h = (uint)(qhv >> (6 * il));
+        const uint gi = (which >> 1) == 0 ? (qsp[0] | ((h << 8) & 0x700))
+                                          : (qsp[1] | ((h << 5) & 0x700));
+        const uint b = (iq1s_grid_gpu[gi] >> (8 * i)) & 0xff;
+        const uint nib = (which & 1) ? (b >> 4) : (b & 0xF);
+        return dl * half(nib) + ml;
+    }
+};
+
 // ---- q8_0 : { half d; int8 qs[32]; }  — 34 bytes, 32 weights/block, value = d * q ----
 struct q8_0 {
     constant static constexpr const int block_k     = 32;

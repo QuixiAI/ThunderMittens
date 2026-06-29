@@ -25,6 +25,16 @@
 > reproducing **fp8 W8A8, int8 W8A8, int8 W4A8** fake-quant numerics. Apple has no int8/fp8 matmul,
 > so this is parity, not speed. W4A16 / W8A16 are just `act=None`.
 
+> **Codebook / LUT dequant + GGUF i-quant family [Phase 2, complete].** The second new dequant
+> style: packed bits index a constant table instead of bit arithmetic. Six formats: **iq4_nl**
+> (16-entry non-linear int4 codebook), **iq4_xs** (256-superblock iq4_nl, 6-bit sub-scales), and the
+> E8-lattice quants **iq2_xxs / iq2_xs / iq3_xxs / iq1_s** (grid-table lookup + ksigns sign bits +
+> per-block scale). The grid/sign tables (iq2xxs 256, iq2xs 512, iq3xxs 256, iq1s_grid_gpu 2048,
+> ksigns 128, kmask 8) are auto-generated from ggml-common.h into `dequant_tables.metal` (Metal) and
+> `tk/quant_tables.py` (numpy) — not hand-transcribed. Kernel decoders mirror the ggml-metal
+> dequantize_* functions exactly; the encoders pick the nearest grid entry per group (kernel-vs-oracle
+> isolates quant quality). All on qgemm/qgemv/qflux, dual-backend, validated vs dequantize(Wq)@x.
+
 > **Integer dot path (idot/imma) — true int8 accumulate [Phase 1].** `idot4` (dp4a equivalent: 4
 > packed int8 → int32, modeled on BitNet's `__dp4a`/`decode_i2s_to_i8s`) powers a per-lane int8 GEMV
 > + `simd_sum`. Two decode kernels in `kernels/qgemv_int/`: **`qgemv_w8a8`** (SmoothQuant — int8

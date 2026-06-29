@@ -575,6 +575,18 @@ static METAL_FUNC typename metal::enable_if<ducks::is_register_tile<RT>(), void>
 relu(thread RT &dst, thread const RT &src) {
     unary_map<base_ops::relu, RT>(dst, src);
 }
+/** @brief Applies the square root element-wise to a register tile. */
+template<typename RT>
+static METAL_FUNC typename metal::enable_if<ducks::is_register_tile<RT>(), void>::type
+sqrt(thread RT &dst, thread const RT &src) {
+    unary_map<base_ops::sqrt, RT>(dst, src);
+}
+/** @brief Applies the reciprocal square root (1/sqrt) element-wise to a register tile. */
+template<typename RT>
+static METAL_FUNC typename metal::enable_if<ducks::is_register_tile<RT>(), void>::type
+rsqrt(thread RT &dst, thread const RT &src) {
+    unary_map<base_ops::rsqrt, RT>(dst, src);
+}
 /**
  * @brief Copies the elements from one tile to another.
  *

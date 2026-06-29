@@ -237,6 +237,30 @@ struct relu {
 TEMPLATE_OPS_OVERRIDE_SINGLE(bf16  , relu, return bf16(metal::max((float)x, base_types::constants<float>::zero()));)
 TEMPLATE_OPS_OVERRIDE_SINGLE(bf16_2, relu, return bf16_2(metal::max((float2)x, base_types::constants<float2>::zero()));)
 /**
+ * @brief Square-root operation.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value (must be non-negative).
+ * @return The square root of the input.
+ */
+struct sqrt {
+    TEMPLATE_OPS_SINGLE(return metal::sqrt(x);)
+};
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16  , sqrt, return bf16(metal::sqrt((float)x));)
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16_2, sqrt, return bf16_2(metal::sqrt((float2)x));)
+/**
+ * @brief Reciprocal square-root operation (1/sqrt(x)).
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value (must be positive).
+ * @return The reciprocal square root of the input.
+ */
+struct rsqrt {
+    TEMPLATE_OPS_SINGLE(return metal::rsqrt(x);)
+};
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16  , rsqrt, return bf16(metal::rsqrt((float)x));)
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16_2, rsqrt, return bf16_2(metal::rsqrt((float2)x));)
+/**
  * @brief Copy operation.
  *
  * This operation returns the input value unchanged.

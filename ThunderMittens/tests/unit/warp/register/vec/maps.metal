@@ -55,10 +55,30 @@ kernel void rv_t_binary(gts_kern_PARAMS(T))
     load(vec_a, input, {0,0,0,0}, simd_lane_id);
     T val = base_types::convertor<T, float>::convert(0.5f);
     add(vec_a, vec_a, val);
-    
+
     store(output, vec_a, {0,0,0,0}, simd_lane_id);
 }
-    
+
+// Exercises the rsqrt map op. Inputs are made positive (abs(x)+0.5) to stay in the
+// sqrt domain; the host reference mirrors this.
+template<typename T, unsigned W, typename L>
+kernel void rv_rsqrt(gts_kern_PARAMS(T))
+{
+    using reg_vec1 = rv<T, W * 8, L>;
+    using reg_vec2 = rv<T, W * 8, L>;
+    using GL = gl<T, 1, 1, 1, W * 8>;
+    reg_vec1 vec_a;
+    reg_vec2 vec_b;
+    GL input(_input, nullptr, nullptr, nullptr, nullptr);
+    GL output(_output, nullptr, nullptr, nullptr, nullptr);
+    load(vec_a, input, {0,0,0,0}, simd_lane_id);
+    abs(vec_a, vec_a);
+    T bias = base_types::convertor<T, float>::convert(0.5f);
+    add(vec_a, vec_a, bias);
+    rsqrt(vec_b, vec_a);
+    store(output, vec_b, {0,0,0,0}, simd_lane_id);
+}
+
 
 #define gen_kernels(reg_N) \
     template [[host_name("rv_exp_float_" #reg_N "_rv_align_layout")]] [[kernel]]  \
@@ -123,7 +143,28 @@ kernel void rv_t_binary(gts_kern_PARAMS(T))
     void rv_t_binary<bf16, reg_N, ducks::rv_layout::ortho>(gts_kern_PARAMS(bf16));  \
     template [[host_name("rv_t_add_bf16_" #reg_N "_rv_naive_layout")]] [[kernel]]  \
     void rv_t_binary<bf16, reg_N, ducks::rv_layout::naive>(gts_kern_PARAMS(bf16));  \
-    
+\
+    template [[host_name("rv_rsqrt_float_" #reg_N "_rv_align_layout")]] [[kernel]]  \
+    void rv_rsqrt<float, reg_N, ducks::rv_layout::align>(gts_kern_PARAMS(float)); \
+    template [[host_name("rv_rsqrt_float_" #reg_N "_rv_ortho_layout")]] [[kernel]]  \
+    void rv_rsqrt<float, reg_N, ducks::rv_layout::ortho>(gts_kern_PARAMS(float)); \
+    template [[host_name("rv_rsqrt_float_" #reg_N "_rv_naive_layout")]] [[kernel]]  \
+    void rv_rsqrt<float, reg_N, ducks::rv_layout::naive>(gts_kern_PARAMS(float)); \
+\
+    template [[host_name("rv_rsqrt_half_" #reg_N "_rv_align_layout")]] [[kernel]]  \
+    void rv_rsqrt<half, reg_N, ducks::rv_layout::align>(gts_kern_PARAMS(half));  \
+    template [[host_name("rv_rsqrt_half_" #reg_N "_rv_ortho_layout")]] [[kernel]]  \
+    void rv_rsqrt<half, reg_N, ducks::rv_layout::ortho>(gts_kern_PARAMS(half));  \
+    template [[host_name("rv_rsqrt_half_" #reg_N "_rv_naive_layout")]] [[kernel]]  \
+    void rv_rsqrt<half, reg_N, ducks::rv_layout::naive>(gts_kern_PARAMS(half));  \
+\
+    template [[host_name("rv_rsqrt_bf16_" #reg_N "_rv_align_layout")]] [[kernel]]  \
+    void rv_rsqrt<bf16, reg_N, ducks::rv_layout::align>(gts_kern_PARAMS(bf16));  \
+    template [[host_name("rv_rsqrt_bf16_" #reg_N "_rv_ortho_layout")]] [[kernel]]  \
+    void rv_rsqrt<bf16, reg_N, ducks::rv_layout::ortho>(gts_kern_PARAMS(bf16));  \
+    template [[host_name("rv_rsqrt_bf16_" #reg_N "_rv_naive_layout")]] [[kernel]]  \
+    void rv_rsqrt<bf16, reg_N, ducks::rv_layout::naive>(gts_kern_PARAMS(bf16));  \
+
 
     
 #if (INTENSITY_1)

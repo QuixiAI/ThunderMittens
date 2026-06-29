@@ -58,6 +58,26 @@ struct test_rv_t_add {
 };
 
 
+template <typename T>
+struct test_rv_rsqrt {
+    template<int W, int NW, rv_layout::all L> using valid = std::bool_constant<NW == 1 && W<=64>; // this is warp-level
+    static inline const std::string test_identifier = std::is_same_v<T, bf16> ? "rv_rsqrt=bf16" :
+                                                      std::is_same_v<T, half> ? "rv_rsqrt=half" :
+                                                                                "rv_rsqrt=float";
+    static inline const std::string kernel_identifier = std::is_same_v<T, bf16> ? "rv_rsqrt_bf16" :
+                                                        std::is_same_v<T, half> ? "rv_rsqrt_half" :
+                                                                                  "rv_rsqrt_float";
+    using dtype = T;
+    template<int W, int NW, rv_layout::all L>
+    static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
+        // mirrors the device kernel: rsqrt(abs(x) + 0.5)
+        for(int i = 0; i < i_ref.size(); i++) {
+            o_ref[i] = 1.0f / ::sqrt(::fabs(i_ref[i]) + 0.5f);
+        }
+    }
+};
+
+
 void warp::reg::vec::maps::tests(MTL::Device* device, MTL::CommandQueue* command_queue, test_data &results) {
     std::cout << "\n ----- Starting ops/warp/register/vec/maps tests! -----\n" << std::endl;
     constexpr int SIZE = INTENSITY_1 ? 2  :
@@ -94,8 +114,16 @@ void warp::reg::vec::maps::tests(MTL::Device* device, MTL::CommandQueue* command
     general_sweep_size_1d_warp<test_rv_t_add<bf16>, SIZE, rv_layout::align>::run(device, command_queue, results);
     general_sweep_size_1d_warp<test_rv_t_add<bf16>, SIZE, rv_layout::ortho>::run(device, command_queue, results);
     general_sweep_size_1d_warp<test_rv_t_add<bf16>, SIZE, rv_layout::naive>::run(device, command_queue, results);
-    
-    
+
+    general_sweep_size_1d_warp<test_rv_rsqrt<float>, SIZE, rv_layout::align>::run(device, command_queue, results);
+    general_sweep_size_1d_warp<test_rv_rsqrt<float>, SIZE, rv_layout::ortho>::run(device, command_queue, results);
+    general_sweep_size_1d_warp<test_rv_rsqrt<float>, SIZE, rv_layout::naive>::run(device, command_queue, results);
+    general_sweep_size_1d_warp<test_rv_rsqrt<half>, SIZE, rv_layout::align>::run(device, command_queue, results);
+    general_sweep_size_1d_warp<test_rv_rsqrt<half>, SIZE, rv_layout::ortho>::run(device, command_queue, results);
+    general_sweep_size_1d_warp<test_rv_rsqrt<half>, SIZE, rv_layout::naive>::run(device, command_queue, results);
+    general_sweep_size_1d_warp<test_rv_rsqrt<bf16>, SIZE, rv_layout::align>::run(device, command_queue, results);
+    general_sweep_size_1d_warp<test_rv_rsqrt<bf16>, SIZE, rv_layout::ortho>::run(device, command_queue, results);
+    general_sweep_size_1d_warp<test_rv_rsqrt<bf16>, SIZE, rv_layout::naive>::run(device, command_queue, results);
 
 }
 

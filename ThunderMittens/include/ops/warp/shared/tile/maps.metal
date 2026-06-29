@@ -237,6 +237,18 @@ static METAL_FUNC typename metal::enable_if<ducks::is_shared_tile<ST>(), void>::
 relu(threadgroup ST &dst, const threadgroup ST &src, const ushort laneid) {
     unary_map<base_ops::relu, ST>(dst, src, laneid);
 }
+/** @brief Applies the square root element-wise to a shared tile. */
+template<typename ST>
+static METAL_FUNC typename metal::enable_if<ducks::is_shared_tile<ST>(), void>::type
+sqrt(threadgroup ST &dst, const threadgroup ST &src, const ushort laneid) {
+    unary_map<base_ops::sqrt, ST>(dst, src, laneid);
+}
+/** @brief Applies the reciprocal square root (1/sqrt) element-wise to a shared tile. */
+template<typename ST>
+static METAL_FUNC typename metal::enable_if<ducks::is_shared_tile<ST>(), void>::type
+rsqrt(threadgroup ST &dst, const threadgroup ST &src, const ushort laneid) {
+    unary_map<base_ops::rsqrt, ST>(dst, src, laneid);
+}
 /**
  * @brief Copies the elements of the source tile to the destination tile.
  *

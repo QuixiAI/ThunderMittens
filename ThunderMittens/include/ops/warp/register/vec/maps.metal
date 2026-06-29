@@ -197,6 +197,22 @@ static METAL_FUNC typename metal::enable_if<ducks::is_register_vector<RV>(), voi
 relu(thread RV &dst, thread const RV &src) {
     unary_op<base_ops::relu, RV>(dst, src);
 }
+/**
+ * @brief Applies the square root element-wise to a register vector.
+ */
+template<typename RV>
+static METAL_FUNC typename metal::enable_if<ducks::is_register_vector<RV>(), void>::type
+sqrt(thread RV &dst, thread const RV &src) {
+    unary_op<base_ops::sqrt, RV>(dst, src);
+}
+/**
+ * @brief Applies the reciprocal square root (1/sqrt) element-wise to a register vector.
+ */
+template<typename RV>
+static METAL_FUNC typename metal::enable_if<ducks::is_register_vector<RV>(), void>::type
+rsqrt(thread RV &dst, thread const RV &src) {
+    unary_op<base_ops::rsqrt, RV>(dst, src);
+}
 
 // ---- binary ops ----
 

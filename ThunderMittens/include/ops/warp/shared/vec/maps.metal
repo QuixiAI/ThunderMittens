@@ -187,6 +187,18 @@ static METAL_FUNC typename metal::enable_if<ducks::is_shared_vector<SV>(), void>
 relu(threadgroup SV &dst, threadgroup const SV &src, const ushort laneid) {
     unary_op<base_ops::relu, SV>(dst, src, laneid);
 }
+/** @brief Applies the square root element-wise to a shared vector. */
+template<typename SV>
+static METAL_FUNC typename metal::enable_if<ducks::is_shared_vector<SV>(), void>::type
+sqrt(threadgroup SV &dst, threadgroup const SV &src, const ushort laneid) {
+    unary_op<base_ops::sqrt, SV>(dst, src, laneid);
+}
+/** @brief Applies the reciprocal square root (1/sqrt) element-wise to a shared vector. */
+template<typename SV>
+static METAL_FUNC typename metal::enable_if<ducks::is_shared_vector<SV>(), void>::type
+rsqrt(threadgroup SV &dst, threadgroup const SV &src, const ushort laneid) {
+    unary_op<base_ops::rsqrt, SV>(dst, src, laneid);
+}
 
 // ---- binary ops ----
 

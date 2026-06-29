@@ -12,20 +12,31 @@ primitives and need **no new substrate code**.
   full register-layout (row/col) handling. `include/ops/warp/register/tile/mma.metal`.
 - **Memory:** global↔register, global↔shared, shared↔register load/store for tiles and vectors,
   with on-the-fly dtype conversion (bf16↔fp32↔fp16). Warp- and group-level.
-- **Compute:** elementwise maps (`exp`, `exp2`, `log`, `abs`, `relu`, `add/sub/mul/div/max/min`,
-  `fma_*`) and row/col reductions (`row_max/row_sum/...`, vec `sum/max/min`) for register and
-  shared tiles/vectors. `swap_layout` register transpose. Shared-memory swizzle.
+- **Compute:** elementwise maps (`exp`, `exp2`, `log`, `abs`, `relu`, `sqrt`, `rsqrt`,
+  `add/sub/mul/div/max/min`, `fma_*`) and row/col reductions (`row_max/row_sum/...`, vec
+  `sum/max/min`) for register and shared tiles/vectors. `swap_layout` register transpose.
+  Shared-memory swizzle.
+
+## Recently implemented
+
+- **`sqrt` / `rsqrt`** — added to `common/base_ops.metal` and the register & shared, vec & tile
+  `maps.metal` wrappers (mirroring `exp`/`relu`). Validated on-device by the `rv_rsqrt` unit test
+  (`tests/unit/warp/register/vec/maps.{metal,cpp}`, 18 cases across float/half/bf16 × align/ortho/
+  naive). Useful for a future tile/vector RMS-style normalization; LayerNorm still uses scalar
+  `metal::rsqrt` inline (its rsqrt argument is a reduced scalar, not a vector).
 
 ## Gaps (and whether they matter)
 
 | Gap | Impact | Plan |
 |---|---|---|
-| **Async copy / `cp.async` / TMA** | None for v1 — Metal has no direct equivalent | Intentionally skipped. Use sync `load`, or stage via shared + `threadgroup_barrier` when a kernel needs overlap. |
-| **`sqrt` / `rsqrt` ops** | Low — layernorm uses scalar `metal::rsqrt` inline | Add `struct sqrt`/`rsqrt` to `common/base_ops.metal` (mirror `log`/`abs`) + vec/tile `maps.metal` wrappers when a kernel needs a *vector* rsqrt (e.g. rms_norm over a tile). |
-| **Complex MMA** | Only complex kernels (fftconv) | `crt`/`crv` types exist; add complex-multiply MMA wrappers when porting fftconv. |
-| **Warp-level global→shared** | Low — group-level version exists and works | Warp variant is commented out in `ops/warp/memory/tile/global_to_shared.metal`; uncomment/finish if a warp-scoped staging path is needed. |
+| **Async copy / `cp.async` / TMA** | None — Metal has no direct equivalent | Intentionally skipped. Use sync `load`, or stage via shared + `threadgroup_barrier` when a kernel needs overlap. |
+| **Complex MMA** | Only complex kernels (fftconv) | `crt`/`crv` types exist; add complex-multiply MMA wrappers when porting fftconv. Deferred until a complex kernel drives it. |
 | **Subtile integration / some layout-conversion edges** | Low | Noted as TODO in `st.metal` and register `conversions.metal`; address per-kernel as needed. |
-| **Shared allocator / non-default max shared mem** | Low | `utils.metal` TODO; relevant for large shared-tile kernels (GEMM staging). |
+| **Shared allocator / non-default max shared mem** | Low | `utils.metal` TODO; relevant for large shared-tile kernels (GEMM staging). Deferred until a staging kernel drives it. |
+
+> Note: the warp-level `global→shared` tile load/store is **implemented** (the active
+> `meta::load`/`meta::store` path in `ops/warp/memory/tile/global_to_shared.metal`; the commented
+> blocks there are superseded experiments) — a previous revision of this doc wrongly listed it as a gap.
 
 ## Primitive unit tests
 
@@ -34,7 +45,7 @@ gated by `tests/unit/testing_commons/testing_flags.hpp` (`ENABLE_TESTS`). It is 
 focused leaf suites the LayerNorm kernel depends on — warp register-vector reductions, vec maps, and
 naive `rv` global↔register memory (flip to `TEST_ALL` for the full sweep).
 
-**Status: working — 90/90 primitive tests pass on-device.** Build & run from the repo root:
+**Status: working — 108/108 primitive tests pass on-device** (incl. 18 `rv_rsqrt` cases). Build & run from the repo root:
 
 ```
 xcodebuild -project ThunderMittens.xcodeproj -scheme ThunderMittens -configuration Debug build CODE_SIGNING_ALLOWED=NO

@@ -209,6 +209,99 @@ mma_AtBt(thread rt<R, N, M, ducks::rt_layout::row>& d,
     }
 }
 
+// ----------------------------------------------------------------------------
+// Complex matrix-multiply-accumulate.  For complex tiles A = Ar + i·Ai etc.,
+//   D = A·B + C   means
+//   Dr = Ar·Br − Ai·Bi + Cr ,   Di = Ar·Bi + Ai·Br + Ci
+// implemented as four real MMAs on the .real/.imag components (the −Ai·Bi term
+// is folded in by negating Ai once into a scratch tile). Mirrors the four
+// transpose variants of the real MMA. d may alias c, but must be distinct from
+// a and b (same rule as the real MMA).
+// ----------------------------------------------------------------------------
 
-    
+template<typename R, typename T, typename U, typename V, int N, int K, int M>
+static METAL_FUNC void
+complex_mma_AB(thread crt<R, N, M, ducks::rt_layout::row>& d,
+               thread crt<T, N, K, ducks::rt_layout::row>& a,
+               thread crt<U, K, M, ducks::rt_layout::row>& b,
+               thread crt<V, N, M, ducks::rt_layout::row>& c) {
+    copy(d.real, c.real);
+    copy(d.imag, c.imag);
+    rt<T, N, K, ducks::rt_layout::row> neg_ai;
+    typename rt<T, N, K, ducks::rt_layout::row>::dtype neg = -1;
+    mul(neg_ai, a.imag, neg);                       // neg_ai = −Ai
+    mma_AB(d.real, a.real, b.real, d.real);         // Dr += Ar·Br
+    mma_AB(d.real, neg_ai, b.imag, d.real);         // Dr += (−Ai)·Bi
+    mma_AB(d.imag, a.real, b.imag, d.imag);         // Di += Ar·Bi
+    mma_AB(d.imag, a.imag, b.real, d.imag);         // Di += Ai·Br
+}
+
+template<typename R, typename T, typename U, typename V, int N, int K, int M>
+static METAL_FUNC void
+complex_mma_ABt(thread crt<R, N, M, ducks::rt_layout::row>& d,
+                thread crt<T, N, K, ducks::rt_layout::row>& a,
+                thread crt<U, M, K, ducks::rt_layout::col>& b,
+                thread crt<V, N, M, ducks::rt_layout::row>& c) {
+    copy(d.real, c.real);
+    copy(d.imag, c.imag);
+    rt<T, N, K, ducks::rt_layout::row> neg_ai;
+    typename rt<T, N, K, ducks::rt_layout::row>::dtype neg = -1;
+    mul(neg_ai, a.imag, neg);
+    mma_ABt(d.real, a.real, b.real, d.real);
+    mma_ABt(d.real, neg_ai, b.imag, d.real);
+    mma_ABt(d.imag, a.real, b.imag, d.imag);
+    mma_ABt(d.imag, a.imag, b.real, d.imag);
+}
+
+template<typename R, typename T, typename U, typename V, int N, int K, int M>
+static METAL_FUNC void
+complex_mma_AtB(thread crt<R, N, M, ducks::rt_layout::row>& d,
+                thread crt<T, K, N, ducks::rt_layout::col>& a,
+                thread crt<U, K, M, ducks::rt_layout::row>& b,
+                thread crt<V, N, M, ducks::rt_layout::row>& c) {
+    copy(d.real, c.real);
+    copy(d.imag, c.imag);
+    rt<T, K, N, ducks::rt_layout::col> neg_ai;
+    typename rt<T, K, N, ducks::rt_layout::col>::dtype neg = -1;
+    mul(neg_ai, a.imag, neg);
+    mma_AtB(d.real, a.real, b.real, d.real);
+    mma_AtB(d.real, neg_ai, b.imag, d.real);
+    mma_AtB(d.imag, a.real, b.imag, d.imag);
+    mma_AtB(d.imag, a.imag, b.real, d.imag);
+}
+
+template<typename R, typename T, typename U, typename V, int N, int K, int M>
+static METAL_FUNC void
+complex_mma_AtBt(thread crt<R, N, M, ducks::rt_layout::row>& d,
+                 thread crt<T, K, N, ducks::rt_layout::col>& a,
+                 thread crt<U, M, K, ducks::rt_layout::col>& b,
+                 thread crt<V, N, M, ducks::rt_layout::row>& c) {
+    copy(d.real, c.real);
+    copy(d.imag, c.imag);
+    rt<T, K, N, ducks::rt_layout::col> neg_ai;
+    typename rt<T, K, N, ducks::rt_layout::col>::dtype neg = -1;
+    mul(neg_ai, a.imag, neg);
+    mma_AtBt(d.real, a.real, b.real, d.real);
+    mma_AtBt(d.real, neg_ai, b.imag, d.real);
+    mma_AtBt(d.imag, a.real, b.imag, d.imag);
+    mma_AtBt(d.imag, a.imag, b.real, d.imag);
+}
+
+// No-accumulate complex matmul: D = A·B (C implicitly zero).
+template<typename R, typename T, typename U, int N, int K, int M>
+static METAL_FUNC void
+complex_mm_AB(thread crt<R, N, M, ducks::rt_layout::row>& d,
+              thread crt<T, N, K, ducks::rt_layout::row>& a,
+              thread crt<U, K, M, ducks::rt_layout::row>& b) {
+    zero(d.real);
+    zero(d.imag);
+    rt<T, N, K, ducks::rt_layout::row> neg_ai;
+    typename rt<T, N, K, ducks::rt_layout::row>::dtype neg = -1;
+    mul(neg_ai, a.imag, neg);
+    mma_AB(d.real, a.real, b.real, d.real);
+    mma_AB(d.real, neg_ai, b.imag, d.real);
+    mma_AB(d.imag, a.real, b.imag, d.imag);
+    mma_AB(d.imag, a.imag, b.real, d.imag);
+}
+
 }

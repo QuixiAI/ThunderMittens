@@ -41,6 +41,7 @@ inline std::string linear_attn_kernel_name(int D) { return "linear_attn_" + std:
 inline std::string hedgehog_kernel_name(int D) { return "hedgehog_" + std::to_string(D); }
 inline std::string lin_attn_causal_kernel_name(int D) { return "lin_attn_causal_" + std::to_string(D); }
 inline std::string mamba2_kernel_name(int D) { return "mamba2_" + std::to_string(D); }
+inline std::string cmplx_matmul_kernel_name(const std::string& t) { return "cmplx_matmul_" + t; }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -225,6 +226,18 @@ void launch_mamba2(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in
   e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(cumlog, 3); e.out(Y, 4);
   e.bytes(N, 5); e.bytes(H, 6);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
+// ----- cmplx_matmul: D@0 A@1 B@2 ; N@3 K@4 M@5 (i32) ; grid (M/32, N/32, 1) group (32,1,1).
+//        Complex GEMM D = A @ B; each operand has a leading size-2 (real,imag) axis:
+//        A (2,N,K), B (2,K,M), D (2,N,M). Uses the complex_mma_AB primitive. -----
+template <class E>
+void launch_cmplx_matmul(E& e, typename E::out_t d, typename E::in_t a, typename E::in_t b,
+                         int N, int K, int M, const std::string& t) {
+  e.pipeline(cmplx_matmul_kernel_name(t));
+  e.out(d, 0); e.in(a, 1); e.in(b, 2);
+  e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
+  e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
 }
 
 } // namespace tk

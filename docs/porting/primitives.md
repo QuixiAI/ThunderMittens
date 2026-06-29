@@ -9,7 +9,9 @@ primitives and need **no new substrate code**.
 - **Types:** register tiles/vectors (`rt`, `rv`, `crt`, `crv`), shared tiles/vectors (`st`, `sv`,
   `cst`, `csv`), global layouts (`gl`, `cgl`). `TILE_DIM=8`, `SIMD_THREADS=32`.
 - **MMA:** `simdgroup_matrix` wrappers `mma_AB / mma_ABt / mma_AtB / mma_AtBt` (+ `mm_*`), with
-  full register-layout (row/col) handling. `include/ops/warp/register/tile/mma.metal`.
+  full register-layout (row/col) handling. Plus **complex** MMA on `crt` tiles —
+  `complex_mma_AB / _ABt / _AtB / _AtBt` (+ `complex_mm_AB`), four real MMAs on the `.real`/`.imag`
+  components. `include/ops/warp/register/tile/mma.metal`.
 - **Memory:** global↔register, global↔shared, shared↔register load/store for tiles and vectors,
   with on-the-fly dtype conversion (bf16↔fp32↔fp16). Warp- and group-level.
 - **Compute:** elementwise maps (`exp`, `exp2`, `log`, `abs`, `relu`, `sqrt`, `rsqrt`,
@@ -37,7 +39,7 @@ primitives and need **no new substrate code**.
 | Gap | Impact | Plan |
 |---|---|---|
 | **Async copy / `cp.async` / TMA** | None — Metal has no direct equivalent | Intentionally skipped. Use sync `load`, or stage via shared + `threadgroup_barrier` when a kernel needs overlap. |
-| **Complex MMA** | Only complex kernels (fftconv) | `crt`/`crv` types exist; add complex-multiply MMA wrappers when porting fftconv. Deferred until a complex kernel drives it. |
+| ~~**Complex MMA**~~ | ~~fftconv~~ | ✅ DONE — `complex_mma_AB/_ABt/_AtB/_AtBt` (+ `complex_mm_AB`) in `mma.metal`, four real MMAs on `.real`/`.imag` (`Dr=Ar·Br−Ai·Bi`, `Di=Ar·Bi+Ai·Br`). Validated via the `cmplx_matmul` kernel. |
 | **Subtile integration / some layout-conversion edges** | Low | Noted as TODO in `st.metal` and register `conversions.metal`; address per-kernel as needed. |
 | **Shared allocator / non-default max shared mem** | Low | `utils.metal` TODO; relevant for large shared-tile kernels (GEMM staging). Deferred until a staging kernel drives it. |
 

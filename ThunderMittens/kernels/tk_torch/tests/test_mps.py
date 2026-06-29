@@ -271,6 +271,24 @@ def test_mamba2(shape):
     assert diff / scale < 0.03
 
 
+@pytest.mark.parametrize("nkm", [(32, 16, 32), (64, 32, 64), (128, 64, 128)])
+def test_cmplx_matmul(nkm):
+    N, K, M = nkm
+    torch.manual_seed(0)
+    A = torch.randn(2, N, K, dtype=torch.float32, device="mps")
+    B = torch.randn(2, K, M, dtype=torch.float32, device="mps")
+    got = tk_torch.cmplx_matmul(A, B)
+    torch.mps.synchronize()
+    a = torch.complex(A[0], A[1]).cpu()
+    b = torch.complex(B[0], B[1]).cpu()
+    ref = a @ b
+    g = got.cpu()
+    assert got.shape == (2, N, M)
+    rel = max((g[0] - ref.real).abs().max().item(),
+              (g[1] - ref.imag).abs().max().item()) / (ref.abs().max().item() + 1e-9)
+    assert rel < 2e-2
+
+
 def test_dispatch_routes_torch_to_mps():
     """tk.<kernel>(torch.Tensor) routes to the MPS backend (no MLX needed)."""
     import tk

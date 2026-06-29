@@ -37,6 +37,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "hedgehog", "hedgehog.metal"),
     os.path.join(_KERNELS, "lin_attn_causal", "lin_attn_causal.metal"),
     os.path.join(_KERNELS, "mamba2", "mamba2.metal"),
+    os.path.join(_KERNELS, "cmplx_matmul", "cmplx_matmul.metal"),
 ]
 
 
@@ -163,3 +164,9 @@ def lin_attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 def mamba2(C: torch.Tensor, B: torch.Tensor, X: torch.Tensor, cumlog: torch.Tensor):
     """Mamba-2 / SSD forward. C,B,X bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS; D=64, N%8."""
     return _ext.mamba2(C, B, X, cumlog)
+
+
+def cmplx_matmul(a: torch.Tensor, b: torch.Tensor):
+    """Complex GEMM D=A@B; leading size-2 (real,imag) axis: a (2,N,K), b (2,K,M) -> (2,N,M).
+    f32/bf16 MPS; N%32, M%32, K%16."""
+    return _ext.cmplx_matmul(a, b)

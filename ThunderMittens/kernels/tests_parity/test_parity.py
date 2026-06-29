@@ -179,6 +179,17 @@ def test_lin_attn_causal_parity(shape):
     _assert_parity(om, ot, atol=1.0)
 
 
+@pytest.mark.parametrize("nkm", [(32, 16, 32), (64, 32, 64)])
+def test_cmplx_matmul_parity(nkm):
+    N, K, M = nkm
+    rng = np.random.default_rng(0)
+    A = rng.standard_normal((2, N, K)).astype(np.float32)
+    B = rng.standard_normal((2, K, M)).astype(np.float32)
+    om = tk.cmplx_matmul(_mk(A, "mlx", "f32"), _mk(B, "mlx", "f32"))
+    ot = tk.cmplx_matmul(_mk(A, "torch", "f32"), _mk(B, "torch", "f32"))
+    _assert_parity(om, ot, atol=1e-3)
+
+
 @pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 2, 128, 64)])
 def test_mamba2_parity(shape):
     B, H, N, D = shape

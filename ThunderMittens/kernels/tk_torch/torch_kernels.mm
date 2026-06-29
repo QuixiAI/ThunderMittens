@@ -369,6 +369,21 @@ static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
   return out;
 }
 
+static at::Tensor cmplx_matmul_mps(const at::Tensor& a_in, const at::Tensor& b_in) {
+  TORCH_CHECK(a_in.device().is_mps(), "cmplx_matmul: a must be an MPS tensor");
+  TORCH_CHECK(a_in.scalar_type() == at::kFloat || a_in.scalar_type() == at::kBFloat16,
+              "cmplx_matmul: dtype float32 or bfloat16");
+  auto a = a_in.contiguous(), b = b_in.contiguous();
+  TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && a.size(0) == 2 && b.size(0) == 2 &&
+              a.size(2) == b.size(1), "cmplx_matmul: a (2,N,K), b (2,K,M)");
+  const int N = a.size(1), K = a.size(2), M = b.size(2);
+  TORCH_CHECK(N % 32 == 0 && M % 32 == 0 && K % 16 == 0, "cmplx_matmul: N%32,M%32,K%16");
+  auto out = at::empty({2, N, M}, a.options());
+  const std::string tn = tk_type_name(a);
+  tk_encode([&](TorchEncoder& e) { tk::launch_cmplx_matmul(e, out, a, b, N, K, M, tn); });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
@@ -388,4 +403,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("hedgehog", &hedgehog_mps, "ThunderMittens hedgehog linear attention (MPS)");
   m.def("lin_attn_causal", &lin_attn_causal_mps, "ThunderMittens causal linear attention (MPS)");
   m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
+  m.def("cmplx_matmul", &cmplx_matmul_mps, "ThunderMittens complex GEMM (MPS)");
 }

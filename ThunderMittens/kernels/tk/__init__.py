@@ -169,3 +169,11 @@ def mamba2(C, B, X, cumlog):
     if _is_torch(C):
         return _torch().mamba2(C, B, X, cumlog)
     return _mlx().mamba2(C, B, X, cumlog)
+
+
+def cmplx_matmul(a, b):
+    """Complex GEMM D=A@B; operands carry a leading size-2 (real,imag) axis: a (2,N,K),
+    b (2,K,M) -> (2,N,M). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(a):
+        return _torch().cmplx_matmul(a, b)
+    return _mlx().cmplx_matmul(a, b)

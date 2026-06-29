@@ -14,6 +14,12 @@
 > primitive drops into a fused kernel). Remaining: Phase 5 dequant-direct-to-fragment (Marlin
 > zero-shuffle, needs the Apple 8×8 fragment map); more retrofits (attention quantized-KV).
 
+> **W·A8 (parity).** Beyond weight-only (W·A16), the activation-quantized schemes work via
+> `tk.qmm(wq, x, w_format, act=...)`: `act="int8"|"fp8"` snaps activations to the 8-bit grid
+> (`tk.quant.quantize_act_int8/_fp8`, per-token) then runs the existing dequant-to-half GEMM —
+> reproducing **fp8 W8A8, int8 W8A8, int8 W4A8** fake-quant numerics. Apple has no int8/fp8 matmul,
+> so this is parity, not speed. W4A16 / W8A16 are just `act=None`.
+
 ## The correction
 
 I previously parked the quantized-GEMM family (`gemm/{fp8_*, int8_*, mxfp8_*, nvfp4_*}`) as

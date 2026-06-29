@@ -374,6 +374,31 @@ def dequantize_bitnet(packed):
     return (scale * (codes.astype(np.float32) - 1.0)).reshape(N, nb * 32)
 
 
+# ---- Activation quantization (for W·A8 schemes: fp8 W8A8, int8 W8A8, int8 W4A8).
+# On Apple there is no int8/fp8 matmul, so "A8" = snap activations to the 8-bit grid then run the
+# existing dequant-to-half GEMM. This reproduces the W·A8 fake-quant numerics (parity), not speed.
+# Per-token (per output column of X (K,M)) symmetric scales. Each returns:
+#   (x_rounded float32  [= activation snapped to the grid, feed this as the fp16 GEMM input],
+#    codes, scale). ----
+def quantize_act_int8(X):
+    X = np.ascontiguousarray(X, np.float32)
+    s = (np.abs(X).max(axis=0, keepdims=True) / 127.0).astype(np.float32)   # (1, M) per-token
+    ssafe = np.where(s == 0, 1.0, s)
+    Xq = np.clip(np.rint(X / ssafe), -127, 127).astype(np.int8)
+    return (Xq.astype(np.float32) * s), Xq, s
+
+
+def quantize_act_fp8(X):
+    X = np.ascontiguousarray(X, np.float32)
+    s = (np.abs(X).max(axis=0, keepdims=True) / 448.0).astype(np.float32)
+    ssafe = np.where(s == 0, 1.0, s)
+    codes = _nearest(X / ssafe, _E4M3_CODES, _E4M3_VALS)
+    return (_e4m3_decode_arr(codes) * s), codes, s
+
+
+ACT_FORMATS = {"int8": quantize_act_int8, "fp8": quantize_act_fp8}
+
+
 # Format registry: name -> (quantize, dequantize). Drives the parametrized tests.
 QUANT_FORMATS = {
     "q8_0": (quantize_q8_0, dequantize_q8_0),

@@ -214,3 +214,36 @@ def qflux_gelu(wq, x, bias, format="q8_0"):
     if _is_torch(wq):
         return _torch().qflux_gelu(wq, x, bias, format)
     return _mlx().qflux_gelu(wq, x, bias, format=format)
+
+
+def _round_activation(x, act):
+    """Snap activations x (K,M) to the 8-bit grid (int8/fp8), returning a fp16 array of the same
+    framework. On Apple there's no int8/fp8 matmul, so W·A8 = round activations then the half GEMM
+    (parity numerics). Rounding is done in numpy (a parity tool, not a perf path)."""
+    import numpy as np
+    from .quant import ACT_FORMATS
+    if act not in ACT_FORMATS:
+        raise ValueError(f"act must be one of {list(ACT_FORMATS)} or None, got {act!r}")
+    if _is_torch(x):
+        import torch
+        xr = ACT_FORMATS[act](x.detach().float().cpu().numpy())[0]
+        return torch.from_numpy(xr).to(x.device, torch.float16)
+    import mlx.core as mx
+    xr = ACT_FORMATS[act](np.array(x.astype(mx.float32)))[0]
+    return mx.array(xr).astype(mx.float16)
+
+
+def qmm(wq, x, w_format="q8_0", act=None):
+    """Quantized matmul = dequantize(wq) @ x. Weight quantized via `w_format`; if `act` is
+    "int8"/"fp8" the activations are also quantized (W·A8 parity: fp8 W8A8, int8 W8A8, int8 W4A8),
+    else they stay fp16 (W·A16). Routes batch-1 (M==1) to the GEMV decode path. wq (N,K/bk,bytes)
+    uint8; x (K,M) -> (N,M) float16. Accepts mlx.array or torch.Tensor (MPS)."""
+    if act is not None:
+        xq = _round_activation(x, act)
+    elif _is_torch(x):
+        import torch
+        xq = x.to(torch.float16)
+    else:
+        import mlx.core as mx
+        xq = x.astype(mx.float16)
+    return qgemm(wq, xq, w_format)

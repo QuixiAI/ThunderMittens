@@ -488,6 +488,70 @@ def dequantize_iq4_xs(packed):
     return out.reshape(N, nb * 256)
 
 
+# ---- iq2_xxs : E8-lattice 2.0625 bpw. { half d; uint16 qs[32]; } = 66 bytes, 256 weights.
+# Decode mirrors ggml dequantize_iq2_xxs (grid lookup + ksigns + 4-bit sub-scale). The encoder
+# produces a valid packed block (nearest grid entry per group of 8, signs in the low 7 bits, scale
+# from the magnitude); kernel-vs-oracle only requires kernel decode == this dequantize. ----
+from .quant_tables import IQ2XXS_GRID, KSIGNS_IQ2XS, KMASK_IQ2XS
+
+_IQ2XXS_GMAG = np.stack([((IQ2XXS_GRID >> (8 * e)) & 0xFF).astype(np.float32) for e in range(8)], axis=1)  # (256,8)
+
+
+def dequantize_iq2_xxs(packed):
+    packed = np.ascontiguousarray(packed, np.uint8)
+    N, nb, _ = packed.shape
+    d = np.ascontiguousarray(packed[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    qs = np.ascontiguousarray(packed[:, :, 2:66]).reshape(N, nb * 64).view(np.uint16).reshape(N, nb, 32).astype(np.uint32)
+    out = np.zeros((N, nb, 256), np.float32)
+    for ib in range(8):
+        q2 = qs[:, :, 4 * ib:4 * ib + 4]
+        aux_g = q2[:, :, 0] | (q2[:, :, 1] << 16)
+        aux_s = q2[:, :, 2] | (q2[:, :, 3] << 16)
+        dl = d * (0.5 + (aux_s >> 28).astype(np.float32)) * 0.25                  # (N,nb)
+        for sub in range(4):
+            g = (aux_g >> (8 * sub)) & 0xFF                                       # (N,nb)
+            ge = IQ2XXS_GRID[g]                                                   # (N,nb) uint64
+            signs = KSIGNS_IQ2XS[(aux_s >> (7 * sub)) & 127].astype(np.int32)     # (N,nb)
+            for e in range(8):
+                gv = ((ge >> np.uint64(8 * e)) & np.uint64(0xFF)).astype(np.float32)
+                sgn = np.where(signs & int(KMASK_IQ2XS[e]), -1.0, 1.0)
+                out[:, :, ib * 32 + sub * 8 + e] = dl * gv * sgn
+    return out.reshape(N, nb * 256)
+
+
+def quantize_iq2_xxs(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
+    Wsb = W.reshape(N, nb, 8, 32)
+    dl_target = (np.abs(Wsb).mean(axis=3) / 8.0).astype(np.float32)               # ~ mean grid mag 8
+    d = (4.0 * dl_target).max(axis=2) / 15.5                                      # (N,nb) super scale
+    dsafe = np.where(d == 0, 1.0, d).astype(np.float32)
+    s4 = np.clip(np.rint(4.0 * dl_target / dsafe[..., None] - 0.5), 0, 15).astype(np.int32)
+    dl = dsafe[..., None] * (0.5 + s4) * 0.25
+    dlsafe = np.where(dl == 0, 1.0, dl)
+    qs = np.zeros((N, nb, 32), np.uint16)
+    for ib in range(8):
+        aux_s = (s4[:, :, ib].astype(np.uint32) << 28)
+        aux_g = np.zeros((N, nb), np.uint32)
+        for sub in range(4):
+            seg = Wsb[:, :, ib, sub * 8:sub * 8 + 8]                              # (N,nb,8)
+            target = np.abs(seg) / dlsafe[:, :, ib, None]
+            dist = ((target[..., None, :] - _IQ2XXS_GMAG[None, None, :, :]) ** 2).sum(-1)  # (N,nb,256)
+            g = dist.argmin(-1).astype(np.uint32)
+            aux_g |= (g << (8 * sub))
+            patt = np.zeros((N, nb), np.uint32)
+            for i in range(8):
+                patt |= ((seg[..., i] < 0).astype(np.uint32) << i)
+            aux_s |= ((patt & 0x7F) << (7 * sub))
+        qs[:, :, 4 * ib + 0] = (aux_g & 0xFFFF).astype(np.uint16)
+        qs[:, :, 4 * ib + 1] = (aux_g >> 16).astype(np.uint16)
+        qs[:, :, 4 * ib + 2] = (aux_s & 0xFFFF).astype(np.uint16)
+        qs[:, :, 4 * ib + 3] = (aux_s >> 16).astype(np.uint16)
+    out = np.zeros((N, nb, 66), np.uint8)
+    out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 2:66] = qs.view(np.uint8).reshape(N, nb, 64)
+    return out
+
+
 # Format registry: name -> (quantize, dequantize). Drives the parametrized tests.
 QUANT_FORMATS = {
     "q8_0": (quantize_q8_0, dequantize_q8_0),
@@ -503,4 +567,5 @@ QUANT_FORMATS = {
     "bitnet": (quantize_bitnet, dequantize_bitnet),
     "iq4_nl": (quantize_iq4_nl, dequantize_iq4_nl),
     "iq4_xs": (quantize_iq4_xs, dequantize_iq4_xs),
+    "iq2_xxs": (quantize_iq2_xxs, dequantize_iq2_xxs),
 }

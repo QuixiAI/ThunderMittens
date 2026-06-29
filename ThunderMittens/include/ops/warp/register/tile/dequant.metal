@@ -15,6 +15,7 @@
 #pragma once
 #include "../../../../common/common.metal"
 #include "../../../../types/types.metal"
+#include "dequant_tables.metal"   // GGUF i-quant lattice/codebook constant tables (namespace mittens)
 
 namespace mittens {
 
@@ -70,6 +71,29 @@ struct iq4_xs {
         const int nib = (local < 16) ? (qs[16 * ib + local] & 0x0F)
                                      : (qs[16 * ib + (local - 16)] >> 4);
         return dl * half(kvalues_iq4nl[nib]);
+    }
+};
+
+// ---- iq2_xxs : E8-lattice 2.0625 bpw. { half d; uint16 qs[32]; } = 66 bytes, 256 weights.
+//   Per block-of-32 (4 groups of 8): 4 uint16 = grid indices (aux_g) + signs/scale (aux_s). Each
+//   8-bit grid index selects an iq2xxs_grid entry (8 packed uint8 magnitudes); a 7-bit ksigns index
+//   gives the 8 signs; the top 4 bits of aux_s give the sub-scale. (ggml-metal dequantize_iq2_xxs.) ----
+struct iq2_xxs {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 66;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        device const ushort* qs = (device const ushort*)(base + 2);
+        const int ib32 = col >> 5, p = col & 31, sub = p >> 3, elem = p & 7;
+        device const ushort* q2 = qs + 4 * ib32;
+        const uint aux_g = (uint)q2[0] | ((uint)q2[1] << 16);
+        const uint aux_s = (uint)q2[2] | ((uint)q2[3] << 16);
+        const uint g = (aux_g >> (8 * sub)) & 0xff;
+        const uint gv = (uint)((iq2xxs_grid[g] >> (8 * elem)) & 0xffUL);
+        const uchar signs = ksigns_iq2xs[(aux_s >> (7 * sub)) & 127];
+        const half dl = d * (0.5h + half((aux_s >> 28) & 0xf)) * 0.25h;
+        const half sgn = (signs & kmask_iq2xs[elem]) ? -1.0h : 1.0h;
+        return dl * half(gv) * sgn;
     }
 };
 

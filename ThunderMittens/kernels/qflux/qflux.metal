@@ -82,5 +82,6 @@ instantiate_qflux("qflux_gelu_mxfp4", mxfp4);
 instantiate_qflux("qflux_gelu_bitnet", bitnet);
 instantiate_qflux("qflux_gelu_iq4_nl", iq4_nl);
 instantiate_qflux("qflux_gelu_iq4_xs", iq4_xs);
+instantiate_qflux("qflux_gelu_iq2_xxs", iq2_xxs);
 
 }

@@ -983,6 +983,100 @@ def dequantize_q6_K(packed):
     return out.reshape(N, nb * 256)
 
 
+# ================= Phase 4: float sub-formats ====================================================
+def _e5m2_decode_arr(b):
+    b = b.astype(np.int32); s = (b >> 7) & 1; e = (b >> 2) & 0x1F; m = b & 3
+    val = np.where(e == 0, (m / 4.0) * 2.0 ** -14, (1.0 + m / 4.0) * 2.0 ** (e - 15))
+    return np.where(s == 1, -val, val).astype(np.float32)
+
+
+def _fp6_decode_arr(c, e3m2):
+    c = c.astype(np.int32); s = (c >> 5) & 1
+    if e3m2:
+        e = (c >> 2) & 7; m = c & 3
+        val = np.where(e == 0, (m / 4.0) * 2.0 ** -2, (1.0 + m / 4.0) * 2.0 ** (e - 3))
+    else:
+        e = (c >> 3) & 3; m = c & 7
+        val = np.where(e == 0, (m / 8.0), (1.0 + m / 8.0) * 2.0 ** (e - 1))
+    return np.where(s == 1, -val, val).astype(np.float32)
+
+
+_E5M2_CODES = np.array([b for b in range(256) if ((b >> 2) & 0x1F) != 0x1F], np.uint8)  # excl inf/nan
+_E5M2_VALS = _e5m2_decode_arr(_E5M2_CODES)
+_E3M2_CODES = np.arange(64, dtype=np.uint8); _E3M2_VALS = _fp6_decode_arr(_E3M2_CODES, True)
+_E2M3_CODES = np.arange(64, dtype=np.uint8); _E2M3_VALS = _fp6_decode_arr(_E2M3_CODES, False)
+
+
+def quantize_e5m2(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
+    Wb = W.reshape(N, nb, 32)
+    scale = (np.abs(Wb).max(axis=2) / 57344.0).astype(np.float32)           # e5m2 max normal
+    ssafe = np.where(scale == 0, 1.0, scale)
+    codes = _nearest(Wb / ssafe[..., None], _E5M2_CODES, _E5M2_VALS)
+    out = np.zeros((N, nb, 34), np.uint8)
+    out[:, :, 0:2] = _f16le(scale, N, nb); out[:, :, 2:34] = codes
+    return out
+
+
+def dequantize_e5m2(packed):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    scale = np.ascontiguousarray(p[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    return (scale * _e5m2_decode_arr(p[:, :, 2:34])).reshape(N, nb * 32)
+
+
+def quantize_fp8_block(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 128
+    Wb = W.reshape(N, nb, 128)
+    scale_full = np.zeros((N, nb), np.float32)
+    for r0 in range(0, N, 128):                                            # 128-row tiles (last may be short)
+        r1 = min(r0 + 128, N)
+        amax = np.abs(W[r0:r1].reshape(r1 - r0, nb, 128)).max(axis=(0, 2))  # (nb,) per 128x128 tile
+        scale_full[r0:r1] = (amax / 448.0)[None, :]
+    ssafe = np.where(scale_full == 0, 1.0, scale_full)
+    codes = _nearest(Wb / ssafe[..., None], _E4M3_CODES, _E4M3_VALS)
+    out = np.zeros((N, nb, 130), np.uint8)
+    out[:, :, 0:2] = _f16le(scale_full, N, nb); out[:, :, 2:130] = codes
+    return out
+
+
+def dequantize_fp8_block(packed):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    scale = np.ascontiguousarray(p[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    return (scale * _e4m3_decode_arr(p[:, :, 2:130])).reshape(N, nb * 128)
+
+
+def _quantize_mxfp6(W, e3m2):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
+    Wb = W.reshape(N, nb, 32)
+    codes_t, vals_t = (_E3M2_CODES, _E3M2_VALS) if e3m2 else (_E2M3_CODES, _E2M3_VALS)
+    maxval = 28.0 if e3m2 else 7.5
+    amax = np.abs(Wb).max(axis=2)
+    exp = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30) / maxval)), 0.0)
+    e8m0 = np.clip(exp + 127, 0, 254).astype(np.int32)
+    scale = (2.0 ** (e8m0 - 127)).astype(np.float32)
+    codes6 = _nearest(Wb / scale[..., None], codes_t, vals_t).astype(np.uint32).reshape(N, nb, 8, 4)
+    val = codes6[..., 0] | (codes6[..., 1] << 6) | (codes6[..., 2] << 12) | (codes6[..., 3] << 18)  # (N,nb,8)
+    out = np.zeros((N, nb, 25), np.uint8)
+    out[:, :, 0] = e8m0.astype(np.uint8)
+    out[:, :, 1:25] = np.stack([val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF], axis=-1).reshape(N, nb, 24)
+    return out
+
+
+def _dequantize_mxfp6(packed, e3m2):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    scale = (2.0 ** (p[:, :, 0].astype(np.int32) - 127)).astype(np.float32)[..., None]
+    cb = p[:, :, 1:25].astype(np.uint32).reshape(N, nb, 8, 3)
+    val = cb[..., 0] | (cb[..., 1] << 8) | (cb[..., 2] << 16)               # (N,nb,8)
+    codes = np.stack([(val >> (6 * w)) & 0x3F for w in range(4)], axis=-1).reshape(N, nb, 32)
+    return (scale * _fp6_decode_arr(codes, e3m2)).reshape(N, nb * 32)
+
+
+def quantize_mxfp6_e3m2(W): return _quantize_mxfp6(W, True)
+def dequantize_mxfp6_e3m2(p): return _dequantize_mxfp6(p, True)
+def quantize_mxfp6_e2m3(W): return _quantize_mxfp6(W, False)
+def dequantize_mxfp6_e2m3(p): return _dequantize_mxfp6(p, False)
+
+
 # Format registry: name -> (quantize, dequantize). Drives the parametrized tests.
 QUANT_FORMATS = {
     "q8_0": (quantize_q8_0, dequantize_q8_0),
@@ -1006,6 +1100,10 @@ QUANT_FORMATS = {
     "q3_K": (quantize_q3_K, dequantize_q3_K),
     "q5_K": (quantize_q5_K, dequantize_q5_K),
     "q6_K": (quantize_q6_K, dequantize_q6_K),
+    "e5m2": (quantize_e5m2, dequantize_e5m2),
+    "fp8_block": (quantize_fp8_block, dequantize_fp8_block),
+    "mxfp6_e3m2": (quantize_mxfp6_e3m2, dequantize_mxfp6_e3m2),
+    "mxfp6_e2m3": (quantize_mxfp6_e2m3, dequantize_mxfp6_e2m3),
     "iq2_xs": (quantize_iq2_xs, dequantize_iq2_xs),
     "iq3_xxs": (quantize_iq3_xxs, dequantize_iq3_xxs),
     "iq1_s": (quantize_iq1_s, dequantize_iq1_s),

@@ -264,6 +264,30 @@ METAL_FUNC half tk_e2m1_decode(uint nib) {
                         : (1.0h + half(m) * 0.5h) * metal::exp2(half((int)e - 1));
     return ((nib >> 3) & 1) ? -val : val;
 }
+// fp8 e5m2 (1-5-2, bias 15): value = (-1)^s * (1 + m/4) * 2^(e-15), subnormal at e==0 (e=31 is inf/nan).
+METAL_FUNC half tk_e5m2_decode(uchar v) {
+    const uint e = (v >> 2) & 0x1F;
+    const uint m = v & 0x3;
+    half val = (e == 0) ? (half(m) * 0.25h * metal::exp2(-14.0h))     // (m/4) * 2^-14
+                        : (1.0h + half(m) * 0.25h) * metal::exp2(half((int)e - 15));
+    return ((v >> 7) & 1) ? -val : val;
+}
+// fp6 e3m2 (1-3-2, bias 3): 6-bit code, sign at bit 5.
+METAL_FUNC half tk_e3m2_decode(uint c) {
+    const uint e = (c >> 2) & 0x7;
+    const uint m = c & 0x3;
+    half val = (e == 0) ? (half(m) * 0.25h * metal::exp2(-2.0h))      // subnormal (m/4)*2^-2
+                        : (1.0h + half(m) * 0.25h) * metal::exp2(half((int)e - 3));
+    return ((c >> 5) & 1) ? -val : val;
+}
+// fp6 e2m3 (1-2-3, bias 1): 6-bit code, sign at bit 5.
+METAL_FUNC half tk_e2m3_decode(uint c) {
+    const uint e = (c >> 3) & 0x3;
+    const uint m = c & 0x7;
+    half val = (e == 0) ? (half(m) * 0.125h)                          // subnormal (m/8)*2^0
+                        : (1.0h + half(m) * 0.125h) * metal::exp2(half((int)e - 1));
+    return ((c >> 5) & 1) ? -val : val;
+}
 
 // ---- fp8_e4m3 : per-group (32) half-scaled fp8. { half scale; uint8 qs[32]; } — 34 bytes.
 //   value = scale * e4m3(q). ----
@@ -343,6 +367,42 @@ struct bitnet {
     }
     static METAL_FUNC half gscale(device const uchar* base) { return ((device const half*)base)[0]; }
 };
+
+// ============================ Phase 4: float sub-formats =========================================
+// ---- e5m2 : per-group (32) half-scaled fp8 e5m2. { half scale; uint8 qs[32]; } — 34 bytes. ----
+struct e5m2 {
+    constant static constexpr const int block_k = 32, block_bytes = 34;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        return ((device const half*)base)[0] * tk_e5m2_decode((base + 2)[col]);
+    }
+};
+
+// ---- fp8_block : 128x128 block-scaled fp8 e4m3 (compressed-tensors). Laid out as a per-row k-block
+//   of 128 with the (128-row x 128-col) tile scale replicated into each row's scale slot, so the
+//   per-row dequant reads the shared block scale. { half scale; uint8 qs[128]; } — 130 bytes. ----
+struct fp8_block {
+    constant static constexpr const int block_k = 128, block_bytes = 130;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        return ((device const half*)base)[0] * tk_e4m3_decode((base + 2)[col]);
+    }
+};
+
+// ---- mxfp6 (e3m2 / e2m3) : OCP microscaling 6-bit. { uint8 e8m0; uint8 codes[24]; } — 25 bytes,
+//   32 weights. 4 six-bit codes pack into 3 bytes (little-endian 24-bit groups). scale = 2^(e-127). ----
+template<bool E3M2>
+struct mxfp6 {
+    constant static constexpr const int block_k = 32, block_bytes = 25;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half scale = metal::exp2(half((int)base[0] - 127));
+        const int g = col >> 2, within = col & 3;
+        device const uchar* p = base + 1 + 3 * g;
+        const uint val = (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16);
+        const uint c = (val >> (6 * within)) & 0x3F;
+        return scale * (E3M2 ? tk_e3m2_decode(c) : tk_e2m3_decode(c));
+    }
+};
+using mxfp6_e3m2 = mxfp6<true>;
+using mxfp6_e2m3 = mxfp6<false>;
 
 // ============================ Phase 3: GGUF k-quant + legacy fan-out ============================
 // Byte layouts match ggml-common.h; per-column decoders mirror the ggml CPU dequantize_row_* refs.

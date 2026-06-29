@@ -82,5 +82,9 @@ instantiate_qflux("qflux_gelu_q2_K", q2_K);
 instantiate_qflux("qflux_gelu_q3_K", q3_K);
 instantiate_qflux("qflux_gelu_q5_K", q5_K);
 instantiate_qflux("qflux_gelu_q6_K", q6_K);
+instantiate_qflux("qflux_gelu_e5m2", e5m2);
+instantiate_qflux("qflux_gelu_fp8_block", fp8_block);
+instantiate_qflux("qflux_gelu_mxfp6_e3m2", mxfp6_e3m2);
+instantiate_qflux("qflux_gelu_mxfp6_e2m3", mxfp6_e2m3);
 
 }

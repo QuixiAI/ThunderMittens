@@ -53,9 +53,16 @@ TK files are hardware-specific *variants* of one algorithm:
   (feature-map), and `mamba2` (selective SSD with the decay-tile). A Taylor feature map for `based` is
   a small variant of `hedgehog`/`linear_attn`.
 
-**Portable — remaining open work (feasible on Apple):**
-- Perf tuning of `gemm_staged` (double-buffered, larger tiles) and `attn_multiwarp`. (All distinct
-  algorithmic kernels are now ported; this is throughput optimization of correct kernels.)
+**Perf tuning (investigated — finding below):**
+All distinct algorithmic kernels are ported. The multi-simdgroup shared-staging kernels
+(`gemm_staged`, `attn_multiwarp`) are correct and *competitive* but do **not** beat the
+single-simdgroup kernels on Apple GPUs, and tuning confirmed this is structural:
+- A bigger 4-simdgroup `BM=128` GEMM tile benchmarked **−20…26%** at 1024/2048 (occupancy) — reverted.
+- 2 vs 4 simdgroups for `attn_multiwarp` were equivalent (~5% behind `attn_fwd`).
+- Root cause: Metal has no async global→shared copy (`cp.async`/TMA) to overlap staging with compute
+  the way the H100 kernels do, and these shapes are compute/cache-bound — so reducing global traffic
+  via sharing doesn't pay. The simpler single-simdgroup kernels are near-optimal; `matmul_custom`/
+  `gemm_staged` sit within ~5% of `mx.matmul`. (Benchmark: `python time_perf.py`.)
 
 **Substrate-blocked:**
 - `fftconv` — needs **complex MMA** wrappers (the `crt`/`crv` complex types exist but have no

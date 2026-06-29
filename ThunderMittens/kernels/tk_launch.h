@@ -158,7 +158,8 @@ void launch_flux_gate(E& e, typename E::out_t d, typename E::in_t a, typename E:
 }
 
 // ----- gemm_staged: D@0 A@1 B@2 ; N@3 K@4 M@5 (i32) ; grid (M/32, N/32, 1), 64 threads
-//        (2 simdgroups) per threadgroup. A (N,K), B (K,M), out (N,M). -----
+//        (2 simdgroups) per threadgroup. A (N,K), B (K,M), out (N,M). A bigger 4-simdgroup
+//        BM=128 tile was benchmarked and is slower (see gemm_staged.metal). -----
 template <class E>
 void launch_gemm_staged(E& e, typename E::out_t d, typename E::in_t a, typename E::in_t b,
                         int N, int K, int M, const std::string& t) {
@@ -173,7 +174,7 @@ void launch_gemm_staged(E& e, typename E::out_t d, typename E::in_t a, typename 
 template <class E>
 void launch_attn_multiwarp(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
                            typename E::out_t o, unsigned N, unsigned H, int B, int D) {
-  constexpr int NUM_WARPS = 4;
+  constexpr int NUM_WARPS = 4;  // 2 vs 4 benchmarked equivalent (both ~5% behind attn_fwd)
   e.pipeline(attn_multiwarp_kernel_name(D));
   e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
   e.bytes(N, 4); e.bytes(H, 5);

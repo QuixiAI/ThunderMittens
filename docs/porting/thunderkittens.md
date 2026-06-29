@@ -25,23 +25,47 @@ Drop async double-buffering for v1. Validate every kernel against an MLX/NumPy o
 | `flux_gelu` / `flux_gate` | `flux/flux_gelu.cu`, `flux_gate.cu` | ✅ | gelu(x@w+b) / (x@w+b)*g+r | Fused GEMM epilogue (register `add_col`/`mul_col`/`gelu` + tile add). `kernels/flux/` |
 | `gemm_staged` | `gemm/bf16_h100` | ✅ 🏎️ | `mx.matmul` | Multi-simdgroup, threadgroup-staged GEMM (2 warps share the A block via shared mem). Competitive with `matmul_custom` and `mx.matmul`. `kernels/gemm_staged/` |
 | `attn_multiwarp` | `attention/mha_h100` | ✅ 🏎️ | SDPA (scale 1/√D) | Multi-warp flash-attn fwd (4 simdgroups share each K/V block via shared mem). Correct; not yet faster than `attn_fwd` at tested shapes (staging overhead) — perf tuning is future work. `kernels/attn_multiwarp/` |
+| `linear_attn` | `linear_attention`, `based/linear_attn` | ✅ | `Q @ (Kᵀ @ V)` | Non-causal linear attention (identity feature map), D=64; `mma_AtB` then `mma_AB` with D×D register state. `kernels/linear_attn/` |
 
 All kernels ship on **both** backends (MLX + PyTorch MPS) via `tk_launch.h`. Run all:
 `cd ThunderMittens/kernels && python -m pytest */correctness/ tk_torch/tests/ tests_parity/ -q`
-(163 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
+(170 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
 Benchmark the perf kernels: `python time_perf.py`.
 
-## Remaining perf-tuning work (correctness complete)
+## Completion map — the full 58-file TK inventory on Apple
 
-The multi-simdgroup kernels above are correct and validated; further throughput tuning is open:
-larger threadgroup tiles + double-buffered staging for GEMM, and tuned tile sizes / register
-pressure for multi-warp attention (currently the staging overhead offsets the single-warp version).
-Heavier families (sequence/state-space, quantized, distributed) remain per the inventory below.
+"Absolute completion" on Apple means covering every *algorithmically-distinct, Apple-feasible* kernel
+and honestly accounting for the rest. The 58 TK files break down as:
 
-## Later (heavier / hardware-coupled)
+**Done (algorithms ported, dual-backend, validated)** — covers the bulk of the inventory because most
+TK files are hardware-specific *variants* of one algorithm:
+- Attention: `attention/{mha_h100, mha_h100_lcf, bf16_b300_mha_causal, bf16_b300_mha_noncausal}` are
+  all flash-attention forward → ported as `attn_fwd` (non-causal), `attn_causal`, `attn_multiwarp`.
+- GEMM: `gemm/{bf16_h100, bf16_b200}` (+ the `educational_h100`/`educational_b200` level_01..09 = GEMM
+  tutorials) → `matmul_custom` (+ arbitrary shapes) and `gemm_staged`.
+- Norm/rotary/activation/fusion: `layernorm`, `rotary`, `flux/{flux_gelu,flux_gate}` → ported; plus
+  `rms_norm`, `softmax`, `gelu` (TK has these inline/fused).
+- Sequence (entry point): `linear_attention` / `based/linear_attn` → `linear_attn` (non-causal,
+  identity feature map).
 
-- Sequence/state-space: `based/linear_attn`, `linear_attention`, `hedgehog`, `mamba2`, `fftconv`.
-- Quantized GEMM: `fp8`, `int8`, `mxfp8`, `nvfp4` (Apple support varies; may need emulation).
-- Distributed/parallel: `ag_gemm`, `all_reduce`, `ring_attn`, `ulysses_attn`, etc. (single-device first).
+**Portable — remaining distinct kernels (open work, feasible on Apple):**
+- `hedgehog` — linear attention with a learned/softmax feature map; extends `linear_attn` with the
+  feature transform (no new substrate needed).
+- `based/linear_attn` causal + Taylor feature map — needs a causal/chunked state scan.
+- `mamba2` — selective SSD (chunked scan / segsum); large, distinct algorithm.
+- Perf tuning of `gemm_staged` (double-buffered, larger tiles) and `attn_multiwarp`.
 
-See `discrepencies.md` for the full 58-kernel inventory.
+**Substrate-blocked:**
+- `fftconv` — needs **complex MMA** wrappers (the `crt`/`crv` complex types exist but have no
+  complex-multiply MMA yet; see `primitives.md`).
+
+**Not applicable / emulation-only on Apple (documented, not "ported"):**
+- `parallel/*` (`ag_gemm`, `all_reduce`, `all_gather`, `ring_attn`, `ulysses_attn`, `gemm_rs`, …) —
+  multi-GPU collectives; a single Apple GPU has no NVLink/multi-device fabric. N/A for this target.
+- Quantized tensor-core GEMM `gemm/{fp8_*, mxfp8_*, nvfp4_*}` — Apple `simdgroup_matrix` has no
+  fp8/mxfp8/nvfp4 path; only **dequant-to-bf16 emulation** is possible (the MLX-style quantized
+  matmul), which is a different value proposition than the TK tensor-core kernels. `int8` is the one
+  plausible emulation port.
+- `gemm/baselines/*` (cuBLAS reference impls) — reference baselines, not TK kernels.
+
+See `discrepencies.md` for the raw file listing.

@@ -33,6 +33,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "flux", "flux.metal"),
     os.path.join(_KERNELS, "gemm_staged", "gemm_staged.metal"),
     os.path.join(_KERNELS, "attn_multiwarp", "attn_multiwarp.metal"),
+    os.path.join(_KERNELS, "linear_attn", "linear_attn.metal"),
 ]
 
 
@@ -139,3 +140,8 @@ def gemm_staged(x: torch.Tensor, y: torch.Tensor):
 def attn_multiwarp(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     """Multi-warp flash attention forward (shared K/V). bf16 (B,H,N,D) MPS; D in {64,128}, N%32."""
     return _ext.attn_multiwarp(q, k, v)
+
+
+def linear_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """Non-causal linear attention Q@(K^T@V). bf16 (B,H,N,D) MPS; D=64, N%8."""
+    return _ext.linear_attn(q, k, v)

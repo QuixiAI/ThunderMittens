@@ -168,6 +168,18 @@ def test_flux_gelu_parity(nkm):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 128, 64), (2, 2, 256, 64)])
+def test_linear_attn_parity(shape):
+    # same kernel + deterministic bf16 input rounding => MLX and MPS outputs match closely
+    rng = np.random.default_rng(0)
+    q = rng.standard_normal(shape).astype(np.float32)
+    k = rng.standard_normal(shape).astype(np.float32)
+    v = rng.standard_normal(shape).astype(np.float32)
+    om = tk.linear_attn(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"))
+    ot = tk.linear_attn(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"))
+    _assert_parity(om, ot, atol=1.0)  # values are O(N*D); same-kernel parity is ~exact
+
+
 @pytest.mark.parametrize("shape", [(1, 2, 256, 64), (1, 2, 128, 128)])
 def test_attn_multiwarp_parity(shape):
     rng = np.random.default_rng(0)

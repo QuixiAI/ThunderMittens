@@ -42,6 +42,7 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/flux/flux.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.cpp
     ${CMAKE_CURRENT_LIST_DIR}/attn_multiwarp/attn_multiwarp.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/linear_attn/linear_attn.cpp
 )
 
 # Add include headers
@@ -75,6 +76,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/flux/flux.metal
         ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.metal
         ${CMAKE_CURRENT_LIST_DIR}/attn_multiwarp/attn_multiwarp.metal
+        ${CMAKE_CURRENT_LIST_DIR}/linear_attn/linear_attn.metal
         INCLUDE_DIRS
         ${PROJECT_SOURCE_DIR}
         ${MLX_INCLUDE_DIRS}

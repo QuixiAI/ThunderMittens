@@ -66,6 +66,7 @@
 #include "flux/flux.h"
 #include "gemm_staged/gemm_staged.h"
 #include "attn_multiwarp/attn_multiwarp.h"
+#include "linear_attn/linear_attn.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -224,5 +225,17 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         multi-warp flash attention forward (shared K/V across simdgroups)
+      )");
+
+    m.def(
+      "linear_attn",
+      &linear_attn,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        non-causal linear attention (identity feature map): Q @ (K^T @ V)
       )");
 }

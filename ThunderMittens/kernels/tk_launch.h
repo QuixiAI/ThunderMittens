@@ -37,6 +37,7 @@ inline std::string flux_gelu_kernel_name(const std::string& t) { return "flux_ge
 inline std::string flux_gate_kernel_name(const std::string& t) { return "flux_gate_" + t; }
 inline std::string gemm_staged_kernel_name(const std::string& t) { return "gemm_staged_" + t; }
 inline std::string attn_multiwarp_kernel_name(int D) { return "attn_multiwarp_" + std::to_string(D); }
+inline std::string linear_attn_kernel_name(int D) { return "linear_attn_" + std::to_string(D); }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -175,6 +176,17 @@ void launch_attn_multiwarp(E& e, typename E::in_t q, typename E::in_t k, typenam
   e.bytes(N, 4); e.bytes(H, 5);
   e.dispatch(static_cast<int>(N) / (8 * NUM_WARPS), static_cast<int>(H), B,
              32 * NUM_WARPS, 1, 1);
+}
+
+// ----- linear_attn: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) ; grid (1, H, B) group (32,1,1).
+//        Non-causal linear attention out = Q @ (K^T @ V). q,k,v,o (B,H,N,D), D=64. -----
+template <class E>
+void launch_linear_attn(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                        typename E::out_t o, unsigned N, unsigned H, int B, int D) {
+  e.pipeline(linear_attn_kernel_name(D));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
+  e.bytes(N, 4); e.bytes(H, 5);
+  e.dispatch(1, static_cast<int>(H), B, 32, 1, 1);
 }
 
 } // namespace tk

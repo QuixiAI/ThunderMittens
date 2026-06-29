@@ -141,3 +141,10 @@ def attn_multiwarp(q, k, v):
     if _is_torch(q):
         return _torch().attn_multiwarp(q, k, v)
     return _mlx().attn_multiwarp(q, k, v)
+
+
+def linear_attn(q, k, v):
+    """Non-causal linear attention Q@(K^T@V). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().linear_attn(q, k, v)
+    return _mlx().linear_attn(q, k, v)

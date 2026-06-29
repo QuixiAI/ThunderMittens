@@ -197,6 +197,22 @@ def test_attn_multiwarp(shape):
     assert _maxdiff(got, exp) < 0.05
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 128, 64), (2, 4, 256, 64)])
+def test_linear_attn(shape):
+    B, H, N, D = shape
+    torch.manual_seed(0)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    got = tk_torch.linear_attn(q, k, v)
+    kv = k.float().transpose(-1, -2) @ v.float()
+    exp = q.float() @ kv
+    torch.mps.synchronize()
+    diff = (got.float() - exp).abs().max().item()
+    scale = exp.abs().max().item() + 1e-9
+    assert diff / scale < 0.03
+
+
 def test_dispatch_routes_torch_to_mps():
     """tk.<kernel>(torch.Tensor) routes to the MPS backend (no MLX needed)."""
     import tk

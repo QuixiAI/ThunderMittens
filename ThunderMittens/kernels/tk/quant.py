@@ -409,6 +409,38 @@ def quantize_w8a8(W):
     return Wq, s
 
 
+# ---- iq4_nl : GGUF non-linear int4 codebook. { half d; uint8 qs[16]; } = 18 bytes, 32 weights.
+# A nibble indexes the 16-entry non-linear table; value = d * kvalues_iq4nl[idx]. q4_0 nibble layout. ----
+_IQ4NL_VALUES = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
+                         dtype=np.float32)
+
+
+def _nearest_index(x, table):
+    """Index of the nearest table entry for each element of x (table 1-D)."""
+    return np.abs(x[..., None] - table).argmin(axis=-1).astype(np.uint8)
+
+
+def quantize_iq4_nl(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
+    Wb = W.reshape(N, nb, 32)
+    d = (np.abs(Wb).max(axis=2) / 127.0).astype(np.float32)           # 127 = max |codebook|
+    dsafe = np.where(d == 0, 1.0, d)
+    idx = _nearest_index(Wb / dsafe[..., None], _IQ4NL_VALUES)        # (N,nb,32) in 0..15
+    out = np.zeros((N, nb, 18), np.uint8)
+    out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 2:18] = (idx[:, :, :16] | (idx[:, :, 16:] << 4)).astype(np.uint8)   # lo | hi<<4
+    return out
+
+
+def dequantize_iq4_nl(packed):
+    packed = np.ascontiguousarray(packed, np.uint8)
+    N, nb, _ = packed.shape
+    d = np.ascontiguousarray(packed[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    qs = packed[:, :, 2:18].astype(np.int32)                         # (N,nb,16)
+    idx = np.concatenate([qs & 0x0F, qs >> 4], axis=-1)              # (N,nb,32): lo then hi
+    return (d * _IQ4NL_VALUES[idx]).reshape(N, nb * 32)
+
+
 # Format registry: name -> (quantize, dequantize). Drives the parametrized tests.
 QUANT_FORMATS = {
     "q8_0": (quantize_q8_0, dequantize_q8_0),
@@ -422,4 +454,5 @@ QUANT_FORMATS = {
     "nvfp4": (quantize_nvfp4, dequantize_nvfp4),
     "mxfp4": (quantize_mxfp4, dequantize_mxfp4),
     "bitnet": (quantize_bitnet, dequantize_bitnet),
+    "iq4_nl": (quantize_iq4_nl, dequantize_iq4_nl),
 }

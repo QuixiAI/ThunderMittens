@@ -31,6 +31,25 @@ METAL_FUNC int idot4(uint a, uint b) {
     return s;
 }
 
+// ---- codebook / lookup-table dequant primitive (the second new style) -------------------------
+// Packed bits index a constant table instead of doing bit arithmetic. kvalues_iq4nl is GGUF's
+// 16-entry non-linear fp codebook (ggml-common.h); a nibble indexes it, then * the block scale.
+constant const int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// ---- iq4_nl : { half d; uint8 qs[16]; }  — 18 bytes, 32 weights, value = d * kvalues_iq4nl[nib]
+//   (q4_0-style nibble layout: col<16 -> low nibble of qs[col], else high nibble of qs[col-16]). ----
+struct iq4_nl {
+    constant static constexpr const int block_k     = 32;
+    constant static constexpr const int block_bytes = 18;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        device const uchar* qs = base + 2;
+        const int nib = (col < 16) ? (qs[col] & 0x0F) : (qs[col - 16] >> 4);
+        return d * half(kvalues_iq4nl[nib]);
+    }
+};
+
 // ---- q8_0 : { half d; int8 qs[32]; }  — 34 bytes, 32 weights/block, value = d * q ----
 struct q8_0 {
     constant static constexpr const int block_k     = 32;

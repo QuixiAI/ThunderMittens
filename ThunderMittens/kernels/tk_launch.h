@@ -42,6 +42,7 @@ inline std::string hedgehog_kernel_name(int D) { return "hedgehog_" + std::to_st
 inline std::string lin_attn_causal_kernel_name(int D) { return "lin_attn_causal_" + std::to_string(D); }
 inline std::string mamba2_kernel_name(int D) { return "mamba2_" + std::to_string(D); }
 inline std::string cmplx_matmul_kernel_name(const std::string& t) { return "cmplx_matmul_" + t; }
+inline std::string fftconv_kernel_name(int S) { return "fftconv_" + std::to_string(S); }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -238,6 +239,20 @@ void launch_cmplx_matmul(E& e, typename E::out_t d, typename E::in_t a, typename
   e.out(d, 0); e.in(a, 1); e.in(b, 2);
   e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
   e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
+}
+
+// ----- fftconv (Monarch FFT convolution): OUT@0 X@1 F@2 TWF@3 FINV@4 TWI@5 KF@6 ;
+//        BH@7 H@8 (i32) ; grid (BH,1,1) group (32,1,1). N = S*S; S in {16,32}.
+//        Complex arrays carry a leading size-2 (real,imag) axis; OUT is real (BH,S,S). -----
+template <class E>
+void launch_fftconv(E& e, typename E::out_t out, typename E::in_t x, typename E::in_t F,
+                    typename E::in_t twf, typename E::in_t finv, typename E::in_t twi,
+                    typename E::in_t kf, int BH, int H, int S) {
+  e.pipeline(fftconv_kernel_name(S));
+  e.out(out, 0); e.in(x, 1); e.in(F, 2); e.in(twf, 3);
+  e.in(finv, 4); e.in(twi, 5); e.in(kf, 6);
+  e.bytes(BH, 7); e.bytes(H, 8);
+  e.dispatch(BH, 1, 1, 32, 1, 1);
 }
 
 } // namespace tk

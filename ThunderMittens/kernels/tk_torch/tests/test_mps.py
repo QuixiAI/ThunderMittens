@@ -289,6 +289,40 @@ def test_cmplx_matmul(nkm):
     assert rel < 2e-2
 
 
+@pytest.mark.parametrize("shape", [(1, 1, 16), (2, 2, 32)])
+def test_fftconv(shape):
+    import numpy as np
+    B, H, S = shape
+    N = S * S
+    rng = np.random.default_rng(0)
+    u = rng.standard_normal((B, H, N)).astype(np.float32)
+    k = rng.standard_normal((H, N)).astype(np.float32)
+
+    def fftm(sign):
+        n = np.arange(S); kk = n.reshape(-1, 1)
+        return np.exp(sign * 2j * np.pi * n * kk / S)
+
+    def tw(sign):
+        na = np.arange(S).reshape(-1, 1); ma = np.arange(S)
+        return np.exp(sign * 2j * np.pi * na * ma / N)
+
+    F, Finv, TW, TWI = fftm(-1), fftm(1), tw(-1), tw(1) / N
+    kf = np.fft.fft(k, n=N).reshape(H, S, S).transpose(0, 2, 1)
+
+    def t(m):
+        return torch.from_numpy(np.stack([m.real, m.imag]).astype(np.float32)).to("mps")
+
+    xr = u.reshape(B, H, S, S).astype(np.float32)
+    X = torch.from_numpy(np.stack([xr, np.zeros_like(xr)])).to("mps")
+    KF = torch.from_numpy(np.stack([kf.real, kf.imag]).astype(np.float32)).to("mps")
+    got = tk_torch.fftconv(X, t(F), t(TW), t(Finv), t(TWI), KF)
+    torch.mps.synchronize()
+    g = got.cpu().numpy()
+    ref = np.fft.ifft(np.fft.fft(u, n=N) * np.fft.fft(k, n=N)[None], n=N).real.reshape(B, H, S, S)
+    assert got.shape == (B, H, S, S)
+    assert np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
+
+
 def test_dispatch_routes_torch_to_mps():
     """tk.<kernel>(torch.Tensor) routes to the MPS backend (no MLX needed)."""
     import tk

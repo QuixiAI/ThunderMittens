@@ -29,18 +29,19 @@ Drop async double-buffering for v1. Validate every kernel against an MLX/NumPy o
 | `hedgehog` | `hedgehog` | ✅ | `phi(Q)@(phi(K)ᵀ@V)` | Feature-map linear attention, φ(x)=exp(x−rowmax(x)) (col-layout feature map), D=64. `kernels/hedgehog/` |
 | `lin_attn_causal` | `based/linear_attn` | ✅ | `tril(Q@Kᵀ)@V` | Causal linear attention via chunked running-KV scan + intra-chunk `make_causal`, D=64. `kernels/lin_attn_causal/` |
 | `mamba2` | `mamba2` | ✅ | `((C@Bᵀ)⊙exp(Δcumlog)⊙tril)@X` | Selective SSD forward (materialized chunked form); decay tile via `add_row`/`sub_col`/`exp` from a host-precomputed `cumlog=cumsum(log a)`, D=64. `kernels/mamba2/` |
-| `cmplx_matmul` | `fftconv` (building block) | ✅ | complex `A@B` | Complex GEMM exercising the new **complex-multiply MMA** (`complex_mma_AB`); operands carry a leading size-2 (real,imag) axis. f32/bf16. `kernels/cmplx_matmul/` |
+| `cmplx_matmul` | `fftconv` (building block) | ✅ | complex `A@B` | Complex GEMM exercising the **complex-multiply MMA** (`complex_mma_AB`); operands carry a leading size-2 (real,imag) axis. f32/bf16. `kernels/cmplx_matmul/` |
+| `fftconv` | `fftconv` | ✅ | `torch.fft` circular conv (exact) | Monarch FFT convolution, N=S² (S∈{16,32}); complex matmuls (`complex_mm_AB`) + transposes + pointwise complex mul. **rel=0.00000 vs torch.fft.** `kernels/fftconv/` |
 
 All kernels ship on **both** backends (MLX + PyTorch MPS) via `tk_launch.h`. Run all:
 `cd ThunderMittens/kernels && python -m pytest */correctness/ tk_torch/tests/ tests_parity/ -q`
-(202 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
+(210 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
 Benchmark the perf kernels: `python time_perf.py`.
 
 **Complex-multiply MMA** (`include/ops/warp/register/tile/mma.metal`): `complex_mma_AB`/`_ABt`/`_AtB`/
 `_AtBt` + `complex_mm_AB` operate on the `crt` complex tiles as four real MMAs on the `.real`/`.imag`
 components (`Dr = Ar·Br − Ai·Bi`, `Di = Ar·Bi + Ai·Br`; the `−Ai·Bi` is folded by negating `Ai` once).
-This removes the only substrate blocker — `fftconv` is now buildable on this primitive (`cmplx_matmul`
-is the validated proof / building block).
+Validated by `cmplx_matmul` and used to build `fftconv` — **every algorithmically-distinct,
+Apple-feasible TK kernel is now ported.**
 
 ## Completion map — the full 58-file TK inventory on Apple
 
@@ -59,6 +60,8 @@ TK files are hardware-specific *variants* of one algorithm:
   `mamba2` → ported as `linear_attn` (non-causal), `lin_attn_causal` (causal scan), `hedgehog`
   (feature-map), and `mamba2` (selective SSD with the decay-tile). A Taylor feature map for `based` is
   a small variant of `hedgehog`/`linear_attn`.
+- FFT / complex: `fftconv` → ported as the Monarch FFT convolution (`kernels/fftconv/`) on the new
+  complex-multiply MMA. Validated exact (rel=0.00000) vs `torch.fft`.
 
 **Perf tuning (investigated — finding below):**
 All distinct algorithmic kernels are ported. The multi-simdgroup shared-staging kernels
@@ -71,11 +74,11 @@ single-simdgroup kernels on Apple GPUs, and tuning confirmed this is structural:
   via sharing doesn't pay. The simpler single-simdgroup kernels are near-optimal; `matmul_custom`/
   `gemm_staged` sit within ~5% of `mx.matmul`. (Benchmark: `python time_perf.py`.)
 
-**Unblocked (complex MMA now implemented):**
-- `fftconv` — the former blocker (complex-multiply MMA) is **done** (`complex_mma_*` in
-  `mma.metal`, validated via `cmplx_matmul`). The full FFT-convolution kernel can now be built on
-  the `crt` complex tiles + `complex_mma_*` + the existing complex memory ops; it remains the one
-  un-ported distinct kernel but is no longer substrate-blocked.
+**Done (was substrate-blocked):**
+- `fftconv` — ✅ ported (`kernels/fftconv/`). The former blocker (complex-multiply MMA) is implemented
+  (`complex_mma_*` in `mma.metal`); the Monarch FFT-conv kernel is built on `crt` complex tiles +
+  `complex_mma_*` + transposes + pointwise complex mul, and matches `torch.fft` exactly. **No
+  distinct, Apple-feasible TK kernel remains.**
 
 **Not applicable / emulation-only on Apple (documented, not "ported"):**
 - `parallel/*` (`ag_gemm`, `all_reduce`, `all_gather`, `ring_attn`, `ulysses_attn`, `gemm_rs`, …) —

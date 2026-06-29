@@ -38,6 +38,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "lin_attn_causal", "lin_attn_causal.metal"),
     os.path.join(_KERNELS, "mamba2", "mamba2.metal"),
     os.path.join(_KERNELS, "cmplx_matmul", "cmplx_matmul.metal"),
+    os.path.join(_KERNELS, "fftconv", "fftconv.metal"),
 ]
 
 
@@ -170,3 +171,11 @@ def cmplx_matmul(a: torch.Tensor, b: torch.Tensor):
     """Complex GEMM D=A@B; leading size-2 (real,imag) axis: a (2,N,K), b (2,K,M) -> (2,N,M).
     f32/bf16 MPS; N%32, M%32, K%16."""
     return _ext.cmplx_matmul(a, b)
+
+
+def fftconv(x: torch.Tensor, fmat: torch.Tensor, twf: torch.Tensor, finv: torch.Tensor,
+            twi: torch.Tensor, kf: torch.Tensor):
+    """Monarch FFT convolution (N=S*S, S in {16,32}). float32 MPS; complex inputs carry a
+    leading size-2 (real,imag) axis: x (2,B,H,S,S), fmat/twf/finv/twi (2,S,S), kf (2,H,S,S)
+    -> real (B,H,S,S)."""
+    return _ext.fftconv(x, fmat, twf, finv, twi, kf)

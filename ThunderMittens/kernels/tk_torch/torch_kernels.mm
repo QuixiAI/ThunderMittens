@@ -384,6 +384,23 @@ static at::Tensor cmplx_matmul_mps(const at::Tensor& a_in, const at::Tensor& b_i
   return out;
 }
 
+static at::Tensor fftconv_mps(const at::Tensor& x_in, const at::Tensor& F_in,
+                              const at::Tensor& twf_in, const at::Tensor& finv_in,
+                              const at::Tensor& twi_in, const at::Tensor& kf_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "fftconv: x must be an MPS tensor");
+  TORCH_CHECK(x_in.scalar_type() == at::kFloat, "fftconv: inputs must be float32");
+  auto x = x_in.contiguous(), F = F_in.contiguous(), twf = twf_in.contiguous();
+  auto finv = finv_in.contiguous(), twi = twi_in.contiguous(), kf = kf_in.contiguous();
+  TORCH_CHECK(x.dim() == 5 && x.size(0) == 2, "fftconv: x must be (2,B,H,S,S)");
+  const int B = x.size(1), H = x.size(2), S = x.size(3);
+  TORCH_CHECK(x.size(4) == S && (S == 16 || S == 32), "fftconv: S must be 16 or 32");
+  auto out = at::empty({B, H, S, S}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_fftconv(e, out, x, F, twf, finv, twi, kf, B * H, H, S);
+  });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
@@ -404,4 +421,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lin_attn_causal", &lin_attn_causal_mps, "ThunderMittens causal linear attention (MPS)");
   m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
   m.def("cmplx_matmul", &cmplx_matmul_mps, "ThunderMittens complex GEMM (MPS)");
+  m.def("fftconv", &fftconv_mps, "ThunderMittens Monarch FFT convolution (MPS)");
 }

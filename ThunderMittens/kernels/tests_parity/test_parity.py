@@ -179,6 +179,34 @@ def test_lin_attn_causal_parity(shape):
     _assert_parity(om, ot, atol=1.0)
 
 
+@pytest.mark.parametrize("shape", [(1, 1, 16), (2, 2, 32)])
+def test_fftconv_parity(shape):
+    B, H, S = shape
+    N = S * S
+    rng = np.random.default_rng(0)
+
+    def fftm(sign):
+        n = np.arange(S); k = n.reshape(-1, 1)
+        return np.exp(sign * 2j * np.pi * n * k / S)
+
+    def tw(sign):
+        na = np.arange(S).reshape(-1, 1); ma = np.arange(S)
+        return np.exp(sign * 2j * np.pi * na * ma / N)
+
+    u = rng.standard_normal((B, H, S, S)).astype(np.float32)
+    kf = rng.standard_normal((2, H, S, S)).astype(np.float32)
+    X = np.stack([u, np.zeros_like(u)]).astype(np.float32)
+    F, Finv, TW, TWI = fftm(-1), fftm(1), tw(-1), tw(1) / N
+
+    def cs(m):
+        return np.stack([m.real, m.imag]).astype(np.float32)
+
+    args_np = [X, cs(F), cs(TW), cs(Finv), cs(TWI), kf]
+    om = tk.fftconv(*[_mk(a, "mlx", "f32") for a in args_np])
+    ot = tk.fftconv(*[_mk(a, "torch", "f32") for a in args_np])
+    _assert_parity(om, ot, atol=1e-2)
+
+
 @pytest.mark.parametrize("nkm", [(32, 16, 32), (64, 32, 64)])
 def test_cmplx_matmul_parity(nkm):
     N, K, M = nkm

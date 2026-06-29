@@ -71,6 +71,7 @@
 #include "lin_attn_causal/lin_attn_causal.h"
 #include "mamba2/mamba2.h"
 #include "cmplx_matmul/cmplx_matmul.h"
+#include "fftconv/fftconv.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -289,5 +290,20 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         complex GEMM D = A @ B; operands carry a leading size-2 (real,imag) axis
+      )");
+
+    m.def(
+      "fftconv",
+      &fftconv,
+      "x"_a,
+      "fmat"_a,
+      "twf"_a,
+      "finv"_a,
+      "twi"_a,
+      "kf"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Monarch FFT convolution (N=S*S); complex inputs with leading size-2 axis, real output
       )");
 }

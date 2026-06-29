@@ -177,3 +177,12 @@ def cmplx_matmul(a, b):
     if _is_torch(a):
         return _torch().cmplx_matmul(a, b)
     return _mlx().cmplx_matmul(a, b)
+
+
+def fftconv(x, fmat, twf, finv, twi, kf):
+    """Monarch FFT convolution (N=S*S). Complex inputs with a leading size-2 (real,imag) axis:
+    x (2,B,H,S,S), fmat/twf/finv/twi (2,S,S), kf (2,H,S,S) -> real (B,H,S,S).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().fftconv(x, fmat, twf, finv, twi, kf)
+    return _mlx().fftconv(x, fmat, twf, finv, twi, kf)

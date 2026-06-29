@@ -38,6 +38,27 @@ def test_attn_q(D, fmt):
     assert rel < 0.1, f"{fmt} D{D} rel {rel}"
 
 
+@pytest.mark.parametrize("fmt", ["q8_0", "fp8_e4m3"])
+@pytest.mark.parametrize("D", [64, 128])
+def test_attn_q_causal(D, fmt):
+    B, H, N = 1, 2, 64
+    rng = np.random.default_rng(1)
+    q = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    k = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    v = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    Kq, Vq = quantize_kv(k, fmt), quantize_kv(v, fmt)
+    dk, dv = dequantize_kv(Kq, fmt), dequantize_kv(Vq, fmt)
+    got = attn_q(mx.array(q).astype(mx.bfloat16), mx.array(Kq), mx.array(Vq), format=fmt, causal=True)
+    mx.eval(got)
+    g = np.array(got.astype(mx.float32))
+    s = (q @ np.swapaxes(dk, -1, -2)) / np.sqrt(D)
+    mask = np.triu(np.ones((N, N), bool), 1)
+    s = np.where(mask, -1e30, s); s = s - s.max(-1, keepdims=True)
+    p = np.exp(s); p = p / p.sum(-1, keepdims=True); ref = p @ dv
+    rel = np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9)
+    assert rel < 0.1, f"{fmt} D{D} causal rel {rel}"
+
+
 if __name__ == "__main__":
     for f in ["q8_0", "q4_0", "fp8_e4m3"]:
         test_attn_q(64, f); test_attn_q(128, f)

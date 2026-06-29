@@ -11,7 +11,7 @@ namespace mittens {
 // Kq/Vq are uchar (B,H,N, D/block_k, block_bytes), each (b,h) slice an (N,D) matrix quantized along D.
 constant constexpr const int TNQ = 8;
 
-template <typename FMT, int D>
+template <typename FMT, int D, bool CAUSAL>
 kernel void attn_q(device   bf16     *q  [[buffer(0)]],
                    device   uchar    *Kq [[buffer(1)]],
                    device   uchar    *Vq [[buffer(2)]],
@@ -32,7 +32,7 @@ kernel void attn_q(device   bf16     *q  [[buffer(0)]],
     using rv_att = rt_fl<TNQ, TNQ>::col_vec;
 
     const int block = blockIdx.z, head = blockIdx.y, q_seq = blockIdx.x;
-    const int kv_blocks = N / TNQ;
+    const int kv_last = CAUSAL ? q_seq : (int)(N / TNQ) - 1;            // causal: attend <= q block
     const int bpr = D / FMT::block_k;                                   // quant blocks per key row
     device const uchar* Kbh = Kq + (uint)((block * (int)H + head) * (int)N) * bpr * FMT::block_bytes;
     device const uchar* Vbh = Vq + (uint)((block * (int)H + head) * (int)N) * bpr * FMT::block_bytes;
@@ -46,12 +46,13 @@ kernel void attn_q(device   bf16     *q  [[buffer(0)]],
     constexpr const bf16 q_mul = ((D == 128) ? 0.08838834764bf : 0.125bf) * 1.44269504089bf;
     mul(q_reg, q_reg, q_mul);
 
-    for (auto kv_idx = 0; kv_idx < kv_blocks; kv_idx++) {
+    for (int kv_idx = 0; kv_idx <= kv_last; kv_idx++) {
         dequant_into_shared<FMT, TNQ, D>(sK, Kbh, (int)N, D, kv_idx, 0, 32, tid);   // K -> shared (half)
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         load(k_reg, sK, laneId);                                                    // shared -> col reg (K^T)
         zero(att_block);
         mma_ABt(att_block, q_reg, k_reg, att_block);
+        if (CAUSAL && kv_idx == q_seq) { float nb = -1e30f; make_causal(att_block, att_block, laneId, nb); }
         copy(max_vec_last, max_vec, laneId);
         row_max(max_vec, att_block, max_vec, laneId);
         sub(max_vec_last, max_vec_last, max_vec); exp2(max_vec_last, max_vec_last);
@@ -67,19 +68,23 @@ kernel void attn_q(device   bf16     *q  [[buffer(0)]],
     store(gl_o, o_reg, {block, head, q_seq, 0}, laneId);
 }
 
-#define instantiate_attn_q(name, FMT, D)                                          \
-   template [[host_name(name)]] [[kernel]] void attn_q<FMT, D>(                   \
+#define instantiate_attn_q(name, FMT, D, CAUSAL)                                  \
+   template [[host_name(name)]] [[kernel]] void attn_q<FMT, D, CAUSAL>(           \
      device bf16* q [[buffer(0)]], device uchar* Kq [[buffer(1)]],                \
      device uchar* Vq [[buffer(2)]], device bf16* o [[buffer(3)]],                \
      constant unsigned &N [[buffer(4)]], constant unsigned &H [[buffer(5)]],      \
      uint3 blockIdx [[threadgroup_position_in_grid]],                            \
      uint tid [[thread_index_in_threadgroup]], uint laneId [[thread_index_in_simdgroup]]);
 
-instantiate_attn_q("attn_q_q8_0_64", q8_0, 64);
-instantiate_attn_q("attn_q_q8_0_128", q8_0, 128);
-instantiate_attn_q("attn_q_q4_0_64", q4_0, 64);
-instantiate_attn_q("attn_q_q4_0_128", q4_0, 128);
-instantiate_attn_q("attn_q_fp8_e4m3_64", fp8_e4m3, 64);
-instantiate_attn_q("attn_q_fp8_e4m3_128", fp8_e4m3, 128);
+#define instantiate_attn_q_fmt(fmt, FMT, D)                                       \
+   instantiate_attn_q("attn_q_" #fmt "_" #D, FMT, D, false)                       \
+   instantiate_attn_q("attn_q_causal_" #fmt "_" #D, FMT, D, true)
+
+instantiate_attn_q_fmt(q8_0, q8_0, 64)
+instantiate_attn_q_fmt(q8_0, q8_0, 128)
+instantiate_attn_q_fmt(q4_0, q4_0, 64)
+instantiate_attn_q_fmt(q4_0, q4_0, 128)
+instantiate_attn_q_fmt(fp8_e4m3, fp8_e4m3, 64)
+instantiate_attn_q_fmt(fp8_e4m3, fp8_e4m3, 128)
 
 }

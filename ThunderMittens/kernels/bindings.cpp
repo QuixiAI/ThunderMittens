@@ -377,6 +377,7 @@ NB_MODULE(_ext, m) {
       &attn_q,
       "q"_a, "kq"_a, "vq"_a,
       "format"_a = "q8_0",
+      "causal"_a = false,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(

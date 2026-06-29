@@ -441,6 +441,53 @@ def dequantize_iq4_nl(packed):
     return (d * _IQ4NL_VALUES[idx]).reshape(N, nb * 32)
 
 
+# ---- iq4_xs : 256-superblock IQ4_NL. { half d; uint16 scales_h; uint8 scales_l[4]; uint8 qs[128]; }
+# = 136 bytes. 8 sub-blocks of 32; 6-bit sub-scale ls in [1,31] (stored ls+32 in [33,63], split as
+# 4 low bits in scales_l + 2 high bits in scales_h). value = d*ls * kvalues_iq4nl[nibble]. ----
+def quantize_iq4_xs(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
+    Wsb = W.reshape(N, nb, 8, 32)                                    # 8 sub-blocks of 32
+    sub_scale = (np.abs(Wsb).max(axis=3) / 127.0).astype(np.float32)  # (N,nb,8) ideal sub scale
+    d = (sub_scale.max(axis=2) / 31.0).astype(np.float32)            # (N,nb) super scale
+    dsafe = np.where(d == 0, 1.0, d)
+    ls = np.clip(np.rint(sub_scale / dsafe[..., None]), 1, 31).astype(np.int32)   # (N,nb,8) in [1,31]
+    dl = d[..., None] * ls.astype(np.float32)                        # (N,nb,8) effective sub scale
+    dlsafe = np.where(dl == 0, 1.0, dl)
+    idx = _nearest_index(Wsb / dlsafe[..., None], _IQ4NL_VALUES)     # (N,nb,8,32) in 0..15
+    ls_raw = (ls + 32).astype(np.uint32)                            # [33,63], 6-bit
+    out = np.zeros((N, nb, 136), np.uint8)
+    out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    sh = (ls_raw >> 4) & 0x3                                        # (N,nb,8) high 2 bits
+    scales_h = np.zeros((N, nb), np.uint32)
+    for ib in range(8):
+        scales_h |= (sh[:, :, ib] << (2 * ib))
+    out[:, :, 2:4] = scales_h.astype(np.uint16).view(np.uint8).reshape(N, nb, 2)
+    sl = (ls_raw & 0x0F).astype(np.uint8)                          # (N,nb,8) low 4 bits
+    out[:, :, 4:8] = (sl[:, :, 0::2] | (sl[:, :, 1::2] << 4))       # 2 sub-blocks/byte
+    lo = idx[:, :, :, :16]; hi = idx[:, :, :, 16:]                  # per sub-block nibbles
+    out[:, :, 8:136] = (lo | (hi << 4)).reshape(N, nb, 128).astype(np.uint8)
+    return out
+
+
+def dequantize_iq4_xs(packed):
+    packed = np.ascontiguousarray(packed, np.uint8)
+    N, nb, _ = packed.shape
+    d = np.ascontiguousarray(packed[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    scales_h = np.ascontiguousarray(packed[:, :, 2:4]).reshape(N, nb * 2).view(np.uint16).astype(np.int32).reshape(N, nb)
+    scales_l = packed[:, :, 4:8].astype(np.int32)                  # (N,nb,4)
+    qs = packed[:, :, 8:136].astype(np.int32).reshape(N, nb, 8, 16)  # 8 sub * 16 bytes
+    out = np.zeros((N, nb, 8, 32), np.float32)
+    for ib in range(8):
+        sl = (scales_l[:, :, ib >> 1] >> (4 * (ib & 1))) & 0x0F
+        sh = (scales_h >> (2 * ib)) & 0x3
+        ls = (sl | (sh << 4)) - 32                                 # (N,nb)
+        dl = (d * ls.astype(np.float32))[..., None]                # (N,nb,1)
+        b = qs[:, :, ib, :]                                        # (N,nb,16)
+        idx = np.concatenate([b & 0x0F, b >> 4], axis=-1)          # (N,nb,32)
+        out[:, :, ib, :] = dl * _IQ4NL_VALUES[idx]
+    return out.reshape(N, nb * 256)
+
+
 # Format registry: name -> (quantize, dequantize). Drives the parametrized tests.
 QUANT_FORMATS = {
     "q8_0": (quantize_q8_0, dequantize_q8_0),
@@ -455,4 +502,5 @@ QUANT_FORMATS = {
     "mxfp4": (quantize_mxfp4, dequantize_mxfp4),
     "bitnet": (quantize_bitnet, dequantize_bitnet),
     "iq4_nl": (quantize_iq4_nl, dequantize_iq4_nl),
+    "iq4_xs": (quantize_iq4_xs, dequantize_iq4_xs),
 }

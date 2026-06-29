@@ -23,7 +23,7 @@
 namespace mlx::core {
 
 static int qflux_block_k(const std::string& fmt) {
-  if (fmt == "q4_K") return 256;
+  if (fmt == "q4_K" || fmt == "iq4_xs") return 256;
   if (fmt == "kU4B8" || fmt == "kU4") return 128;
   if (fmt == "nvfp4") return 16;
   return 32;

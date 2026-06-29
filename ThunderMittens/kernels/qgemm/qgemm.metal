@@ -72,6 +72,7 @@ instantiate_qgemm("qgemm_nvfp4", nvfp4, 2, 16);
 instantiate_qgemm("qgemm_mxfp4", mxfp4, 2, 16);
 instantiate_qgemm("qgemm_bitnet", bitnet, 2, 16);
 instantiate_qgemm("qgemm_iq4_nl", iq4_nl, 2, 16);
+instantiate_qgemm("qgemm_iq4_xs", iq4_xs, 2, 16);
 
 // ---- qgemm_frag: dequant-direct-to-fragment (Marlin zero-shuffle). Single simdgroup per
 // (32x32) output tile; the weight block is dequantized straight into the register fragment
@@ -122,5 +123,6 @@ instantiate_qgemm_frag("qgemm_frag_nvfp4", nvfp4);
 instantiate_qgemm_frag("qgemm_frag_mxfp4", mxfp4);
 instantiate_qgemm_frag("qgemm_frag_bitnet", bitnet);
 instantiate_qgemm_frag("qgemm_frag_iq4_nl", iq4_nl);
+instantiate_qgemm_frag("qgemm_frag_iq4_xs", iq4_xs);
 
 }

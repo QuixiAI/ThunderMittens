@@ -50,6 +50,29 @@ struct iq4_nl {
     }
 };
 
+// ---- iq4_xs : 256-superblock IQ4_NL. { half d; uint16 scales_h; uint8 scales_l[4]; uint8 qs[128]; }
+//   = 136 bytes. 8 sub-blocks of 32; each has a 6-bit scale ls = (4 low bits in scales_l | 2 high
+//   bits in scales_h) − 32, so value = d·ls · kvalues_iq4nl[nibble]. (ggml-common.h block_iq4_xs.) ----
+struct iq4_xs {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 136;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        const ushort scales_h = ((device const ushort*)(base + 2))[0];
+        device const uchar* scales_l = base + 4;       // 4 bytes
+        device const uchar* qs = base + 8;             // 128 bytes
+        const int ib = col >> 5;                       // sub-block 0..7
+        const int local = col & 31;
+        const int sl = (scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F;
+        const int sh = (scales_h >> (2 * ib)) & 0x3;
+        const int ls = (sl | (sh << 4)) - 32;          // 6-bit signed sub-scale
+        const half dl = d * half(ls);
+        const int nib = (local < 16) ? (qs[16 * ib + local] & 0x0F)
+                                     : (qs[16 * ib + (local - 16)] >> 4);
+        return dl * half(kvalues_iq4nl[nib]);
+    }
+};
+
 // ---- q8_0 : { half d; int8 qs[32]; }  — 34 bytes, 32 weights/block, value = d * q ----
 struct q8_0 {
     constant static constexpr const int block_k     = 32;

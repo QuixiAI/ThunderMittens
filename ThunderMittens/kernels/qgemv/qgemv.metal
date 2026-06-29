@@ -51,5 +51,6 @@ instantiate_qgemv("qgemv_nvfp4", nvfp4);
 instantiate_qgemv("qgemv_mxfp4", mxfp4);
 instantiate_qgemv("qgemv_bitnet", bitnet);
 instantiate_qgemv("qgemv_iq4_nl", iq4_nl);
+instantiate_qgemv("qgemv_iq4_xs", iq4_xs);
 
 }

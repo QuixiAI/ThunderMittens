@@ -230,6 +230,23 @@ def qgemm_actorder(wq, x, perm, w_format="kU4B8"):
     return qgemm(wq, mx.take(x, mx.array(np.asarray(perm, np.int32)), axis=0), w_format)
 
 
+def qgemm_w8a8(wq, xq, w_scale, a_scale):
+    """W8A8 prefill GEMM (M>1, bit-exact int32): out[n,m]=w_scale[n]*a_scale[m]*sum_k Wq[n,k]*Xq[m,k].
+    wq int8 (N,K); xq int8 (M,K) token-major; w_scale (N,) half; a_scale (M,) half -> (N,M) half.
+    NOTE: int prefill is perf-negative on Apple (no int matmul); use for exact int32 numerics."""
+    if _is_torch(wq):
+        return _torch().qgemm_w8a8(wq, xq, w_scale, a_scale)
+    return _mlx().qgemm_w8a8(wq, xq, w_scale, a_scale)
+
+
+def qgemm_w2a8(wq, xq, a_scale):
+    """BitNet W2A8 prefill GEMM (M>1): ternary 2-bit weight x int8 act (M,K), per-group absmean scale
+    * a_scale[m] -> (N,M) half. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(wq):
+        return _torch().qgemm_w2a8(wq, xq, a_scale)
+    return _mlx().qgemm_w2a8(wq, xq, a_scale)
+
+
 def qgemv_w8a8(wq, xq, w_scale, a_scale):
     """W8A8/SmoothQuant decode GEMV: int8 weight (N,K) x int8 act (K,1) -> int32, *w_scale[n]*a_scale.
     w_scale (N,) half, a_scale (1,) half -> (N,1) half. Accepts mlx.array or torch.Tensor (MPS)."""

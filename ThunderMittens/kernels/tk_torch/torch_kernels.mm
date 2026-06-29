@@ -502,6 +502,30 @@ static at::Tensor qgemv_w2a8_mps(const at::Tensor& wq_in, const at::Tensor& xq_i
   return out;
 }
 
+static at::Tensor qgemm_w8a8_mps(const at::Tensor& wq_in, const at::Tensor& xq_in,
+                                 const at::Tensor& ws_in, const at::Tensor& as_in) {
+  TORCH_CHECK(wq_in.device().is_mps() && wq_in.scalar_type() == at::kChar && xq_in.scalar_type() == at::kChar,
+              "qgemm_w8a8: wq, xq must be int8 MPS");
+  auto wq = wq_in.contiguous(), xq = xq_in.contiguous(), ws = ws_in.contiguous(), as = as_in.contiguous();
+  const int N = wq.size(0), K = wq.size(1), M = xq.size(0);
+  TORCH_CHECK(K % 4 == 0 && xq.size(1) == K, "qgemm_w8a8: K%4==0, xq (M,K)");
+  auto out = at::empty({N, M}, ws.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_qgemm_w8a8(e, out, wq, xq, ws, as, N, K, M); });
+  return out;
+}
+
+static at::Tensor qgemm_w2a8_mps(const at::Tensor& wq_in, const at::Tensor& xq_in,
+                                 const at::Tensor& as_in) {
+  TORCH_CHECK(wq_in.device().is_mps() && wq_in.scalar_type() == at::kByte && xq_in.scalar_type() == at::kChar,
+              "qgemm_w2a8: wq uint8, xq int8 MPS");
+  auto wq = wq_in.contiguous(), xq = xq_in.contiguous(), as = as_in.contiguous();
+  const int N = wq.size(0), K = (int)wq.size(1) * 32, M = xq.size(0);
+  TORCH_CHECK(xq.size(1) == K, "qgemm_w2a8: xq (M,K)");
+  auto out = at::empty({N, M}, as.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_qgemm_w2a8(e, out, wq, xq, as, N, K, M); });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
@@ -529,4 +553,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_q", &attn_q_mps, "ThunderMittens quantized-KV flash attention (MPS)");
   m.def("qgemv_w8a8", &qgemv_w8a8_mps, "ThunderMittens W8A8 int8xint8 decode GEMV (MPS)");
   m.def("qgemv_w2a8", &qgemv_w2a8_mps, "ThunderMittens BitNet W2A8 int decode GEMV (MPS)");
+  m.def("qgemm_w8a8", &qgemm_w8a8_mps, "ThunderMittens W8A8 int8 prefill GEMM (MPS)");
+  m.def("qgemm_w2a8", &qgemm_w2a8_mps, "ThunderMittens BitNet W2A8 prefill GEMM (MPS)");
 }

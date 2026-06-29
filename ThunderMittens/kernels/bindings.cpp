@@ -78,6 +78,7 @@
 #include "qflux/qflux.h"
 #include "qgemv_int/qgemv_int.h"
 #include "attn_q/attn_q.h"
+#include "qgemm_int/qgemm_int.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -394,4 +395,16 @@ NB_MODULE(_ext, m) {
       R"(
         BitNet W2A8 decode GEMV: ternary 2-bit weight x int8 activation -> int32, per-group scale
       )");
+
+    m.def(
+      "qgemm_w8a8", &qgemm_w8a8,
+      "wq"_a, "xq"_a, "w_scale"_a, "a_scale"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(W8A8 prefill GEMM (int8 x int8 -> int32, bit-exact, then scale))");
+
+    m.def(
+      "qgemm_w2a8", &qgemm_w2a8,
+      "wq"_a, "xq"_a, "a_scale"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(BitNet W2A8 prefill GEMM (ternary 2-bit x int8 -> int32))");
 }

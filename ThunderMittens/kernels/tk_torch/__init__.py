@@ -44,6 +44,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "qflux", "qflux.metal"),
     os.path.join(_KERNELS, "qgemv_int", "qgemv_int.metal"),
     os.path.join(_KERNELS, "attn_q", "attn_q.metal"),
+    os.path.join(_KERNELS, "qgemm_int", "qgemm_int.metal"),
 ]
 
 
@@ -205,6 +206,16 @@ def qflux_gelu(wq: torch.Tensor, x: torch.Tensor, bias: torch.Tensor, format: st
 def attn_q(q, kq, vq, format="q8_0", causal=False, multiwarp=False):
     """Quantized-KV flash attention: softmax(QK^T)V, K/V from blocks. q bf16 (B,H,N,D); kq/vq uint8. MPS."""
     return _ext.attn_q(q, kq, vq, format, causal, multiwarp)
+
+
+def qgemm_w8a8(wq, xq, w_scale, a_scale):
+    """W8A8 prefill GEMM (M>1, bit-exact int32). wq int8 (N,K); xq int8 (M,K) token-major. MPS."""
+    return _ext.qgemm_w8a8(wq, xq, w_scale, a_scale)
+
+
+def qgemm_w2a8(wq, xq, a_scale):
+    """BitNet W2A8 prefill GEMM (M>1): ternary 2-bit weight x int8 act (M,K). MPS."""
+    return _ext.qgemm_w2a8(wq, xq, a_scale)
 
 
 def qgemv_w8a8(wq, xq, w_scale, a_scale):

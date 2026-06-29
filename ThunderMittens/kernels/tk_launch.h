@@ -335,6 +335,27 @@ void launch_qgemv_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.dispatch(N, 1, 1, 32, 1, 1);
 }
 
+// ----- qgemm_w8a8 (W8A8 int8xint8 PREFILL, M>1): D@0 Wq@1(int8 N,K) Xq@2(int8 M,K) w_scale@3
+//        a_scale@4 ; N@5 K@6 M@7 ; grid (N,1,1) 32 threads. Exact int32, scaled once. -----
+template <class E>
+void launch_qgemm_w8a8(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t xq,
+                       typename E::in_t wscale, typename E::in_t ascale, int N, int K, int M) {
+  e.pipeline("mittens::qgemm_w8a8");
+  e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(wscale, 3); e.in(ascale, 4);
+  e.bytes(N, 5); e.bytes(K, 6); e.bytes(M, 7);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
+// ----- qgemm_w2a8 (BitNet W2A8 prefill): D@0 Wq@1(blocks) Xq@2(int8 M,K) a_scale@3 ; N@4 K@5 M@6. ---
+template <class E>
+void launch_qgemm_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t xq,
+                       typename E::in_t ascale, int N, int K, int M) {
+  e.pipeline("mittens::qgemm_w2a8");
+  e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(ascale, 3);
+  e.bytes(N, 4); e.bytes(K, 5); e.bytes(M, 6);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
 // ----- qflux_gelu (quantized fused GEMM+GELU): D@0 Wq@1 X@2 bias@3 ; N@4 K@5 M@6 (i32) ;
 //        grid (M/32, N/32, 1), 32 threads (1 simdgroup, dequant-direct-to-fragment). -----
 template <class E>

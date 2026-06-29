@@ -40,5 +40,8 @@ kernel void qgemv(
      uint lane [[thread_index_in_simdgroup]]);
 
 instantiate_qgemv("qgemv_q8_0", q8_0);
+instantiate_qgemv("qgemv_q4_0", q4_0);
+instantiate_qgemv("qgemv_q4_K", q4_K);
+instantiate_qgemv("qgemv_kU4B8", kU4B8);
 
 }

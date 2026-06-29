@@ -24,9 +24,9 @@ namespace mlx::core {
 
 // block_k for each supported format (weights per quant block).
 static int format_block_k(const std::string& fmt) {
-  if (fmt == "q8_0" || fmt == "q4_0") return 32;
   if (fmt == "q4_K") return 256;
-  return 32;
+  if (fmt == "kU4B8") return 128;
+  return 32;  // q8_0, q4_0
 }
 
 array qgemm(const array& wq, const array& x, const std::string& format, StreamOrDevice s) {

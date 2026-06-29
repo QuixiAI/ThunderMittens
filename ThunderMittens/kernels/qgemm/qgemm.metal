@@ -22,7 +22,7 @@ kernel void qgemm(
     uint  lane [[thread_index_in_simdgroup]]) {
     using G = group<N_WARPS>;
     constexpr const int BN = 32;
-    constexpr const int BK = FMT::block_k;   // 32 — one quant block per K-step
+    constexpr const int BK = 32;             // MMA K-step (decoupled from FMT::block_k)
 
     using gl_h = gl<half, 1, 1, -1, -1>;
     gl_h gl_x(X, nullptr, nullptr, K, M);
@@ -61,5 +61,8 @@ kernel void qgemm(
      uint lane [[thread_index_in_simdgroup]]);
 
 instantiate_qgemm("qgemm_q8_0", q8_0, 2, 16);
+instantiate_qgemm("qgemm_q4_0", q4_0, 2, 16);
+instantiate_qgemm("qgemm_q4_K", q4_K, 2, 16);
+instantiate_qgemm("qgemm_kU4B8", kU4B8, 2, 16);
 
 }

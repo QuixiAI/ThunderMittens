@@ -24,6 +24,7 @@ namespace mlx::core {
 
 static int qgemv_block_k(const std::string& fmt) {
   if (fmt == "q4_K") return 256;
+  if (fmt == "kU4B8") return 128;
   return 32;  // q8_0, q4_0
 }
 

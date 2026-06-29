@@ -207,33 +207,42 @@ def test_fftconv_parity(shape):
     _assert_parity(om, ot, atol=1e-2)
 
 
-@pytest.mark.parametrize("nkm", [(64, 64, 64), (128, 128, 128)])
-def test_qgemm_q8_0_parity(nkm):
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "q4_K", "kU4B8"])
+@pytest.mark.parametrize("nkm", [(64, 256, 64), (128, 512, 128)])
+def test_qgemm_parity(nkm, fmt):
     # same packed weights + same fp16 activations -> MLX and MPS run the same kernel ≈ identical
-    from tk.quant import quantize_q8_0
+    from tk.quant import QUANT_FORMATS
+    quantize, _ = QUANT_FORMATS[fmt]
     N, K, M = nkm
     rng = np.random.default_rng(0)
     W = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
     X = rng.standard_normal((K, M)).astype(np.float32)
-    Wq = quantize_q8_0(W)
-    om = tk.qgemm(mx.array(Wq), mx.array(X).astype(mx.float16), format="q8_0")
+    Wq = quantize(W)
+    om = tk.qgemm(mx.array(Wq), mx.array(X).astype(mx.float16), format=fmt)
     ot = tk.qgemm(torch.from_numpy(Wq).to("mps"),
-                  torch.from_numpy(X).to(torch.float16).to("mps"), format="q8_0")
-    _assert_parity(om, ot, atol=1e-2)
+                  torch.from_numpy(X).to(torch.float16).to("mps"), format=fmt)
+    # the two backends use separately-compiled metallibs, so allow a tiny magnitude-relative diff
+    mx.eval(om)
+    atol = max(1e-2, 3e-3 * float(mx.max(mx.abs(om)).item()))
+    _assert_parity(om, ot, atol=atol)
 
 
-@pytest.mark.parametrize("nk", [(64, 64), (128, 256)])
-def test_qgemv_q8_0_parity(nk):
-    from tk.quant import quantize_q8_0
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "q4_K", "kU4B8"])
+@pytest.mark.parametrize("nk", [(64, 256), (128, 256)])
+def test_qgemv_parity(nk, fmt):
+    from tk.quant import QUANT_FORMATS
+    quantize, _ = QUANT_FORMATS[fmt]
     N, K = nk
     rng = np.random.default_rng(0)
     W = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
     x = rng.standard_normal((K, 1)).astype(np.float32)
-    Wq = quantize_q8_0(W)
-    om = tk.qgemv(mx.array(Wq), mx.array(x).astype(mx.float16), format="q8_0")
+    Wq = quantize(W)
+    om = tk.qgemv(mx.array(Wq), mx.array(x).astype(mx.float16), format=fmt)
     ot = tk.qgemv(torch.from_numpy(Wq).to("mps"),
-                  torch.from_numpy(x).to(torch.float16).to("mps"), format="q8_0")
-    _assert_parity(om, ot, atol=1e-2)
+                  torch.from_numpy(x).to(torch.float16).to("mps"), format=fmt)
+    mx.eval(om)
+    atol = max(1e-2, 3e-3 * float(mx.max(mx.abs(om)).item()))
+    _assert_parity(om, ot, atol=atol)
 
 
 @pytest.mark.parametrize("nkm", [(32, 16, 32), (64, 32, 64)])

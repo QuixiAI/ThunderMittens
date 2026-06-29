@@ -55,10 +55,8 @@ def quantize_q4_0(W: np.ndarray) -> np.ndarray:
     assert K % Q4_0_BLOCK_K == 0, "K must be a multiple of 32"
     nb = K // Q4_0_BLOCK_K
     Wb = W.reshape(N, nb, Q4_0_BLOCK_K)
-    amax = np.abs(Wb).max(axis=2)                              # (N, nb)
-    d = (amax / 7.0).astype(np.float32)
-    d_safe = np.where(d == 0.0, 1.0, d)
-    q = np.clip(np.rint(Wb / d_safe[..., None]) + 8, 0, 15).astype(np.uint8)  # 0..15
+    scale, L = _make_qx_quants(Wb, 8, 1)                       # symmetric int4: value = scale*(L-8)
+    d = scale.astype(np.float32); q = L.astype(np.uint8)
     out = np.zeros((N, nb, Q4_0_BLOCK_BYTES), dtype=np.uint8)
     out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
     lo, hi = q[:, :, 0:16], q[:, :, 16:32]
@@ -94,17 +92,18 @@ def quantize_q4_K(W: np.ndarray) -> np.ndarray:
     assert K % Q4_K_BLOCK_K == 0, "K must be a multiple of 256"
     nb = K // Q4_K_BLOCK_K
     sub = W.reshape(N, nb, 8, 32)
-    mn = sub.min(axis=3)                                   # (N, nb, 8)
-    mx = sub.max(axis=3)
-    scale_sub = (mx - mn) / 15.0
-    eff_min = np.maximum(-mn, 0.0)                          # value = scale*q - eff_min
-    d = (scale_sub.max(axis=2) / 63.0).astype(np.float32)  # (N, nb)
-    dmin = (eff_min.max(axis=2) / 63.0).astype(np.float32)
-    ds, dms = np.where(d == 0, 1.0, d), np.where(dmin == 0, 1.0, dmin)
-    sc = np.clip(np.rint(scale_sub / ds[..., None]), 0, 63).astype(np.int32)  # (N, nb, 8)
-    m = np.clip(np.rint(eff_min / dms[..., None]), 0, 63).astype(np.int32)
-    ssafe = np.where(scale_sub == 0, 1.0, scale_sub)
-    q = np.clip(np.rint((sub - mn[..., None]) / ssafe[..., None]), 0, 15).astype(np.int32)  # (N,nb,8,32)
+    av_x = np.sqrt((sub * sub).mean(-1, keepdims=True))     # weights = av_x + |x| (ggml q4_K)
+    wts = av_x + np.abs(sub)
+    scale_sub, eff_min, _ = _make_qkx2_quants(sub, wts, 15, -1.0, 0.1, 20, False)   # (N,nb,8)
+    max_scale = scale_sub.max(axis=2); max_min = eff_min.max(axis=2)
+    d = (max_scale / 63.0).astype(np.float32); dmin = (max_min / 63.0).astype(np.float32)
+    isc = np.where(max_scale > 0, 63.0 / np.where(max_scale == 0, 1.0, max_scale), 0.0)
+    iscm = np.where(max_min > 0, 63.0 / np.where(max_min == 0, 1.0, max_min), 0.0)
+    sc = np.minimum(np.rint(isc[..., None] * scale_sub), 63).astype(np.int32)  # (N,nb,8)
+    m = np.minimum(np.rint(iscm[..., None] * eff_min), 63).astype(np.int32)
+    d16 = d.astype(np.float16).astype(np.float32); dm16 = dmin.astype(np.float16).astype(np.float32)
+    dr = d16[..., None] * sc; drs = np.where(dr == 0, 1.0, dr)
+    q = np.clip(np.rint((sub + (dm16[..., None] * m)[..., None]) / drs[..., None]), 0, 15).astype(np.int32)
 
     out = np.zeros((N, nb, Q4_K_BLOCK_BYTES), dtype=np.uint8)
     out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
@@ -156,10 +155,8 @@ def quantize_kU4B8(W: np.ndarray) -> np.ndarray:
     assert K % KU4B8_BLOCK_K == 0, "K must be a multiple of 128"
     nb = K // KU4B8_BLOCK_K
     Wb = W.reshape(N, nb, KU4B8_BLOCK_K)
-    amax = np.abs(Wb).max(axis=2)
-    d = (amax / 7.0).astype(np.float32)
-    d_safe = np.where(d == 0.0, 1.0, d)
-    q = np.clip(np.rint(Wb / d_safe[..., None]) + 8, 0, 15).astype(np.uint8)   # (N, nb, 128)
+    scale, L = _make_qx_quants(Wb, 8, 1)                       # GPTQ symmetric int4: value = scale*(L-8)
+    d = scale.astype(np.float32); q = L.astype(np.uint8)       # (N, nb, 128)
     out = np.zeros((N, nb, KU4B8_BLOCK_BYTES), dtype=np.uint8)
     out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
     lo, hi = q[:, :, 0:64], q[:, :, 64:128]
@@ -190,11 +187,13 @@ def quantize_kU4(W: np.ndarray) -> np.ndarray:
     assert K % KU4_BLOCK_K == 0, "K must be a multiple of 128"
     nb = K // KU4_BLOCK_K
     Wb = W.reshape(N, nb, KU4_BLOCK_K)
-    mn, mx = Wb.min(axis=2), Wb.max(axis=2)
-    scale = ((mx - mn) / 15.0).astype(np.float32)
+    av_x = np.sqrt((Wb * Wb).mean(-1, keepdims=True)); wts = av_x + np.abs(Wb)
+    scale, the_min, _ = _make_qkx2_quants(Wb, wts, 15, -1.0, 0.1, 20, False)   # value = scale*(nibble - zp)
     ssafe = np.where(scale == 0, 1.0, scale)
-    zp = np.clip(np.rint(-mn / ssafe), 0, 15).astype(np.float32)            # (N, nb)
-    q = np.clip(np.rint(Wb / ssafe[..., None] + zp[..., None]), 0, 15).astype(np.uint8)
+    zp = (the_min / ssafe).astype(np.float32)                                # fractional zero-point
+    s16 = scale.astype(np.float16).astype(np.float32); zp16 = zp.astype(np.float16).astype(np.float32)
+    s16s = np.where(s16 == 0, 1.0, s16)
+    q = np.clip(np.rint(Wb / s16s[..., None] + zp16[..., None]), 0, 15).astype(np.uint8)
     out = np.zeros((N, nb, KU4_BLOCK_BYTES), dtype=np.uint8)
     out[:, :, 0:2] = scale.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
     out[:, :, 2:4] = zp.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
@@ -283,15 +282,33 @@ def dequantize_fp4_e2m1(packed):
     return (scale * _e2m1_decode_arr(nib)).reshape(N, nb * 32)
 
 
+# ---- e8m0 (MX) block-scale selection: pick the power-of-two scale (floor or floor+1) that minimizes
+# round-trip error — floor alone lets the block max overflow the codebook by up to 2x (a big quality
+# hit, esp. at 8-bit); best-of-2 removes that clamp. `decode_fn` reconstructs codes for the error check.
+def _best_mx_e8m0(Wb, maxval, code_tbl, val_tbl, decode_fn):
+    amax = np.abs(Wb).max(-1)
+    base = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30) / maxval)), 0.0)
+    best_e = best_codes = best_err = None
+    for off in (0.0, 1.0):
+        e8m0 = np.clip(base + off + 127, 0, 254).astype(np.int32)
+        scale = (2.0 ** (e8m0 - 127)).astype(np.float32); ss = np.where(scale == 0, 1.0, scale)
+        codes = _nearest(Wb / ss[..., None], code_tbl, val_tbl)
+        err = ((scale[..., None] * decode_fn(codes) - Wb) ** 2).sum(-1)
+        if best_e is None:
+            best_e, best_codes, best_err = e8m0, codes, err
+        else:
+            better = err < best_err
+            best_e = np.where(better, e8m0, best_e)
+            best_codes = np.where(better[..., None], codes, best_codes)
+            best_err = np.where(better, err, best_err)
+    return best_e, best_codes
+
+
 # ---- mxfp8 : 32-block, e8m0 power-of-two scale + fp8 e4m3. { uint8 e8m0; uint8 qs[32]; } = 33 bytes. ----
 def quantize_mxfp8(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
     Wb = W.reshape(N, nb, 32)
-    amax = np.abs(Wb).max(axis=2)
-    exp = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30) / 448.0)), 0.0)
-    e8m0 = np.clip(exp + 127, 0, 254).astype(np.int32)                      # (N,nb)
-    scale = (2.0 ** (e8m0 - 127)).astype(np.float32)
-    codes = _nearest(Wb / scale[..., None], _E4M3_CODES, _E4M3_VALS)
+    e8m0, codes = _best_mx_e8m0(Wb, 448.0, _E4M3_CODES, _E4M3_VALS, _e4m3_decode_arr)
     out = np.zeros((N, nb, 33), np.uint8)
     out[:, :, 0] = e8m0.astype(np.uint8)
     out[:, :, 1:33] = codes
@@ -331,11 +348,7 @@ def dequantize_nvfp4(packed):
 def quantize_mxfp4(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
     Wb = W.reshape(N, nb, 32)
-    amax = np.abs(Wb).max(axis=2)
-    exp = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30) / 6.0)), 0.0)
-    e8m0 = np.clip(exp + 127, 0, 254).astype(np.int32)
-    scale = (2.0 ** (e8m0 - 127)).astype(np.float32)
-    codes = _nearest(Wb / scale[..., None], _E2M1_CODES, _E2M1_VALS)        # (N,nb,32)
+    e8m0, codes = _best_mx_e8m0(Wb, 6.0, _E2M1_CODES, _E2M1_VALS, _e2m1_decode_arr)
     out = np.zeros((N, nb, 17), np.uint8)
     out[:, :, 0] = e8m0.astype(np.uint8)
     out[:, :, 1:17] = _pack_nibbles(codes, 16)
@@ -420,12 +433,34 @@ def _nearest_index(x, table):
     return np.abs(x[..., None] - table).argmin(axis=-1).astype(np.uint8)
 
 
+def _iq4_blockscale(Wb):
+    """ggml iq4_nl per-block scale: weight x^2, init d=-max/values[0], refit, 15-pt scale sweep
+    (itry in [-7,7]) keeping best sumqx^2/sumq2. Wb (B,32) -> d (B,) float32."""
+    vals = _IQ4NL_VALUES.astype(np.float32); w = Wb * Wb
+    amax_i = np.abs(Wb).argmax(-1, keepdims=True)
+    mx = np.take_along_axis(Wb, amax_i, -1)[..., 0]; amax = np.abs(mx); deg = amax < 1e-30
+    mxs = np.where(mx == 0, 1.0, mx)
+    def nidx(s): return np.abs(s[..., None] - vals).argmin(-1)
+    d = -mx / vals[0]
+    q = vals[nidx((1.0 / np.where(d == 0, 1.0, d))[..., None] * Wb)]
+    sumqx = (w * q * Wb).sum(-1); sumq2 = (w * q * q).sum(-1)
+    d = np.where(sumq2 > 0, sumqx / np.where(sumq2 == 0, 1.0, sumq2), 0.0); best = d * sumqx
+    for itry in range(-7, 8):
+        idv = (itry + vals[0]) / mxs
+        q = vals[nidx(idv[..., None] * Wb)]
+        sqx = (w * q * Wb).sum(-1); sq2 = (w * q * q).sum(-1)
+        imp = (sq2 > 0) & (sqx * sqx > best * sq2)
+        d = np.where(imp, sqx / np.where(sq2 == 0, 1.0, sq2), d); best = np.where(imp, d * sqx, best)
+    return np.where(deg, 0.0, d).astype(np.float32)
+
+
 def quantize_iq4_nl(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
     Wb = W.reshape(N, nb, 32)
-    d = (np.abs(Wb).max(axis=2) / 127.0).astype(np.float32)           # 127 = max |codebook|
-    dsafe = np.where(d == 0, 1.0, d)
-    idx = _nearest_index(Wb / dsafe[..., None], _IQ4NL_VALUES)        # (N,nb,32) in 0..15
+    d = _iq4_blockscale(Wb.reshape(-1, 32)).reshape(N, nb)
+    d16 = d.astype(np.float16).astype(np.float32)
+    idn = 1.0 / np.where(d16 == 0, 1.0, d16)
+    idx = _nearest_index(idn[..., None] * Wb, _IQ4NL_VALUES)          # (N,nb,32) in 0..15
     out = np.zeros((N, nb, 18), np.uint8)
     out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
     out[:, :, 2:18] = (idx[:, :, :16] | (idx[:, :, 16:] << 4)).astype(np.uint8)   # lo | hi<<4
@@ -447,14 +482,17 @@ def dequantize_iq4_nl(packed):
 def quantize_iq4_xs(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
     Wsb = W.reshape(N, nb, 8, 32)                                    # 8 sub-blocks of 32
-    sub_scale = (np.abs(Wsb).max(axis=3) / 127.0).astype(np.float32)  # (N,nb,8) ideal sub scale
-    d = (sub_scale.max(axis=2) / 31.0).astype(np.float32)            # (N,nb) super scale
-    dsafe = np.where(d == 0, 1.0, d)
-    ls = np.clip(np.rint(sub_scale / dsafe[..., None]), 1, 31).astype(np.int32)   # (N,nb,8) in [1,31]
-    dl = d[..., None] * ls.astype(np.float32)                        # (N,nb,8) effective sub scale
-    dlsafe = np.where(dl == 0, 1.0, dl)
+    scales = _iq4_blockscale(Wsb.reshape(-1, 32)).reshape(N, nb, 8)   # ggml per-sub-block scale (signed)
+    absid = np.abs(scales).argmax(-1, keepdims=True)
+    max_scale = np.take_along_axis(scales, absid, -1)[..., 0]        # signed scale at max |scale|
+    nz = np.abs(max_scale) >= 1e-30
+    d = np.where(nz, -max_scale / 32.0, 0.0).astype(np.float32)      # super scale (ggml: -max/32)
+    d16 = d.astype(np.float16).astype(np.float32)
+    idd = 1.0 / np.where(d16 == 0, 1.0, d16)
+    l = np.clip(np.rint(idd[..., None] * scales), -32, 31).astype(np.int32)   # (N,nb,8) signed
+    dl = d16[..., None] * l; dlsafe = np.where(dl == 0, 1.0, dl)
     idx = _nearest_index(Wsb / dlsafe[..., None], _IQ4NL_VALUES)     # (N,nb,8,32) in 0..15
-    ls_raw = (ls + 32).astype(np.uint32)                            # [33,63], 6-bit
+    ls_raw = (l + 32).astype(np.uint32)                             # [0,63], 6-bit
     out = np.zeros((N, nb, 136), np.uint8)
     out[:, :, 0:2] = d.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
     sh = (ls_raw >> 4) & 0x3                                        # (N,nb,8) high 2 bits
@@ -733,6 +771,98 @@ def _f16le(x, N, nb):  # pack float32 -> 2 little-endian uint8 bytes (N,nb,2)
     return x.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
 
 
+# ---- ggml-faithful quant optimizers (batched over the leading axes B; last axis n = sub-block) ----
+# Ports of make_qx_quants / make_qkx2_quants / make_q3_quants from llama.cpp ggml-quants.c. They pick
+# the (scale[,min], integer codes L) that minimize weighted error, exactly as ggml does, so our
+# encoders match ggml's quant *quality* (the byte packing stays our existing, decoder-matched layout).
+def _make_qx_quants(x, nmax, rmse_type=1):
+    """Symmetric: value = scale*(L-nmax), L in [0,2nmax-1]. Returns (scale (B,), L (B,n) int)."""
+    amax_i = np.abs(x).argmax(axis=-1, keepdims=True)
+    mx = np.take_along_axis(x, amax_i, axis=-1)[..., 0]              # signed value at amax
+    amax = np.abs(mx)
+    iscale = np.where(amax > 1e-15, -nmax / np.where(mx == 0, 1.0, mx), 0.0)
+    w = x * x if rmse_type == 1 else np.ones_like(x)
+    def quant(isc):
+        l = np.clip(np.rint(isc[..., None] * x), -nmax, nmax - 1)
+        sumlx = (w * x * l).sum(-1); suml2 = (w * l * l).sum(-1)
+        return l, sumlx, suml2
+    l, sumlx, suml2 = quant(iscale)
+    scale = np.where(suml2 > 0, sumlx / np.where(suml2 == 0, 1.0, suml2), 0.0)
+    best = scale * sumlx; Lbest = l
+    for is_ in range(-9, 10):
+        if is_ == 0:
+            continue
+        isc = np.where(amax > 1e-15, -(nmax + 0.1 * is_) / np.where(mx == 0, 1.0, mx), 0.0)
+        l2, sumlx2, suml2_2 = quant(isc)
+        imp = (suml2_2 > 0) & (sumlx2 * sumlx2 > best * suml2_2)
+        scale = np.where(imp, sumlx2 / np.where(suml2_2 == 0, 1.0, suml2_2), scale)
+        best = np.where(imp, scale * sumlx2, best)
+        Lbest = np.where(imp[..., None], l2, Lbest)
+    L = np.where((amax > 1e-15)[..., None], Lbest + nmax, 0).astype(np.int32)
+    return np.where(amax > 1e-15, scale, 0.0).astype(np.float32), L
+
+
+def _make_qkx2_quants(x, w, nmax, rmin, rdelta, nstep, use_mad):
+    """Affine: value = scale*L + min, L in [0,nmax]. Returns (scale (B,), the_min (B,), L (B,n) int)."""
+    mn = x.min(-1); mx = x.max(-1); mn = np.minimum(mn, 0.0)
+    degen = mx == mn
+    span = np.where(degen, 1.0, mx - mn)
+    iscale = nmax / span; scale = 1.0 / iscale
+    minv = mn.copy()
+    L = np.clip(np.rint(iscale[..., None] * (x - minv[..., None])), 0, nmax)
+    def err(sc, mi, Lc):
+        diff = sc[..., None] * Lc + mi[..., None] - x
+        diff = np.abs(diff) if use_mad else diff * diff
+        return (w * diff).sum(-1)
+    best_error = err(scale, minv, L)
+    sum_w = w.sum(-1); sum_x = (w * x).sum(-1)
+    for is_ in range(nstep + 1):
+        isc = (rmin + rdelta * is_ + nmax) / span
+        Laux = np.clip(np.rint(isc[..., None] * (x - minv[..., None])), 0, nmax)
+        sum_l = (w * Laux).sum(-1); sum_l2 = (w * Laux * Laux).sum(-1); sum_xl = (w * Laux * x).sum(-1)
+        D = sum_w * sum_l2 - sum_l * sum_l
+        Dok = D > 0; Ds = np.where(Dok, D, 1.0)
+        this_scale = (sum_w * sum_xl - sum_x * sum_l) / Ds
+        this_min = (sum_l2 * sum_x - sum_l * sum_xl) / Ds
+        neg = this_min > 0
+        this_scale = np.where(neg, sum_xl / np.where(sum_l2 == 0, 1.0, sum_l2), this_scale)
+        this_min = np.where(neg, 0.0, this_min)
+        cur_error = err(this_scale, this_min, Laux)
+        imp = Dok & (cur_error < best_error)
+        L = np.where(imp[..., None], Laux, L)
+        best_error = np.where(imp, cur_error, best_error)
+        scale = np.where(imp, this_scale, scale)
+        minv = np.where(imp, this_min, minv)
+    L = np.where(degen[..., None], 0, L).astype(np.int32)
+    return np.where(degen, 0.0, scale).astype(np.float32), (-minv).astype(np.float32), L
+
+
+def _make_q3_quants(x, nmax=4):
+    """Symmetric + coordinate descent. Returns (scale (B,), L (B,n) int in [0,2nmax-1])."""
+    amax_i = np.abs(x).argmax(axis=-1, keepdims=True)
+    mx = np.take_along_axis(x, amax_i, axis=-1)[..., 0]; amax = np.abs(mx)
+    iscale = np.where(amax > 1e-15, -nmax / np.where(mx == 0, 1.0, mx), 0.0)
+    L = np.clip(np.rint(iscale[..., None] * x), -nmax, nmax - 1).astype(np.float64)
+    w = (x * x).astype(np.float64)
+    xd = x.astype(np.float64)
+    sumlx = (w * xd * L).sum(-1); suml2 = (w * L * L).sum(-1)
+    n = x.shape[-1]
+    for _ in range(5):
+        for i in range(n):
+            wi = w[..., i]; xi = xd[..., i]; Li = L[..., i]
+            slx = sumlx - wi * xi * Li
+            sl2 = suml2 - wi * Li * Li
+            pos = slx > 0
+            new_l = np.clip(np.rint(np.where(pos, xi * sl2 / np.where(slx == 0, 1.0, slx), Li)), -nmax, nmax - 1)
+            slx2 = slx + wi * xi * new_l; sl2_2 = sl2 + wi * new_l * new_l
+            acc = pos & (new_l != Li) & (sl2_2 > 0) & (slx2 * slx2 * suml2 > sumlx * sumlx * sl2_2)
+            L[..., i] = np.where(acc, new_l, Li)
+            sumlx = np.where(acc, slx2, sumlx); suml2 = np.where(acc, sl2_2, suml2)
+    scale = np.where((suml2 > 0) & (amax > 1e-15), sumlx / np.where(suml2 == 0, 1.0, suml2), 0.0)
+    L = np.where((amax > 1e-15)[..., None], L + nmax, 0).astype(np.int32)
+    return scale.astype(np.float32), L
+
+
 def quantize_q4_1(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
     Wb = W.reshape(N, nb, 32); mn = Wb.min(2); d = ((Wb.max(2) - mn) / 15.0).astype(np.float32)
@@ -816,13 +946,16 @@ def dequantize_q5_1(packed):
 def quantize_q2_K(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
     Wsb = W.reshape(N, nb, 16, 16)                          # sub-block g == kernel index `is`
-    mn = Wsb.min(3); sc_t = (Wsb.max(3) - mn) / 3.0; min_t = np.maximum(-mn, 0.0)
-    d = (sc_t.max(2) / 15.0).astype(np.float32); dmin = (min_t.max(2) / 15.0).astype(np.float32)
-    ds, dms = np.where(d == 0, 1.0, d), np.where(dmin == 0, 1.0, dmin)
-    sc = np.clip(np.rint(sc_t / ds[..., None]), 0, 15).astype(np.int32)
-    m = np.clip(np.rint(min_t / dms[..., None]), 0, 15).astype(np.int32)
-    dl = d[..., None] * sc; ml = dmin[..., None] * m; dls = np.where(dl == 0, 1.0, dl)
-    qel = np.clip(np.rint((Wsb + ml[..., None]) / dls[..., None]), 0, 3).astype(np.uint8)
+    scale, the_min, _ = _make_qkx2_quants(Wsb, np.abs(Wsb), 3, -0.5, 0.1, 15, True)   # (N,nb,16)
+    max_scale = scale.max(-1); max_min = the_min.max(-1)
+    d = (max_scale / 15.0).astype(np.float32); dmin = (max_min / 15.0).astype(np.float32)
+    isc = np.where(max_scale > 0, 15.0 / np.where(max_scale == 0, 1.0, max_scale), 0.0)
+    iscm = np.where(max_min > 0, 15.0 / np.where(max_min == 0, 1.0, max_min), 0.0)
+    sc = np.clip(np.rint(isc[..., None] * scale), 0, 15).astype(np.int32)
+    m = np.clip(np.rint(iscm[..., None] * the_min), 0, 15).astype(np.int32)
+    d16 = d.astype(np.float16).astype(np.float32); dm16 = dmin.astype(np.float16).astype(np.float32)
+    dr = d16[..., None] * sc; drs = np.where(dr == 0, 1.0, dr)                          # reconstructed scale
+    qel = np.clip(np.rint((Wsb + (dm16[..., None] * m)[..., None]) / drs[..., None]), 0, 3).astype(np.uint8)
     out = np.zeros((N, nb, 84), np.uint8)
     out[:, :, 0:16] = (sc | (m << 4)).astype(np.uint8)
     for g in range(16):
@@ -850,11 +983,16 @@ def dequantize_q2_K(packed):
 def quantize_q3_K(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
     Wsb = W.reshape(N, nb, 16, 16)
-    scl = (np.abs(Wsb).max(3) / 4.0).astype(np.float32)     # q3 in -4..3
-    d = (scl.max(2) / 31.0).astype(np.float32); ds = np.where(d == 0, 1.0, d)
-    s6 = np.clip(np.rint(scl / ds[..., None]) + 32, 1, 63).astype(np.int32)   # 6-bit, used as s-32
-    dl = d[..., None] * (s6 - 32); dls = np.where(dl == 0, 1.0, dl)
-    code = np.clip(np.rint(Wsb / dls[..., None]) + 4, 0, 7).astype(np.int32)  # q3v+4 in 0..7
+    scale, _ = _make_q3_quants(Wsb, 4)                       # scale (N,nb,16) signed
+    absid = np.abs(scale).argmax(-1, keepdims=True)
+    max_scale = np.take_along_axis(scale, absid, -1)[..., 0]  # signed scale at max |scale|
+    nz = np.abs(max_scale) >= 1e-15
+    iscale = np.where(nz, -32.0 / np.where(max_scale == 0, 1.0, max_scale), 0.0)
+    d = np.where(nz, 1.0 / np.where(iscale == 0, 1.0, iscale), 0.0).astype(np.float32)  # = -max_scale/32
+    s6 = np.where(nz[..., None], (np.clip(np.rint(iscale[..., None] * scale), -32, 31) + 32), 32).astype(np.int32)
+    d16 = d.astype(np.float16).astype(np.float32)
+    dr = d16[..., None] * (s6 - 32); drs = np.where(dr == 0, 1.0, dr)
+    code = (np.clip(np.rint(Wsb / drs[..., None]), -4, 3) + 4).astype(np.int32)  # q3v+4 in 0..7
     out = np.zeros((N, nb, 110), np.uint8)
     for g in range(16):
         chunk, sidx, sub = g // 8, (g % 8) // 2, g % 2
@@ -896,13 +1034,18 @@ def dequantize_q3_K(packed):
 def quantize_q5_K(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
     Wsb = W.reshape(N, nb, 8, 32)                           # sub-block g32 == kernel index `is`
-    mn = Wsb.min(3); sc_t = (Wsb.max(3) - mn) / 31.0; min_t = np.maximum(-mn, 0.0)
-    d = (sc_t.max(2) / 63.0).astype(np.float32); dmin = (min_t.max(2) / 63.0).astype(np.float32)
-    ds, dms = np.where(d == 0, 1.0, d), np.where(dmin == 0, 1.0, dmin)
-    sc = np.clip(np.rint(sc_t / ds[..., None]), 0, 63).astype(np.int32)
-    m = np.clip(np.rint(min_t / dms[..., None]), 0, 63).astype(np.int32)
-    dl = d[..., None] * sc; ml = dmin[..., None] * m; dls = np.where(dl == 0, 1.0, dl)
-    code = np.clip(np.rint((Wsb + ml[..., None]) / dls[..., None]), 0, 31).astype(np.int32)
+    av_x = np.sqrt((Wsb * Wsb).mean(-1, keepdims=True))
+    wts = av_x + np.abs(Wsb)
+    scale_sub, eff_min, _ = _make_qkx2_quants(Wsb, wts, 31, -0.5, 0.1, 15, False)   # (N,nb,8)
+    max_scale = scale_sub.max(2); max_min = eff_min.max(2)
+    d = (max_scale / 63.0).astype(np.float32); dmin = (max_min / 63.0).astype(np.float32)
+    isc = np.where(max_scale > 0, 63.0 / np.where(max_scale == 0, 1.0, max_scale), 0.0)
+    iscm = np.where(max_min > 0, 63.0 / np.where(max_min == 0, 1.0, max_min), 0.0)
+    sc = np.minimum(np.rint(isc[..., None] * scale_sub), 63).astype(np.int32)
+    m = np.minimum(np.rint(iscm[..., None] * eff_min), 63).astype(np.int32)
+    d16 = d.astype(np.float16).astype(np.float32); dm16 = dmin.astype(np.float16).astype(np.float32)
+    dr = d16[..., None] * sc; drs = np.where(dr == 0, 1.0, dr)
+    code = np.clip(np.rint((Wsb + (dm16[..., None] * m)[..., None]) / drs[..., None]), 0, 31).astype(np.int32)
     out = np.zeros((N, nb, 176), np.uint8)
     out[:, :, 0:2] = _f16le(d, N, nb); out[:, :, 2:4] = _f16le(dmin, N, nb)
     sca = np.zeros((N, nb, 12), np.uint8)                   # get_scale_min_k4 inverse (as q4_K)
@@ -942,18 +1085,20 @@ def dequantize_q5_K(packed):
 
 def quantize_q6_K(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
-    sc_of_col = np.array([(c >> 7) * 8 + ((c & 31) >> 4) + ((c & 127) >> 5) * 2 for c in range(256)])
+    sc_of_col = np.array([(c >> 7) * 8 + ((c & 31) >> 4) + ((c & 127) >> 5) * 2 for c in range(256)])  # == c//16
     Wf = W.reshape(N, nb, 256)
-    scl = np.zeros((N, nb, 16), np.float32)
-    for s in range(16):
-        cols = np.where(sc_of_col == s)[0]
-        scl[:, :, s] = np.abs(Wf[:, :, cols]).max(2) / 32.0
-    d = (scl.max(2) / 127.0).astype(np.float32); dsf = np.where(d == 0, 1.0, d)
-    sc8 = np.clip(np.rint(scl / dsf[..., None]), -127, 127).astype(np.int32)
+    scale, _ = _make_qx_quants(W.reshape(N, nb, 16, 16), 32, 1)   # (N,nb,16) per contiguous sub-block
+    absid = np.abs(scale).argmax(-1, keepdims=True)
+    max_scale = np.take_along_axis(scale, absid, -1)[..., 0]
+    nz = np.abs(max_scale) >= 1e-15
+    iscale = np.where(nz, -128.0 / np.where(max_scale == 0, 1.0, max_scale), 0.0)
+    d = np.where(nz, 1.0 / np.where(iscale == 0, 1.0, iscale), 0.0).astype(np.float32)  # = -max_scale/128
+    sc8 = np.clip(np.rint(iscale[..., None] * scale), -128, 127).astype(np.int32)
+    d16 = d.astype(np.float16).astype(np.float32)
     out = np.zeros((N, nb, 210), np.uint8)
     for col in range(256):
         chunk, pos = col >> 7, col & 127; group, l = pos >> 5, pos & 31; s = sc_of_col[col]
-        dl = d * sc8[:, :, s]; dls = np.where(dl == 0, 1.0, dl)
+        dl = d16 * sc8[:, :, s]; dls = np.where(dl == 0, 1.0, dl)
         code = np.clip(np.rint(Wf[:, :, col] / dls) + 32, 0, 63).astype(np.int32)
         ql_byte = chunk * 64 + l + 32 * (group & 1)
         if group & 2:
@@ -987,10 +1132,14 @@ def dequantize_q6_K(packed):
 # ---- hqq : HQQ int4 + per-group zero-point, group 64. { half scale; half zp; uint8 qs[32]; } = 36. ----
 def quantize_hqq(W):
     W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 64
-    Wb = W.reshape(N, nb, 64); mn, mx = Wb.min(2), Wb.max(2)
-    scale = ((mx - mn) / 15.0).astype(np.float32); ssafe = np.where(scale == 0, 1.0, scale)
-    zp = np.clip(np.rint(-mn / ssafe), 0, 15).astype(np.float32)
-    q = np.clip(np.rint(Wb / ssafe[..., None] + zp[..., None]), 0, 15).astype(np.uint8)
+    Wb = W.reshape(N, nb, 64)
+    av_x = np.sqrt((Wb * Wb).mean(-1, keepdims=True)); wts = av_x + np.abs(Wb)
+    scale, the_min, _ = _make_qkx2_quants(Wb, wts, 15, -1.0, 0.1, 20, False)
+    ssafe = np.where(scale == 0, 1.0, scale)
+    zp = (the_min / ssafe).astype(np.float32)
+    s16 = scale.astype(np.float16).astype(np.float32); zp16 = zp.astype(np.float16).astype(np.float32)
+    s16s = np.where(s16 == 0, 1.0, s16)
+    q = np.clip(np.rint(Wb / s16s[..., None] + zp16[..., None]), 0, 15).astype(np.uint8)
     out = np.zeros((N, nb, 36), np.uint8)
     out[:, :, 0:2] = scale.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
     out[:, :, 2:4] = zp.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
@@ -1074,11 +1223,8 @@ def _quantize_mxfp6(W, e3m2):
     Wb = W.reshape(N, nb, 32)
     codes_t, vals_t = (_E3M2_CODES, _E3M2_VALS) if e3m2 else (_E2M3_CODES, _E2M3_VALS)
     maxval = 28.0 if e3m2 else 7.5
-    amax = np.abs(Wb).max(axis=2)
-    exp = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30) / maxval)), 0.0)
-    e8m0 = np.clip(exp + 127, 0, 254).astype(np.int32)
-    scale = (2.0 ** (e8m0 - 127)).astype(np.float32)
-    codes6 = _nearest(Wb / scale[..., None], codes_t, vals_t).astype(np.uint32).reshape(N, nb, 8, 4)
+    e8m0, codes6 = _best_mx_e8m0(Wb, maxval, codes_t, vals_t, lambda c: _fp6_decode_arr(c, e3m2))
+    codes6 = codes6.astype(np.uint32).reshape(N, nb, 8, 4)
     val = codes6[..., 0] | (codes6[..., 1] << 6) | (codes6[..., 2] << 12) | (codes6[..., 3] << 18)  # (N,nb,8)
     out = np.zeros((N, nb, 25), np.uint8)
     out[:, :, 0] = e8m0.astype(np.uint8)

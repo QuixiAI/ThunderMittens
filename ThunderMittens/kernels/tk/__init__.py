@@ -207,6 +207,22 @@ def qgemm_direct(wq, x, format="q8_0"):
     return _mlx().qgemm_direct(wq, x, format=format)
 
 
+def qgemv_w8a8(wq, xq, w_scale, a_scale):
+    """W8A8/SmoothQuant decode GEMV: int8 weight (N,K) x int8 act (K,1) -> int32, *w_scale[n]*a_scale.
+    w_scale (N,) half, a_scale (1,) half -> (N,1) half. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(wq):
+        return _torch().qgemv_w8a8(wq, xq, w_scale, a_scale)
+    return _mlx().qgemv_w8a8(wq, xq, w_scale, a_scale)
+
+
+def qgemv_w2a8(wq, xq, a_scale):
+    """BitNet W2A8 decode GEMV: ternary 2-bit weight (bitnet blocks) x int8 act (K,1) -> int32,
+    per-group absmean scale * a_scale -> (N,1) half. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(wq):
+        return _torch().qgemv_w2a8(wq, xq, a_scale)
+    return _mlx().qgemv_w2a8(wq, xq, a_scale)
+
+
 def qgemv(wq, x, format="q8_0"):
     """Quantized GEMV (batch-1 decode): out = dequantize(wq) @ x. wq packed weight blocks
     (N, K//block_k, block_bytes) uint8; x is (K, 1) float16 -> (N, 1) float16.

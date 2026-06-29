@@ -454,6 +454,35 @@ static at::Tensor qflux_gelu_mps(const at::Tensor& wq_in, const at::Tensor& x_in
   return out;
 }
 
+static at::Tensor qgemv_w8a8_mps(const at::Tensor& wq_in, const at::Tensor& xq_in,
+                                 const at::Tensor& ws_in, const at::Tensor& as_in) {
+  TORCH_CHECK(wq_in.device().is_mps(), "qgemv_w8a8: wq must be an MPS tensor");
+  TORCH_CHECK(wq_in.scalar_type() == at::kChar && xq_in.scalar_type() == at::kChar,
+              "qgemv_w8a8: wq, xq must be int8");
+  TORCH_CHECK(ws_in.scalar_type() == at::kHalf && as_in.scalar_type() == at::kHalf,
+              "qgemv_w8a8: scales must be float16");
+  auto wq = wq_in.contiguous(), xq = xq_in.contiguous(), ws = ws_in.contiguous(), as = as_in.contiguous();
+  const int N = wq.size(0), K = wq.size(1);
+  TORCH_CHECK(K % 4 == 0 && xq.size(0) == K, "qgemv_w8a8: K%4==0, xq rows==K");
+  auto out = at::empty({N, 1}, ws.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_qgemv_w8a8(e, out, wq, xq, ws, as, N, K); });
+  return out;
+}
+
+static at::Tensor qgemv_w2a8_mps(const at::Tensor& wq_in, const at::Tensor& xq_in,
+                                 const at::Tensor& as_in) {
+  TORCH_CHECK(wq_in.device().is_mps(), "qgemv_w2a8: wq must be an MPS tensor");
+  TORCH_CHECK(wq_in.scalar_type() == at::kByte && xq_in.scalar_type() == at::kChar,
+              "qgemv_w2a8: wq uint8 (bitnet blocks), xq int8");
+  TORCH_CHECK(as_in.scalar_type() == at::kHalf, "qgemv_w2a8: a_scale float16");
+  auto wq = wq_in.contiguous(), xq = xq_in.contiguous(), as = as_in.contiguous();
+  const int N = wq.size(0), K = (int)wq.size(1) * 32;
+  TORCH_CHECK(xq.size(0) == K, "qgemv_w2a8: xq rows==K");
+  auto out = at::empty({N, 1}, as.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_qgemv_w2a8(e, out, wq, xq, as, N, K); });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
@@ -478,4 +507,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("qgemm", &qgemm_mps, "ThunderMittens quantized GEMM (MPS)");
   m.def("qgemv", &qgemv_mps, "ThunderMittens quantized GEMV decode (MPS)");
   m.def("qflux_gelu", &qflux_gelu_mps, "ThunderMittens quantized fused GEMM+GELU (MPS)");
+  m.def("qgemv_w8a8", &qgemv_w8a8_mps, "ThunderMittens W8A8 int8xint8 decode GEMV (MPS)");
+  m.def("qgemv_w2a8", &qgemv_w2a8_mps, "ThunderMittens BitNet W2A8 int decode GEMV (MPS)");
 }

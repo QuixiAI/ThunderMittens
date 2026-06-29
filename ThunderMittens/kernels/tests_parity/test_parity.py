@@ -245,6 +245,43 @@ def test_qgemv_parity(nk, fmt):
     _assert_parity(om, ot, atol=atol)
 
 
+@pytest.mark.parametrize("nk", [(64, 256), (128, 512)])
+def test_qgemv_w8a8_parity(nk):
+    from tk.quant import quantize_w8a8, quantize_act_int8
+    N, K = nk
+    rng = np.random.default_rng(0)
+    W = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    X = rng.standard_normal((K, 1)).astype(np.float32)
+    Wq, ws = quantize_w8a8(W)
+    _, Xq, xs = quantize_act_int8(X)
+    asc = np.array([xs[0, 0]], np.float16)
+    om = tk.qgemv_w8a8(mx.array(Wq), mx.array(Xq), mx.array(ws).astype(mx.float16), mx.array(asc))
+    ot = tk.qgemv_w8a8(torch.from_numpy(Wq).to("mps"), torch.from_numpy(Xq).to("mps"),
+                       torch.from_numpy(ws).to(torch.float16).to("mps"),
+                       torch.from_numpy(asc).to("mps"))
+    mx.eval(om)
+    atol = max(1e-2, 3e-3 * float(mx.max(mx.abs(om)).item()))
+    _assert_parity(om, ot, atol=atol)
+
+
+@pytest.mark.parametrize("nk", [(64, 256), (128, 512)])
+def test_qgemv_w2a8_parity(nk):
+    from tk.quant import quantize_bitnet, quantize_act_int8
+    N, K = nk
+    rng = np.random.default_rng(0)
+    W = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    X = rng.standard_normal((K, 1)).astype(np.float32)
+    Wq = quantize_bitnet(W)
+    _, Xq, xs = quantize_act_int8(X)
+    asc = np.array([xs[0, 0]], np.float16)
+    om = tk.qgemv_w2a8(mx.array(Wq), mx.array(Xq), mx.array(asc))
+    ot = tk.qgemv_w2a8(torch.from_numpy(Wq).to("mps"), torch.from_numpy(Xq).to("mps"),
+                       torch.from_numpy(asc).to("mps"))
+    mx.eval(om)
+    atol = max(1e-2, 3e-3 * float(mx.max(mx.abs(om)).item()))
+    _assert_parity(om, ot, atol=atol)
+
+
 @pytest.mark.parametrize("nkm", [(32, 16, 32), (64, 32, 64)])
 def test_cmplx_matmul_parity(nkm):
     N, K, M = nkm

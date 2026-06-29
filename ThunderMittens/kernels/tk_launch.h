@@ -293,6 +293,28 @@ void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq, typename E::in
   e.dispatch(N, 1, 1, 32, 1, 1);  // one simdgroup per output row
 }
 
+// ----- qgemv_w8a8 (W8A8 int8xint8 decode): D@0 Wq@1(int8) Xq@2(int8) w_scale@3 a_scale@4 ;
+//        N@5 K@6 (i32) ; grid (N,1,1) 32 threads. int32 accumulate then *w_scale[n]*a_scale. -----
+template <class E>
+void launch_qgemv_w8a8(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t xq,
+                       typename E::in_t wscale, typename E::in_t ascale, int N, int K) {
+  e.pipeline("mittens::qgemv_w8a8");  // non-template kernel keeps its namespaced symbol
+  e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(wscale, 3); e.in(ascale, 4);
+  e.bytes(N, 5); e.bytes(K, 6);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
+// ----- qgemv_w2a8 (BitNet W2A8 int2xint8 decode): D@0 Wq@1(bitnet blocks) Xq@2(int8) a_scale@3 ;
+//        N@4 K@5 (i32) ; grid (N,1,1) 32 threads. per-group int32 sums * absmean scale * a_scale. -----
+template <class E>
+void launch_qgemv_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t xq,
+                       typename E::in_t ascale, int N, int K) {
+  e.pipeline("mittens::qgemv_w2a8");  // non-template kernel keeps its namespaced symbol
+  e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(ascale, 3);
+  e.bytes(N, 4); e.bytes(K, 5);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
 // ----- qflux_gelu (quantized fused GEMM+GELU): D@0 Wq@1 X@2 bias@3 ; N@4 K@5 M@6 (i32) ;
 //        grid (M/32, N/32, 1), 64 threads. D = gelu(dequant(Wq) @ X + bias), all half. -----
 template <class E>

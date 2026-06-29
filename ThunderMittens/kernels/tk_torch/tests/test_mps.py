@@ -367,6 +367,49 @@ def test_qgemv(nk, fmt):
     assert np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
 
 
+@pytest.mark.parametrize("nk", [(64, 256), (128, 512)])
+def test_qgemv_w8a8(nk):
+    """W8A8 int8xint8 decode (MPS), vs the INTEGER oracle (not the half path)."""
+    import numpy as np
+    from tk.quant import quantize_w8a8, quantize_act_int8
+    N, K = nk
+    rng = np.random.default_rng(0)
+    W = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    X = rng.standard_normal((K, 1)).astype(np.float32)
+    Wq, ws = quantize_w8a8(W)
+    _, Xq, xs = quantize_act_int8(X)
+    a_scale = float(xs[0, 0])
+    got = tk_torch.qgemv_w8a8(torch.from_numpy(Wq).to("mps"), torch.from_numpy(Xq).to("mps"),
+                              torch.from_numpy(ws).to(torch.float16).to("mps"),
+                              torch.from_numpy(np.array([a_scale], np.float16)).to("mps"))
+    torch.mps.synchronize()
+    g = got.float().cpu().numpy()
+    ref = (Wq.astype(np.int32) @ Xq.astype(np.int32)).astype(np.float32) * ws[:, None] * a_scale
+    assert got.shape == (N, 1)
+    assert np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
+
+
+@pytest.mark.parametrize("nk", [(64, 256), (128, 512)])
+def test_qgemv_w2a8(nk):
+    """BitNet W2A8 int decode (MPS), per-group int sums * absmean scale * a_scale."""
+    import numpy as np
+    from tk.quant import quantize_bitnet, dequantize_bitnet, quantize_act_int8
+    N, K = nk
+    rng = np.random.default_rng(0)
+    W = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    X = rng.standard_normal((K, 1)).astype(np.float32)
+    Wq = quantize_bitnet(W)
+    _, Xq, xs = quantize_act_int8(X)
+    a_scale = float(xs[0, 0])
+    got = tk_torch.qgemv_w2a8(torch.from_numpy(Wq).to("mps"), torch.from_numpy(Xq).to("mps"),
+                              torch.from_numpy(np.array([a_scale], np.float16)).to("mps"))
+    torch.mps.synchronize()
+    g = got.float().cpu().numpy()
+    ref = (dequantize_bitnet(Wq).astype(np.float32) @ Xq.astype(np.float32)) * a_scale
+    assert got.shape == (N, 1)
+    assert np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
+
+
 def test_dispatch_routes_torch_to_mps():
     """tk.<kernel>(torch.Tensor) routes to the MPS backend (no MLX needed)."""
     import tk

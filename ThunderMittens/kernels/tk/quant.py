@@ -399,6 +399,16 @@ def quantize_act_fp8(X):
 ACT_FORMATS = {"int8": quantize_act_int8, "fp8": quantize_act_fp8}
 
 
+# ---- W8A8 / SmoothQuant weight: int8 (N,K) + per-channel (per-row) symmetric scale (N,).
+# For the integer GEMV path (int8 weight x int8 activation -> int32). ----
+def quantize_w8a8(W):
+    W = np.ascontiguousarray(W, np.float32)
+    s = (np.abs(W).max(axis=1) / 127.0).astype(np.float32)            # per-channel (N,)
+    ssafe = np.where(s == 0, 1.0, s)
+    Wq = np.clip(np.rint(W / ssafe[:, None]), -127, 127).astype(np.int8)
+    return Wq, s
+
+
 # Format registry: name -> (quantize, dequantize). Drives the parametrized tests.
 QUANT_FORMATS = {
     "q8_0": (quantize_q8_0, dequantize_q8_0),

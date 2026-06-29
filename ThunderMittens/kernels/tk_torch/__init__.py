@@ -42,6 +42,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "qgemm", "qgemm.metal"),
     os.path.join(_KERNELS, "qgemv", "qgemv.metal"),
     os.path.join(_KERNELS, "qflux", "qflux.metal"),
+    os.path.join(_KERNELS, "qgemv_int", "qgemv_int.metal"),
 ]
 
 
@@ -198,3 +199,13 @@ def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
 def qflux_gelu(wq: torch.Tensor, x: torch.Tensor, bias: torch.Tensor, format: str = "q8_0"):
     """Quantized fused GEMM+GELU: gelu(dequantize(wq) @ x + bias). x (K,M) f16; bias (M,) f16. MPS."""
     return _ext.qflux_gelu(wq, x, bias, format)
+
+
+def qgemv_w8a8(wq, xq, w_scale, a_scale):
+    """W8A8 decode GEMV: int8 weight (N,K) x int8 act (K,1) -> int32 * w_scale[n] * a_scale. MPS."""
+    return _ext.qgemv_w8a8(wq, xq, w_scale, a_scale)
+
+
+def qgemv_w2a8(wq, xq, a_scale):
+    """BitNet W2A8 decode GEMV: ternary 2-bit weight x int8 act -> int32, per-group scale. MPS."""
+    return _ext.qgemv_w2a8(wq, xq, a_scale)

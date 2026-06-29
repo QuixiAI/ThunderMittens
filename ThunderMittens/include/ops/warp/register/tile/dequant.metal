@@ -18,6 +18,19 @@
 
 namespace mittens {
 
+// ---- integer dot primitive (the "idot/imma" unlock) ------------------------------------------
+// Apple's simdgroup_matrix has no integer path, so activation-quantized kernels accumulate in
+// int32 on the ALUs. idot4 is the dp4a equivalent (4 packed signed int8 per uint -> int32),
+// modeled on BitNet's __dp4a; a per-lane int8 GEMV then simd_sum-reduces (see qgemv_w8a8/_w2a8).
+METAL_FUNC int idot4(uint a, uint b) {
+    int s = 0;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 4; i++) {
+        s += (int)(char)((a >> (8 * i)) & 0xffu) * (int)(char)((b >> (8 * i)) & 0xffu);
+    }
+    return s;
+}
+
 // ---- q8_0 : { half d; int8 qs[32]; }  — 34 bytes, 32 weights/block, value = d * q ----
 struct q8_0 {
     constant static constexpr const int block_k     = 32;
@@ -27,6 +40,9 @@ struct q8_0 {
         const char q = ((device const char*)(base + 2))[col];  // signed int8 codes at offset 2
         return d * half(q);
     }
+    // integer path: the raw int8 code and the per-group (block) scale, kept separate.
+    static METAL_FUNC int  code(device const uchar* base, int col) { return (int)((device const char*)(base + 2))[col]; }
+    static METAL_FUNC half gscale(device const uchar* base)        { return ((device const half*)base)[0]; }
 };
 
 // ---- q4_0 : { half d; uint8 qs[16]; } — 18 bytes, 32 weights/block. Nibble packing (ggml):
@@ -186,6 +202,12 @@ struct bitnet {
         const uint code = (qs[col >> 2] >> ((col & 3) * 2)) & 0x3;
         return scale * half((int)code - 1);                // 0->-1, 1->0, 2->+1
     }
+    // integer path (W2A8): the ternary code in {-1,0,+1} and the per-group absmean scale.
+    static METAL_FUNC int code(device const uchar* base, int col) {
+        device const uchar* qs = base + 2;
+        return (int)((qs[col >> 2] >> ((col & 3) * 2)) & 0x3) - 1;
+    }
+    static METAL_FUNC half gscale(device const uchar* base) { return ((device const half*)base)[0]; }
 };
 
 // Cooperatively dequantize an (BN x BK) weight tile into a shared half tile. `kb` is the K-tile

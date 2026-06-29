@@ -76,6 +76,7 @@
 #include "qgemm/qgemm.h"
 #include "qgemv/qgemv.h"
 #include "qflux/qflux.h"
+#include "qgemv_int/qgemv_int.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -358,5 +359,25 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         quantized fused GEMM+GELU: gelu(dequantize(wq) @ x + bias)
+      )");
+
+    m.def(
+      "qgemv_w8a8",
+      &qgemv_w8a8,
+      "wq"_a, "xq"_a, "w_scale"_a, "a_scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        W8A8 decode GEMV: int8 weight x int8 activation -> int32, then *w_scale[n]*a_scale
+      )");
+
+    m.def(
+      "qgemv_w2a8",
+      &qgemv_w2a8,
+      "wq"_a, "xq"_a, "a_scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        BitNet W2A8 decode GEMV: ternary 2-bit weight x int8 activation -> int32, per-group scale
       )");
 }

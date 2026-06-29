@@ -25,6 +25,23 @@
 > reproducing **fp8 W8A8, int8 W8A8, int8 W4A8** fake-quant numerics. Apple has no int8/fp8 matmul,
 > so this is parity, not speed. W4A16 / W8A16 are just `act=None`.
 
+> **Integer dot path (idot/imma) — true int8 accumulate [Phase 1].** `idot4` (dp4a equivalent: 4
+> packed int8 → int32, modeled on BitNet's `__dp4a`/`decode_i2s_to_i8s`) powers a per-lane int8 GEMV
+> + `simd_sum`. Two decode kernels in `kernels/qgemv_int/`: **`qgemv_w8a8`** (SmoothQuant — int8
+> weight per-channel scale × int8 act per-token scale; int32 accumulate, scale once at the end) and
+> **`qgemv_w2a8`** (BitNet ternary 2-bit × int8 act; per-group int32 sums × absmean scale). `q8_0`
+> and `bitnet` gained `code()`/`gscale()` int accessors; host `quantize_w8a8` + `quantize_act_int8`.
+> **Decision — integer PREFILL stays on the dequant-to-half MMA**: Apple has no int8 matrix unit, so
+> a hand-rolled tiled int dot would lose to the half tensor cores, and W8A8 prefill parity already
+> exists via `qmm(act="int8")`. The int primitive is the decode (batch-1, memory-bound) regime only.
+> **Numerics differ by design:** decode = exact int32 accumulate scaled once; prefill = fp16
+> dequant-both-to-half (fp16 accumulation error). Validated against the INTEGER oracle
+> `(W_int8 @ x_int8)·w_scale·a_scale`, NOT each other — the decode-vs-prefill gap at M=1 is correct,
+> not a bug. **Benchmark (the primitive's justification):** int8-path vs dequant-to-half decode at
+> the same (N,K) — int8 is FASTER on the realistic large shapes (+7–20%, incl. K=11008 FFN and
+> 32000-vocab projections) and more accurate everywhere; ~10% slower only on the smallest square
+> (4096²). Verified, not assumed.
+
 ## The correction
 
 I previously parked the quantized-GEMM family (`gemm/{fp8_*, int8_*, mxfp8_*, nvfp4_*}`) as

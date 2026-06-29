@@ -173,6 +173,21 @@ struct mxfp4 {
     }
 };
 
+// ---- bitnet : BitNet b1.58 ternary weights {-1,0,+1}, group 32, per-group absmean scale.
+//   2-bit codes packed 4/byte (code in {0,1,2} -> value scale*(code-1)). { half scale; uint8 qs[8]; }
+//   = 10 bytes. (BitNet's GPU kernel uses int8×int2 dp4a; Apple has no int matmul, so we dequant
+//   ternary -> half and use the standard simdgroup MMA, like every other format here.) ----
+struct bitnet {
+    constant static constexpr const int block_k     = 32;
+    constant static constexpr const int block_bytes = 10;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half scale = ((device const half*)base)[0];
+        device const uchar* qs = base + 2;                 // 8 bytes, 4 ternary codes each
+        const uint code = (qs[col >> 2] >> ((col & 3) * 2)) & 0x3;
+        return scale * half((int)code - 1);                // 0->-1, 1->0, 2->+1
+    }
+};
+
 // Cooperatively dequantize an (BN x BK) weight tile into a shared half tile. `kb` is the K-tile
 // index in units of BK (the MMA K-step). The quant grouping (FMT::block_k) is DECOUPLED from BK:
 // each tile column maps to its quant block via the global K index, so large blocks (e.g. q4_K's

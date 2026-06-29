@@ -6,7 +6,8 @@
 > dual-backend, validated vs `dequantize(Wq)@x`, rel ~1e-3):
 > integer — **q8_0, q4_0, q4_K (256-superblock hierarchical scales), kU4B8 (GPTQ int4 g128), kU4
 > (AWQ int4 g128 + zero-point)**; float — **fp8_e4m3, fp4_e2m1, mxfp8 (e8m0 block scale), nvfp4
-> (e4m3 block scale), mxfp4 (e8m0 block scale + e2m1)**. Float decode is field-extract→widen-to-half; host uses nearest-code-in-codebook
+> (e4m3 block scale), mxfp4 (e8m0 block scale + e2m1)**; ternary — **bitnet (BitNet b1.58 {−1,0,+1},
+> group-32 absmean scale, 2-bit codes)**. Float decode is field-extract→widen-to-half; host uses nearest-code-in-codebook
 > so host decode == kernel decode exactly. Host quant + registry in `kernels/tk/quant.py`.
 > Phase 6 (retrofit) demonstrated: `kernels/qflux/` — `qflux_gelu` = gelu(dequantize(Wq)@X + bias),
 > the dequant path + flux's bias+GELU epilogue, all 10 formats, dual-backend (proves the dequant

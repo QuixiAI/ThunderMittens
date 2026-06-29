@@ -70,5 +70,6 @@ instantiate_qgemm("qgemm_fp4_e2m1", fp4_e2m1, 2, 16);
 instantiate_qgemm("qgemm_mxfp8", mxfp8, 2, 16);
 instantiate_qgemm("qgemm_nvfp4", nvfp4, 2, 16);
 instantiate_qgemm("qgemm_mxfp4", mxfp4, 2, 16);
+instantiate_qgemm("qgemm_bitnet", bitnet, 2, 16);
 
 }

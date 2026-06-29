@@ -350,6 +350,30 @@ def dequantize_mxfp4(packed):
     return (scale * _e2m1_decode_arr(nib)).reshape(N, nb * 32)
 
 
+# ---- bitnet : BitNet b1.58 ternary {-1,0,+1}, group 32, per-group absmean scale.
+# 2-bit codes (code in {0,1,2} -> value = scale*(code-1)), 4/byte. { half scale; uint8 qs[8]; } = 10 bytes. ----
+def quantize_bitnet(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
+    Wb = W.reshape(N, nb, 32)
+    scale = np.abs(Wb).mean(axis=2).astype(np.float32)                      # absmean (BitNet b1.58)
+    ssafe = np.where(scale == 0, 1.0, scale)
+    wq = np.clip(np.rint(Wb / ssafe[..., None]), -1, 1).astype(np.int32)    # ternary
+    code = (wq + 1).astype(np.uint32).reshape(N, nb, 8, 4)                  # 0,1,2
+    out = np.zeros((N, nb, 10), np.uint8)
+    out[:, :, 0:2] = scale.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 2:10] = (code[..., 0] | (code[..., 1] << 2) | (code[..., 2] << 4) | (code[..., 3] << 6)).astype(np.uint8)
+    return out
+
+
+def dequantize_bitnet(packed):
+    packed = np.ascontiguousarray(packed, np.uint8)
+    N, nb, _ = packed.shape
+    scale = np.ascontiguousarray(packed[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    qs = packed[:, :, 2:10].astype(np.int32)                               # (N, nb, 8)
+    codes = np.stack([(qs >> (j * 2)) & 0x3 for j in range(4)], axis=-1).reshape(N, nb, 32)
+    return (scale * (codes.astype(np.float32) - 1.0)).reshape(N, nb * 32)
+
+
 # Format registry: name -> (quantize, dequantize). Drives the parametrized tests.
 QUANT_FORMATS = {
     "q8_0": (quantize_q8_0, dequantize_q8_0),
@@ -362,4 +386,5 @@ QUANT_FORMATS = {
     "mxfp8": (quantize_mxfp8, dequantize_mxfp8),
     "nvfp4": (quantize_nvfp4, dequantize_nvfp4),
     "mxfp4": (quantize_mxfp4, dequantize_mxfp4),
+    "bitnet": (quantize_bitnet, dequantize_bitnet),
 }

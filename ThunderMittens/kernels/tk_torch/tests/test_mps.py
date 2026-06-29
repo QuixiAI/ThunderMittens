@@ -69,6 +69,28 @@ def test_attn_fwd(shape):
     assert _maxdiff(got, exp) < 0.06
 
 
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "fp8_e4m3"])
+@pytest.mark.parametrize("D", [64, 128])
+def test_attn_q(D, fmt):
+    """Quantized-KV attention (MPS) vs reference attention on the dequantized K/V."""
+    import numpy as np
+    from tk.quant import quantize_kv, dequantize_kv
+    B, H, N = 1, 2, 64
+    rng = np.random.default_rng(0)
+    q = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    k = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    v = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    Kq, Vq = quantize_kv(k, fmt), quantize_kv(v, fmt)
+    dk, dv = dequantize_kv(Kq, fmt), dequantize_kv(Vq, fmt)
+    got = tk_torch.attn_q(torch.from_numpy(q).to(torch.bfloat16).to("mps"),
+                          torch.from_numpy(Kq).to("mps"), torch.from_numpy(Vq).to("mps"), fmt)
+    torch.mps.synchronize()
+    g = got.float().cpu().numpy()
+    s = (q @ np.swapaxes(dk, -1, -2)) / np.sqrt(D); s -= s.max(-1, keepdims=True)
+    p = np.exp(s); p /= p.sum(-1, keepdims=True); ref = p @ dv
+    assert np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9) < 0.1
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (4, 64, 512), (1, 256, 768), (8, 256)])
 def test_rms_norm(shape):
     D = shape[-1]

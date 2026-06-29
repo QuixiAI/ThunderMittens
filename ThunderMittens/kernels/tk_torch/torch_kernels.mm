@@ -457,6 +457,22 @@ static at::Tensor qflux_gelu_mps(const at::Tensor& wq_in, const at::Tensor& x_in
   return out;
 }
 
+static at::Tensor attn_q_mps(const at::Tensor& q_in, const at::Tensor& kq_in,
+                             const at::Tensor& vq_in, const std::string& format) {
+  TORCH_CHECK(q_in.device().is_mps(), "attn_q: q must be an MPS tensor");
+  TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "attn_q: q must be bfloat16");
+  TORCH_CHECK(kq_in.scalar_type() == at::kByte && vq_in.scalar_type() == at::kByte,
+              "attn_q: kq, vq must be uint8 packed blocks");
+  auto q = q_in.contiguous(), kq = kq_in.contiguous(), vq = vq_in.contiguous();
+  TORCH_CHECK(q.dim() == 4 && kq.dim() == 5, "attn_q: q (B,H,N,D), kq (B,H,N,D/bk,bytes)");
+  const int B = q.size(0), H = q.size(1), D = q.size(3);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  TORCH_CHECK((D == 64 || D == 128) && N % 8 == 0, "attn_q: D in {64,128}, N%8==0");
+  auto out = at::empty_like(q);
+  tk_encode([&](TorchEncoder& e) { tk::launch_attn_q(e, q, kq, vq, out, N, H, B, D, format); });
+  return out;
+}
+
 static at::Tensor qgemv_w8a8_mps(const at::Tensor& wq_in, const at::Tensor& xq_in,
                                  const at::Tensor& ws_in, const at::Tensor& as_in) {
   TORCH_CHECK(wq_in.device().is_mps(), "qgemv_w8a8: wq must be an MPS tensor");
@@ -510,6 +526,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("qgemm", &qgemm_mps, "ThunderMittens quantized GEMM (MPS)");
   m.def("qgemv", &qgemv_mps, "ThunderMittens quantized GEMV decode (MPS)");
   m.def("qflux_gelu", &qflux_gelu_mps, "ThunderMittens quantized fused GEMM+GELU (MPS)");
+  m.def("attn_q", &attn_q_mps, "ThunderMittens quantized-KV flash attention (MPS)");
   m.def("qgemv_w8a8", &qgemv_w8a8_mps, "ThunderMittens W8A8 int8xint8 decode GEMV (MPS)");
   m.def("qgemv_w2a8", &qgemv_w2a8_mps, "ThunderMittens BitNet W2A8 int decode GEMV (MPS)");
 }

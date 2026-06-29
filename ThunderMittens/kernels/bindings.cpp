@@ -77,6 +77,7 @@
 #include "qgemv/qgemv.h"
 #include "qflux/qflux.h"
 #include "qgemv_int/qgemv_int.h"
+#include "attn_q/attn_q.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -369,6 +370,17 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         W8A8 decode GEMV: int8 weight x int8 activation -> int32, then *w_scale[n]*a_scale
+      )");
+
+    m.def(
+      "attn_q",
+      &attn_q,
+      "q"_a, "kq"_a, "vq"_a,
+      "format"_a = "q8_0",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        quantized-KV flash attention: softmax(QK^T)V with K,V dequantized from blocks
       )");
 
     m.def(

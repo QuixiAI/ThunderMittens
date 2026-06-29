@@ -575,8 +575,9 @@ METAL_FUNC void dequant_into_register(thread RT& dst, device const uchar* Wq, in
             const int blk1 = (gc + 1) / FMT::block_k, cib1 = (gc + 1) % FMT::block_k;
             device const uchar* b0 = Wq + (uint)(grow * bpr + blk0) * FMT::block_bytes;
             device const uchar* b1 = Wq + (uint)(grow * bpr + blk1) * FMT::block_bytes;
-            dst.tiles[i][j].data.thread_elements()[0] = FMT::dequant(b0, cib0);
-            dst.tiles[i][j].data.thread_elements()[1] = FMT::dequant(b1, cib1);
+            // cast half->RT::dtype (RT may be bf16, e.g. quantized-KV attention's V tile)
+            dst.tiles[i][j].data.thread_elements()[0] = (typename RT::dtype)(float)FMT::dequant(b0, cib0);
+            dst.tiles[i][j].data.thread_elements()[1] = (typename RT::dtype)(float)FMT::dequant(b1, cib1);
         }
     }
 }

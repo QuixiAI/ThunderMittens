@@ -1309,3 +1309,20 @@ QUANT_FORMATS = {
     "iq3_xxs": (quantize_iq3_xxs, dequantize_iq3_xxs),
     "iq1_s": (quantize_iq1_s, dequantize_iq1_s),
 }
+
+
+# ---- KV-cache quantization helpers (Phase B): quantize K/V (B,H,N,D) along D per (b,h,key) row,
+# reusing any block format. Packed (B,H,N, D/block_k, block_bytes) uint8 for the attn_q kernel. ----
+def quantize_kv(K, format="q8_0"):
+    K = np.ascontiguousarray(K, np.float32)
+    B, H, N, D = K.shape
+    quantize, _ = QUANT_FORMATS[format]
+    packed = quantize(K.reshape(B * H * N, D))                 # (B*H*N, D/block_k, block_bytes)
+    return packed.reshape(B, H, N, packed.shape[1], packed.shape[2])
+
+
+def dequantize_kv(packed, format="q8_0"):
+    B, H, N, nbk, nby = packed.shape
+    _, dequantize = QUANT_FORMATS[format]
+    dW = dequantize(np.ascontiguousarray(packed).reshape(B * H * N, nbk, nby))
+    return dW.reshape(B, H, N, -1)

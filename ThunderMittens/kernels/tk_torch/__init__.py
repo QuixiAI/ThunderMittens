@@ -43,6 +43,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "qgemv", "qgemv.metal"),
     os.path.join(_KERNELS, "qflux", "qflux.metal"),
     os.path.join(_KERNELS, "qgemv_int", "qgemv_int.metal"),
+    os.path.join(_KERNELS, "attn_q", "attn_q.metal"),
 ]
 
 
@@ -199,6 +200,11 @@ def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
 def qflux_gelu(wq: torch.Tensor, x: torch.Tensor, bias: torch.Tensor, format: str = "q8_0"):
     """Quantized fused GEMM+GELU: gelu(dequantize(wq) @ x + bias). x (K,M) f16; bias (M,) f16. MPS."""
     return _ext.qflux_gelu(wq, x, bias, format)
+
+
+def attn_q(q, kq, vq, format="q8_0"):
+    """Quantized-KV flash attention: softmax(QK^T)V, K/V from blocks. q bf16 (B,H,N,D); kq/vq uint8. MPS."""
+    return _ext.attn_q(q, kq, vq, format)
 
 
 def qgemv_w8a8(wq, xq, w_scale, a_scale):

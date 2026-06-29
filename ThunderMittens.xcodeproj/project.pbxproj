@@ -126,6 +126,7 @@
 				kernels/qgemv/qgemv.cpp,
 				kernels/qflux/qflux.cpp,
 				kernels/qgemv_int/qgemv_int.cpp,
+				kernels/attn_q/attn_q.cpp,
 				kernels/flux/flux.cpp,
 				kernels/gelu/gelu.cpp,
 				kernels/gemm_staged/gemm_staged.cpp,

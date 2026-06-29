@@ -93,6 +93,20 @@ def test_attn_fwd_parity(shape):
     _assert_parity(om, ot, atol=1e-2)
 
 
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "fp8_e4m3"])
+def test_attn_q_parity(fmt):
+    from tk.quant import quantize_kv
+    B, H, N, D = 1, 2, 64, 64
+    rng = np.random.default_rng(0)
+    q = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    Kq = quantize_kv((rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32), fmt)
+    Vq = quantize_kv((rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32), fmt)
+    om = tk.attn_q(mx.array(q).astype(mx.bfloat16), mx.array(Kq), mx.array(Vq), format=fmt)
+    ot = tk.attn_q(torch.from_numpy(q).to(torch.bfloat16).to("mps"),
+                   torch.from_numpy(Kq).to("mps"), torch.from_numpy(Vq).to("mps"), format=fmt)
+    _assert_parity(om, ot, atol=2e-2)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_rms_norm_parity(shape):
     D = shape[-1]

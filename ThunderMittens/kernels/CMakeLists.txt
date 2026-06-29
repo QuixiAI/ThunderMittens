@@ -52,6 +52,7 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/qgemv/qgemv.cpp
     ${CMAKE_CURRENT_LIST_DIR}/qflux/qflux.cpp
     ${CMAKE_CURRENT_LIST_DIR}/qgemv_int/qgemv_int.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/attn_q/attn_q.cpp
 )
 
 # Add include headers
@@ -95,6 +96,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/qgemv/qgemv.metal
         ${CMAKE_CURRENT_LIST_DIR}/qflux/qflux.metal
         ${CMAKE_CURRENT_LIST_DIR}/qgemv_int/qgemv_int.metal
+        ${CMAKE_CURRENT_LIST_DIR}/attn_q/attn_q.metal
         INCLUDE_DIRS
         ${PROJECT_SOURCE_DIR}
         ${MLX_INCLUDE_DIRS}

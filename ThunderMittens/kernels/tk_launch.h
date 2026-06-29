@@ -37,6 +37,7 @@ inline std::string flux_gelu_kernel_name(const std::string& t) { return "flux_ge
 inline std::string flux_gate_kernel_name(const std::string& t) { return "flux_gate_" + t; }
 inline std::string gemm_staged_kernel_name(const std::string& t) { return "gemm_staged_" + t; }
 inline std::string attn_multiwarp_kernel_name(int D) { return "attn_multiwarp_" + std::to_string(D); }
+inline std::string attn_q_kernel_name(const std::string& fmt, int D) { return "attn_q_" + fmt + "_" + std::to_string(D); }
 inline std::string linear_attn_kernel_name(int D) { return "linear_attn_" + std::to_string(D); }
 inline std::string hedgehog_kernel_name(int D) { return "hedgehog_" + std::to_string(D); }
 inline std::string lin_attn_causal_kernel_name(int D) { return "lin_attn_causal_" + std::to_string(D); }
@@ -85,6 +86,17 @@ void launch_attn_fwd(E& e, typename E::in_t q, typename E::in_t k, typename E::i
                      typename E::out_t o, unsigned N, unsigned H, int B, int D) {
   e.pipeline(attn_fwd_kernel_name(D));
   e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
+  e.bytes(N, 4); e.bytes(H, 5);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
+// ----- attn_q (quantized-KV attention): q@0(bf16) Kq@1(uchar) Vq@2(uchar) o@3(bf16) ; N@4 H@5 ;
+//        grid (N/8, H, B), 32 threads. Same online-softmax flow as attn_fwd, K/V dequantized. -----
+template <class E>
+void launch_attn_q(E& e, typename E::in_t q, typename E::in_t kq, typename E::in_t vq,
+                   typename E::out_t o, unsigned N, unsigned H, int B, int D, const std::string& fmt) {
+  e.pipeline(attn_q_kernel_name(fmt, D));
+  e.in(q, 0); e.in(kq, 1); e.in(vq, 2); e.out(o, 3);
   e.bytes(N, 4); e.bytes(H, 5);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }

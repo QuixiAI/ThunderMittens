@@ -35,12 +35,18 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/matmul_custom/matmul_custom.cpp
     ${CMAKE_CURRENT_LIST_DIR}/layernorm/layernorm.cpp
     ${CMAKE_CURRENT_LIST_DIR}/rms_norm/rms_norm.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/add_norm/add_norm.cpp
     ${CMAKE_CURRENT_LIST_DIR}/softmax/softmax.cpp
     ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/rope_kv/rope_kv.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/glu/glu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/hadamard/hadamard.cpp
     ${CMAKE_CURRENT_LIST_DIR}/kv_cache/kv_cache.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/paged_attn_v2/paged_attn_v2.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/quant_rt/quant_rt.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/sampling/sampling.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/moe.cpp
     ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.cpp
     ${CMAKE_CURRENT_LIST_DIR}/flux/flux.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.cpp
@@ -86,12 +92,18 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/matmul_custom/matmul_custom.metal
         ${CMAKE_CURRENT_LIST_DIR}/layernorm/layernorm.metal
         ${CMAKE_CURRENT_LIST_DIR}/rms_norm/rms_norm.metal
+        ${CMAKE_CURRENT_LIST_DIR}/add_norm/add_norm.metal
         ${CMAKE_CURRENT_LIST_DIR}/softmax/softmax.metal
         ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.metal
+        ${CMAKE_CURRENT_LIST_DIR}/rope_kv/rope_kv.metal
         ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.metal
         ${CMAKE_CURRENT_LIST_DIR}/glu/glu.metal
         ${CMAKE_CURRENT_LIST_DIR}/hadamard/hadamard.metal
         ${CMAKE_CURRENT_LIST_DIR}/kv_cache/kv_cache.metal
+        ${CMAKE_CURRENT_LIST_DIR}/paged_attn_v2/paged_attn_v2.metal
+        ${CMAKE_CURRENT_LIST_DIR}/quant_rt/quant_rt.metal
+        ${CMAKE_CURRENT_LIST_DIR}/sampling/sampling.metal
+        ${CMAKE_CURRENT_LIST_DIR}/moe/moe.metal
         ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.metal
         ${CMAKE_CURRENT_LIST_DIR}/flux/flux.metal
         ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.metal

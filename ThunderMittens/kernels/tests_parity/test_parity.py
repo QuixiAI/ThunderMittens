@@ -118,6 +118,180 @@ def test_rms_norm_parity(shape):
     _assert_parity(om, ot, atol=1e-2)
 
 
+@pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
+def test_rms_norm_add_parity(shape):
+    D = shape[-1]
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(shape).astype(np.float32)
+    r = rng.standard_normal(shape).astype(np.float32)
+    w = rng.standard_normal((D,)).astype(np.float32)
+    om, am = tk.rms_norm_add(_mk(x, "mlx"), _mk(r, "mlx"), _mk(w, "mlx"))
+    ot, at = tk.rms_norm_add(_mk(x, "torch"), _mk(r, "torch"), _mk(w, "torch"))
+    _assert_parity(om, ot, atol=1e-2)
+    _assert_parity(am, at, atol=1e-2)
+
+
+@pytest.mark.parametrize("E,K", [(8, 2), (64, 4)])
+def test_moe_route_topk_parity(E, K):
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((100, E)).astype(np.float32)
+    im, wm = tk.moe_route_topk(_mk(x, "mlx", "f32"), K)
+    it, wt = tk.moe_route_topk(_mk(x, "torch", "f32"), K)
+    _assert_parity(im, it, atol=0)        # exact ids (f32, no ties)
+    _assert_parity(wm, wt, atol=1e-4)
+
+
+@pytest.mark.parametrize("E,K", [(8, 2), (16, 4)])
+def test_moe_permute_offsets_parity(E, K):
+    # sorted_row_idx/inv_idx order is atomic-nondeterministic; offsets are deterministic.
+    rng = np.random.default_rng(0)
+    ids = rng.integers(0, E, size=(50, K)).astype(np.int32)
+    om = tk.moe_permute(mx.array(ids), E)[1]
+    ot = tk.moe_permute(torch.from_numpy(ids).to("mps"), E)[1]
+    _assert_parity(om, ot, atol=0)
+
+
+@pytest.mark.parametrize("K,H", [(2, 64), (4, 128)])
+def test_moe_finalize_parity(K, H):
+    rng = np.random.default_rng(1)
+    T = 20
+    inv = rng.permutation(T * K).astype(np.int32)
+    eo = rng.standard_normal((T * K, H)).astype(np.float32)
+    w = rng.random((T, K)).astype(np.float32)
+    ym = tk.moe_finalize(_mk(eo, "mlx", "f32"), mx.array(inv), _mk(w, "mlx", "f32"), K)
+    yt = tk.moe_finalize(_mk(eo, "torch", "f32"), torch.from_numpy(inv).to("mps"),
+                         _mk(w, "torch", "f32"), K)
+    _assert_parity(ym, yt, atol=1e-4)
+
+
+@pytest.mark.parametrize("shape", [(4, 1000), (2, 3, 257)])
+def test_argmax_sample_parity(shape):
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(shape).astype(np.float32)
+    om = tk.argmax_sample(_mk(x, "mlx", "f32"))
+    ot = tk.argmax_sample(_mk(x, "torch", "f32"))
+    _assert_parity(om, ot, atol=0)
+
+
+@pytest.mark.parametrize("shape,K", [((16, 256), 5), ((4, 1000), 20)])
+def test_top_k_sample_parity(shape, K):
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(shape).astype(np.float32)
+    om = tk.top_k_sample(_mk(x, "mlx", "f32"), K, temperature=0.9, seed=99)
+    ot = tk.top_k_sample(_mk(x, "torch", "f32"), K, temperature=0.9, seed=99)
+    _assert_parity(om, ot, atol=0)
+
+
+@pytest.mark.parametrize("shape,p", [((16, 256), 0.9), ((4, 1000), 0.7)])
+def test_top_p_sample_parity(shape, p):
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(shape).astype(np.float32)
+    om = tk.top_p_sample(_mk(x, "mlx", "f32"), p, temperature=0.9, seed=99)
+    ot = tk.top_p_sample(_mk(x, "torch", "f32"), p, temperature=0.9, seed=99)
+    _assert_parity(om, ot, atol=0)
+
+
+def test_apply_penalty_parity():
+    rng = np.random.default_rng(0)
+    T, V, L = 8, 300, 30
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    prev = rng.integers(-1, V, size=(T, L)).astype(np.int32)
+    kw = dict(temperature=0.8, repetition_penalty=1.3, presence_penalty=0.1, frequency_penalty=0.05)
+    om = tk.apply_penalty(_mk(logits, "mlx", "f32"), mx.array(prev), **kw)
+    ot = tk.apply_penalty(_mk(logits, "torch", "f32"), torch.from_numpy(prev).to("mps"), **kw)
+    _assert_parity(om, ot, atol=1e-5)
+
+
+@pytest.mark.parametrize("shape,temp", [((16, 256), 1.0), ((4, 1000), 0.7)])
+def test_sample_categorical_parity(shape, temp):
+    # Same metallib kernel + same seed -> identical RNG stream -> identical tokens.
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(shape).astype(np.float32)
+    om = tk.sample_categorical(_mk(x, "mlx", "f32"), temperature=temp, seed=99)
+    ot = tk.sample_categorical(_mk(x, "torch", "f32"), temperature=temp, seed=99)
+    _assert_parity(om, ot, atol=0)
+
+
+@pytest.mark.parametrize("shape", [(8, 256), (3, 513)])
+def test_quantize_per_token_fp8_parity(shape):
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(shape) * 2.0).astype(np.float32)
+    cm, sm = tk.quantize_per_token_fp8(_mk(x, "mlx", "f32"))
+    ct, st = tk.quantize_per_token_fp8(_mk(x, "torch", "f32"))
+    _assert_parity(cm, ct, atol=0)       # same metallib -> bit-identical codes
+    _assert_parity(sm, st, atol=1e-6)
+
+
+@pytest.mark.parametrize("shape", [(8, 256), (3, 513)])
+def test_quantize_per_token_int8_parity(shape):
+    rng = np.random.default_rng(1)
+    x = (rng.standard_normal(shape) * 2.0).astype(np.float32)
+    cm, sm = tk.quantize_per_token_int8(_mk(x, "mlx", "f32"))
+    ct, st = tk.quantize_per_token_int8(_mk(x, "torch", "f32"))
+    _assert_parity(cm, ct, atol=0)
+    _assert_parity(sm, st, atol=1e-6)
+
+
+@pytest.mark.parametrize("H,H_KV,ps", [(2, 2, 4), (4, 1, 8)])
+def test_paged_attention_v2_parity(H, H_KV, ps):
+    rng = np.random.default_rng(3)
+    B, D, num_blocks, block_size = 2, 64, 8, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    om = tk.paged_attention_v2(
+        _mk(q, "mlx"), _mk(kc, "mlx"), _mk(vc, "mlx"),
+        mx.array(bt), mx.array(cl), partition_size=ps)
+    ot = tk.paged_attention_v2(
+        _mk(q, "torch"), _mk(kc, "torch"), _mk(vc, "torch"),
+        torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"), partition_size=ps)
+    _assert_parity(om, ot, atol=2e-2)
+
+
+@pytest.mark.parametrize("D,H_KV", [(64, 2), (128, 1)])
+def test_rope_kv_insert_parity(D, H_KV):
+    rng = np.random.default_rng(5)
+    num_blocks, block_size, num_tokens = 4, 4, 5
+    P = num_blocks * block_size
+    half = D // 2
+    inv = 1.0 / (10000.0 ** (np.arange(half) / half))
+    ang = np.arange(P)[:, None] * inv[None, :]
+    cos = np.cos(ang).astype(np.float32)
+    sin = np.sin(ang).astype(np.float32)
+    k = (0.3 * rng.normal(size=(num_tokens, H_KV, D))).astype(np.float32)
+    v = (0.3 * rng.normal(size=(num_tokens, H_KV, D))).astype(np.float32)
+    positions = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+    slot_mapping = np.array([0, 5, -1, 6, 11], dtype=np.int64)
+    kc0 = (0.1 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    vc0 = (0.1 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+
+    km, vm = tk.rope_kv_insert(
+        _mk(k, "mlx"), _mk(v, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"),
+        mx.array(positions), mx.array(slot_mapping), _mk(kc0, "mlx"), _mk(vc0, "mlx"))
+    kt, vt = tk.rope_kv_insert(
+        _mk(k, "torch"), _mk(v, "torch"), _mk(cos, "torch"), _mk(sin, "torch"),
+        torch.from_numpy(positions).to("mps"), torch.from_numpy(slot_mapping).to("mps"),
+        _mk(kc0, "torch"), _mk(vc0, "torch"))
+    _assert_parity(km, kt, atol=2e-2)
+    _assert_parity(vm, vt, atol=2e-2)
+
+
+@pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
+def test_layernorm_add_parity(shape):
+    D = shape[-1]
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(shape).astype(np.float32)
+    r = rng.standard_normal(shape).astype(np.float32)
+    w = rng.standard_normal((D,)).astype(np.float32)
+    b = rng.standard_normal((D,)).astype(np.float32)
+    om, am = tk.layernorm_add(_mk(x, "mlx"), _mk(r, "mlx"), _mk(w, "mlx"), _mk(b, "mlx"))
+    ot, at = tk.layernorm_add(_mk(x, "torch"), _mk(r, "torch"), _mk(w, "torch"), _mk(b, "torch"))
+    _assert_parity(om, ot, atol=1e-2)
+    _assert_parity(am, at, atol=1e-2)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (1, 256, 768)])
 def test_softmax_parity(shape):
     rng = np.random.default_rng(0)
@@ -518,3 +692,55 @@ def test_paged_attention_parity(dtype, atol):
         torch.from_numpy(context_lens).to("mps"),
     )
     _assert_parity(om, ot, atol=atol)
+
+
+@pytest.mark.parametrize("H,H_KV", [(2, 2), (4, 1)])
+def test_paged_attention_fp8_parity(H, H_KV):
+    rng = np.random.default_rng(3)
+    B, D, num_blocks, block_size = 2, 64, 8, 4
+    total = num_blocks * block_size
+    K = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    V = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    ks = float(np.abs(K).max() / 448.0)
+    vs = float(np.abs(V).max() / 448.0)
+    slot = np.arange(total, dtype=np.int64)
+
+    kcm, vcm = tk.kv_cache_scatter_fp8(_mk(K, "mlx"), _mk(V, "mlx"), mx.array(slot),
+                                       num_blocks, block_size, ks, vs)
+    om = tk.paged_attention_fp8(_mk(q, "mlx"), kcm, vcm, mx.array(bt), mx.array(cl), ks, vs)
+    kct, vct = tk.kv_cache_scatter_fp8(_mk(K, "torch"), _mk(V, "torch"),
+                                       torch.from_numpy(slot).to("mps"), num_blocks, block_size, ks, vs)
+    ot = tk.paged_attention_fp8(_mk(q, "torch"), kct, vct,
+                                torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"), ks, vs)
+    _assert_parity(om, ot, atol=2e-2)
+
+
+@pytest.mark.parametrize("H,H_KV", [(4, 2), (4, 1)])  # GQA group 2, MQA
+def test_paged_attention_gqa_parity(H, H_KV):
+    rng = np.random.default_rng(2)
+    B, D = 2, 64
+    num_blocks, block_size = 4, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    key_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    value_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    block_table = np.array([[0, 1], [2, 3]], dtype=np.int32)
+    context_lens = np.array([6, 7], dtype=np.int32)
+
+    om = tk.paged_attention(
+        _mk(q, "mlx", "bf16"),
+        _mk(key_cache, "mlx", "bf16"),
+        _mk(value_cache, "mlx", "bf16"),
+        mx.array(block_table),
+        mx.array(context_lens),
+    )
+    ot = tk.paged_attention(
+        _mk(q, "torch", "bf16"),
+        _mk(key_cache, "torch", "bf16"),
+        _mk(value_cache, "torch", "bf16"),
+        torch.from_numpy(block_table).to("mps"),
+        torch.from_numpy(context_lens).to("mps"),
+    )
+    _assert_parity(om, ot, atol=2e-2)

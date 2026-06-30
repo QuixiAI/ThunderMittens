@@ -166,8 +166,12 @@ array paged_attention(
       key_cache.shape() != value_cache.shape()) {
     throw std::invalid_argument("paged_attention: caches must have shape (num_blocks, block_size, num_heads, head_size)");
   }
-  if (key_cache.shape(2) != q.shape(1) || key_cache.shape(3) != q.shape(2)) {
-    throw std::invalid_argument("paged_attention: q heads/head_size must match cache heads/head_size");
+  if (key_cache.shape(3) != q.shape(2)) {
+    throw std::invalid_argument("paged_attention: q head_size must match cache head_size");
+  }
+  if (key_cache.shape(2) <= 0 || q.shape(1) % key_cache.shape(2) != 0) {
+    throw std::invalid_argument(
+        "paged_attention: num_q_heads must be a positive multiple of num_kv_heads (GQA/MQA)");
   }
   if (block_table.ndim() != 2 || block_table.shape(0) != q.shape(0)) {
     throw std::invalid_argument("paged_attention: block_table must have shape (batch, max_blocks)");
@@ -358,11 +362,144 @@ void PagedAttention::eval_gpu(
       out,
       q.shape(0),
       q.shape(1),
+      key_cache.shape(2),
       D,
       key_cache.shape(1),
       block_table.shape(1),
       scale,
       type_to_name(q));
+}
+
+// --------------------------- fp8 KV cache ---------------------------
+
+std::vector<array> kv_cache_scatter_fp8(
+    const array& key,
+    const array& value,
+    const array& slot_mapping,
+    int num_blocks,
+    int block_size,
+    float k_scale,
+    float v_scale,
+    StreamOrDevice s) {
+  if (key.ndim() != 3 || value.ndim() != 3 || key.shape() != value.shape()) {
+    throw std::invalid_argument("kv_cache_scatter_fp8: key/value must be (num_tokens, num_heads, head_size)");
+  }
+  if (slot_mapping.ndim() != 1 || slot_mapping.shape(0) != key.shape(0)) {
+    throw std::invalid_argument("kv_cache_scatter_fp8: slot_mapping must be (num_tokens,)");
+  }
+  if (num_blocks <= 0 || block_size <= 0) {
+    throw std::invalid_argument("kv_cache_scatter_fp8: num_blocks and block_size must be positive");
+  }
+  const auto dtype = promoted_float_dtype(key, value, "kv_cache_scatter_fp8");
+  auto key_c = contiguous_cast(key, dtype, s);
+  auto value_c = contiguous_cast(value, dtype, s);
+  auto slot_c = contiguous(astype(slot_mapping, int64, s), false, s);
+  const int H = key.shape(1);
+  const int D = key.shape(2);
+  std::vector<int> cache_shape = {num_blocks, block_size, H, D};
+  return array::make_arrays(
+      {cache_shape, cache_shape},
+      {uint8, uint8},
+      std::make_shared<KvCacheScatterFp8>(to_stream(s), block_size, k_scale, v_scale),
+      {key_c, value_c, slot_c});
+}
+
+array paged_attention_fp8(
+    const array& q,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    float k_scale,
+    float v_scale,
+    float scale,
+    StreamOrDevice s) {
+  if (q.ndim() != 3) {
+    throw std::invalid_argument("paged_attention_fp8: q must be (batch, num_heads, head_size)");
+  }
+  if (!is_supported_float(q.dtype())) {
+    throw std::invalid_argument("paged_attention_fp8: q must be float32, float16, or bfloat16");
+  }
+  if (key_cache.ndim() != 4 || value_cache.ndim() != 4 || key_cache.shape() != value_cache.shape()) {
+    throw std::invalid_argument("paged_attention_fp8: caches must be (num_blocks, block_size, num_kv_heads, head_size)");
+  }
+  if (key_cache.dtype() != uint8 || value_cache.dtype() != uint8) {
+    throw std::invalid_argument("paged_attention_fp8: caches must be uint8 (e4m3 codes)");
+  }
+  if (key_cache.shape(3) != q.shape(2)) {
+    throw std::invalid_argument("paged_attention_fp8: q head_size must match cache head_size");
+  }
+  if (key_cache.shape(2) <= 0 || q.shape(1) % key_cache.shape(2) != 0) {
+    throw std::invalid_argument("paged_attention_fp8: num_q_heads must be a positive multiple of num_kv_heads");
+  }
+  const int D = q.shape(2);
+  if (!(D == 64 || D == 128)) {
+    throw std::invalid_argument("paged_attention_fp8: head_size must be 64 or 128");
+  }
+  auto q_c = contiguous(q, false, s);
+  auto kc = contiguous(astype(key_cache, uint8, s), false, s);
+  auto vc = contiguous(astype(value_cache, uint8, s), false, s);
+  auto table_c = contiguous(astype(block_table, int32, s), false, s);
+  auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
+  return array(
+      q.shape(),
+      q.dtype(),
+      std::make_shared<PagedAttentionFp8>(to_stream(s), scale, k_scale, v_scale),
+      {q_c, kc, vc, table_c, lens_c});
+}
+
+void KvCacheScatterFp8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("KvCacheScatterFp8 has no CPU implementation.");
+}
+
+void KvCacheScatterFp8::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& key = inputs[0];
+  auto& value = inputs[1];
+  auto& slot = inputs[2];
+  auto& key_cache = outputs[0];
+  auto& value_cache = outputs[1];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  key_cache.set_data(allocator::malloc_or_wait(key_cache.nbytes()));
+  value_cache.set_data(allocator::malloc_or_wait(value_cache.nbytes()));
+
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  const uint64_t total = static_cast<uint64_t>(key_cache.size());
+  tk::launch_kv_cache_zero_u8(enc, key_cache, value_cache, total);
+  tk::launch_kv_cache_scatter_fp8(
+      enc, key, value, slot, key_cache, value_cache,
+      key.shape(0), key.shape(1), key.shape(2), block_size_, k_scale_, v_scale_,
+      type_to_name(key));
+}
+
+void PagedAttentionFp8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("PagedAttentionFp8 has no CPU implementation.");
+}
+
+void PagedAttentionFp8::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& q = inputs[0];
+  auto& key_cache = inputs[1];
+  auto& value_cache = inputs[2];
+  auto& block_table = inputs[3];
+  auto& context_lens = inputs[4];
+  auto& out = outputs[0];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+
+  const int D = q.shape(2);
+  const float scale = scale_ > 0.0f ? scale_ : 1.0f / std::sqrt(static_cast<float>(D));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_paged_attention_fp8(
+      enc, q, key_cache, value_cache, block_table, context_lens, out,
+      q.shape(0), q.shape(1), key_cache.shape(2), D, key_cache.shape(1),
+      block_table.shape(1), scale, k_scale_, v_scale_, type_to_name(q));
 }
 
 #define TK_KV_NO_AUTODIFF(CLASS, LABEL)                                      \
@@ -386,6 +523,8 @@ void PagedAttention::eval_gpu(
   }
 
 TK_KV_NO_AUTODIFF(KvCacheScatter, "KvCacheScatter")
+TK_KV_NO_AUTODIFF(KvCacheScatterFp8, "KvCacheScatterFp8")
+TK_KV_NO_AUTODIFF(PagedAttentionFp8, "PagedAttentionFp8")
 TK_KV_NO_AUTODIFF(KvCacheGather, "KvCacheGather")
 TK_KV_NO_AUTODIFF(KvCacheCopyBlocks, "KvCacheCopyBlocks")
 TK_KV_NO_AUTODIFF(KvCacheScales, "KvCacheScales")

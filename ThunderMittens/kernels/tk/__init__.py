@@ -79,6 +79,37 @@ def attn_fwd(q, k, v):
     return _mlx().attn_fwd(q, k, v)
 
 
+def rope_kv_insert(k, v, cos, sin, positions, slot_mapping, key_cache, value_cache):
+    """Fused RoPE (split-half) on K + paged-KV insert. Returns updated (key_cache, value_cache).
+
+    Accepts mlx.array or torch.Tensor (MPS). k/v (num_tokens, num_kv_heads, D);
+    caches (num_blocks, block_size, num_kv_heads, D); D in {64,128}.
+    """
+    if _is_torch(k):
+        return _torch().rope_kv_insert(k, v, cos, sin, positions, slot_mapping, key_cache, value_cache)
+    return _mlx().rope_kv_insert(k, v, cos, sin, positions, slot_mapping, key_cache, value_cache)
+
+
+def rms_norm_add(x, residual, weight, eps=1e-5):
+    """Fused residual-add + RMSNorm. Returns (out, x+residual).
+
+    out = rms_norm(x + residual) * weight. Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(x):
+        return _torch().rms_norm_add(x, residual, weight, eps)
+    return _mlx().rms_norm_add(x, residual, weight, eps=eps)
+
+
+def layernorm_add(x, residual, weight, bias, eps=1e-5):
+    """Fused residual-add + LayerNorm. Returns (out, x+residual).
+
+    out = layernorm(x + residual) * weight + bias. Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(x):
+        return _torch().layernorm_add(x, residual, weight, bias, eps)
+    return _mlx().layernorm_add(x, residual, weight, bias, eps=eps)
+
+
 def rms_norm(x, weight, eps=1e-5):
     """RMSNorm over the last axis. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(x):
@@ -178,6 +209,151 @@ def paged_attention(q, key_cache, value_cache, block_table, context_lens, scale=
     if _is_torch(q):
         return _torch().paged_attention(q, key_cache, value_cache, block_table, context_lens, scale)
     return _mlx().paged_attention(q, key_cache, value_cache, block_table, context_lens, scale)
+
+
+def kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size, k_scale, v_scale):
+    """Scatter K/V into a uint8 (e4m3) paged cache with per-tensor scales. Returns (kc, vc).
+
+    Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(key):
+        return _torch().kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size,
+                                             k_scale, v_scale)
+    return _mlx().kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size,
+                                       k_scale, v_scale)
+
+
+def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
+                        k_scale, v_scale, scale=0.0):
+    """Decode paged attention over fp8 (uint8 e4m3) caches, dequantized on read. GQA aware.
+
+    Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(q):
+        return _torch().paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
+                                            k_scale, v_scale, scale)
+    return _mlx().paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
+                                      k_scale, v_scale, scale)
+
+
+def paged_attention_v2(q, key_cache, value_cache, block_table, context_lens,
+                       scale=0.0, partition_size=512):
+    """Long-context paged decode attention (partition/reduce). GQA/MQA aware.
+
+    q/out (B,H,D); caches (num_blocks, block_size, num_kv_heads, D). Accepts
+    mlx.array or torch.Tensor (MPS). partition_size must be a multiple of block_size.
+    """
+    if _is_torch(q):
+        return _torch().paged_attention_v2(
+            q, key_cache, value_cache, block_table, context_lens, scale, partition_size)
+    return _mlx().paged_attention_v2(
+        q, key_cache, value_cache, block_table, context_lens,
+        scale=scale, partition_size=partition_size)
+
+
+def moe_route_topk(logits, k):
+    """MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
+
+    logits (num_tokens, num_experts); k <= min(16, num_experts). Accepts mlx.array or torch.Tensor.
+    """
+    if _is_torch(logits):
+        return _torch().moe_route_topk(logits, k)
+    return _mlx().moe_route_topk(logits, k)
+
+
+def moe_permute(topk_ids, num_experts):
+    """Group T*k routing rows by expert. Returns (sorted_row_idx, offsets, inv_idx) int32.
+
+    Accepts mlx.array or torch.Tensor (MPS). A flat row r maps to token r//k, slot r%k.
+    """
+    if _is_torch(topk_ids):
+        return _torch().moe_permute(topk_ids, num_experts)
+    sorted_idx, offsets, inv_idx = _mlx().moe_permute(topk_ids, num_experts)[:3]
+    return sorted_idx, offsets, inv_idx
+
+
+def moe_finalize(expert_out, inv_idx, topk_weights, k):
+    """out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim).
+
+    Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(expert_out):
+        return _torch().moe_finalize(expert_out, inv_idx, topk_weights, k)
+    return _mlx().moe_finalize(expert_out, inv_idx, topk_weights, k)
+
+
+def argmax_sample(logits):
+    """Greedy sampling: argmax token index over the last (vocab) axis. Returns int32.
+
+    Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(logits):
+        return _torch().argmax_sample(logits)
+    return _mlx().argmax_sample(logits)
+
+
+def sample_categorical(logits, temperature=1.0, seed=0):
+    """Gumbel-max categorical sampling from softmax(logits/temperature). Returns int32.
+
+    Accepts mlx.array or torch.Tensor (MPS). The draw is reproducible given (seed, row).
+    """
+    if _is_torch(logits):
+        return _torch().sample_categorical(logits, temperature, seed)
+    return _mlx().sample_categorical(logits, temperature=temperature, seed=seed)
+
+
+def top_k_sample(logits, k, temperature=1.0, seed=0):
+    """Top-k sampling: Gumbel-max from softmax over the k highest logits. Returns int32.
+
+    Accepts mlx.array or torch.Tensor (MPS). Reproducible given (seed, row). k <= 64.
+    """
+    if _is_torch(logits):
+        return _torch().top_k_sample(logits, k, temperature, seed)
+    return _mlx().top_k_sample(logits, k, temperature=temperature, seed=seed)
+
+
+def top_p_sample(logits, p, temperature=1.0, seed=0):
+    """Top-p (nucleus) sampling: Gumbel-max from the smallest top-prob set with mass >= p. int32.
+
+    Accepts mlx.array or torch.Tensor (MPS). Reproducible given (seed, row).
+    """
+    if _is_torch(logits):
+        return _torch().top_p_sample(logits, p, temperature, seed)
+    return _mlx().top_p_sample(logits, p, temperature=temperature, seed=seed)
+
+
+def apply_penalty(logits, prev_tokens, temperature=1.0, repetition_penalty=1.0,
+                  presence_penalty=0.0, frequency_penalty=0.0):
+    """Temperature + repetition/presence/frequency penalties. Returns penalized logits (T,V).
+
+    logits (T,V); prev_tokens (T,L) int (out-of-range = ignored padding). Accepts mlx/torch.
+    """
+    if _is_torch(logits):
+        return _torch().apply_penalty(logits, prev_tokens, temperature, repetition_penalty,
+                                      presence_penalty, frequency_penalty)
+    return _mlx().apply_penalty(
+        logits, prev_tokens, temperature=temperature, repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty, frequency_penalty=frequency_penalty)[0]
+
+
+def quantize_per_token_fp8(x):
+    """Per-row fp8 e4m3 quant. Returns (codes uint8, scale f32), scale=absmax/448.
+
+    Accepts mlx.array or torch.Tensor (MPS). Reconstruct as scale[...,None] * e4m3_decode(codes).
+    """
+    if _is_torch(x):
+        return _torch().quantize_per_token_fp8(x)
+    return _mlx().quantize_per_token_fp8(x)
+
+
+def quantize_per_token_int8(x):
+    """Per-row symmetric int8 quant. Returns (codes int8, scale f32), scale=absmax/127.
+
+    Accepts mlx.array or torch.Tensor (MPS). Reconstruct as scale[...,None] * codes.
+    """
+    if _is_torch(x):
+        return _torch().quantize_per_token_int8(x)
+    return _mlx().quantize_per_token_int8(x)
 
 
 def attn_causal(q, k, v):

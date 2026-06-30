@@ -11,8 +11,11 @@ from tk import (
     kv_cache_gather,
     kv_cache_scales,
     kv_cache_scatter,
+    kv_cache_scatter_fp8,
     paged_attention,
+    paged_attention_fp8,
 )
+from tk.quant import _e4m3_decode_arr
 
 
 def _mx_dtype(name):
@@ -180,3 +183,92 @@ def test_paged_attention(dtype, atol, D):
         scale,
     )
     np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=2e-3)
+
+
+def _paged_ref_gqa(q, key_cache, value_cache, block_table, context_lens, scale):
+    """GQA/MQA reference: query head h reads KV head h // (H // H_KV)."""
+    B, H, D = q.shape
+    H_KV = key_cache.shape[2]
+    group = H // H_KV
+    block_size = key_cache.shape[1]
+    out = np.zeros_like(q, dtype=np.float32)
+    for b in range(B):
+        for h in range(H):
+            kvh = h // group
+            scores, vals = [], []
+            for t in range(context_lens[b]):
+                block = block_table[b, t // block_size]
+                slot = t % block_size
+                scores.append(float(np.dot(q[b, h], key_cache[block, slot, kvh]) * scale))
+                vals.append(value_cache[block, slot, kvh])
+            if not scores:
+                continue
+            s = np.array(scores, np.float32)
+            p = np.exp(s - s.max())
+            p /= p.sum()
+            out[b, h] = np.sum(p[:, None] * np.stack(vals, axis=0), axis=0)
+    return out
+
+
+@pytest.mark.parametrize("dtype,atol", [("float32", 2e-5), ("bfloat16", 2e-2)])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("H,H_KV", [(4, 2), (4, 1), (8, 2)])  # GQA group 2, MQA, GQA group 4
+def test_paged_attention_gqa(dtype, atol, D, H, H_KV):
+    rng = np.random.default_rng(11 + D + H + H_KV)
+    B = 2
+    num_blocks, block_size = 4, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    key_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    value_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    block_table = np.array([[0, 1], [2, 3]], dtype=np.int32)
+    context_lens = np.array([6, 7], dtype=np.int32)
+    scale = 1.0 / math.sqrt(D)
+
+    qm = mx.array(q).astype(_mx_dtype(dtype))
+    km = mx.array(key_cache).astype(_mx_dtype(dtype))
+    vm = mx.array(value_cache).astype(_mx_dtype(dtype))
+    got = paged_attention(qm, km, vm, mx.array(block_table), mx.array(context_lens), scale=0.0)
+    mx.eval(got)
+
+    ref = _paged_ref_gqa(
+        _np(qm).astype(np.float32),
+        _np(km).astype(np.float32),
+        _np(vm).astype(np.float32),
+        block_table,
+        context_lens,
+        scale,
+    )
+    np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=2e-3)
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("H,H_KV", [(2, 2), (4, 1)])  # MHA, MQA
+def test_fp8_kv_roundtrip(D, H, H_KV):
+    # Scatter K/V into an fp8 (uint8 e4m3) cache, then attend, dequantizing on read.
+    rng = np.random.default_rng(30 + D + H + H_KV)
+    B, num_blocks, block_size = 2, 8, 4
+    total = num_blocks * block_size
+    K = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    V = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    block_table = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    context_lens = np.array([10, 16], dtype=np.int32)
+    k_scale = float(np.abs(K).max() / 448.0)
+    v_scale = float(np.abs(V).max() / 448.0)
+    scale = 1.0 / math.sqrt(D)
+    slot_mapping = np.arange(total, dtype=np.int64)
+
+    kc, vc = kv_cache_scatter_fp8(
+        mx.array(K).astype(mx.bfloat16), mx.array(V).astype(mx.bfloat16),
+        mx.array(slot_mapping), num_blocks, block_size, k_scale, v_scale)
+    got = paged_attention_fp8(
+        mx.array(q).astype(mx.bfloat16), kc, vc,
+        mx.array(block_table), mx.array(context_lens), k_scale, v_scale, scale=0.0)
+    mx.eval(kc, vc, got)
+
+    # Reference: dequantize the stored codes and run the GQA softmax on the same values.
+    kc_deq = _e4m3_decode_arr(np.array(kc)) * k_scale
+    vc_deq = _e4m3_decode_arr(np.array(vc)) * v_scale
+    q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
+    ref = _paged_ref_gqa(q_bf, kc_deq, vc_deq, block_table, context_lens, scale)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=2e-3)

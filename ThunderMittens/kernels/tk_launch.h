@@ -29,6 +29,18 @@ inline std::string attn_fwd_kernel_name(int D) { return "attn_fwd_" + std::to_st
 inline std::string add_rt_kernel_name(const std::string& t) { return "add_rt_" + t; }
 inline std::string matmul_custom_kernel_name(const std::string& t) { return "matmul_custom_" + t; }
 inline std::string rms_norm_kernel_name(int D) { return "rms_norm_" + std::to_string(D); }
+inline std::string rms_norm_add_kernel_name(int D) { return "rms_norm_add_" + std::to_string(D); }
+inline std::string layernorm_add_kernel_name(int D) { return "layernorm_add_" + std::to_string(D); }
+inline std::string rope_kv_insert_kernel_name(int D) { return "rope_kv_insert_" + std::to_string(D); }
+inline std::string argmax_kernel_name(const std::string& t) { return "argmax_" + t; }
+inline std::string moe_route_topk_kernel_name(const std::string& t) { return "moe_route_topk_" + t; }
+inline std::string moe_finalize_kernel_name(const std::string& t) { return "moe_finalize_" + t; }
+inline std::string sample_categorical_kernel_name(const std::string& t) { return "sample_categorical_" + t; }
+inline std::string top_k_sample_kernel_name(const std::string& t) { return "top_k_sample_" + t; }
+inline std::string top_p_sample_kernel_name(const std::string& t) { return "top_p_sample_" + t; }
+inline std::string apply_penalty_kernel_name(const std::string& t) { return "apply_penalty_" + t; }
+inline std::string quantize_per_token_fp8_kernel_name(const std::string& t) { return "quantize_per_token_fp8_" + t; }
+inline std::string quantize_per_token_int8_kernel_name(const std::string& t) { return "quantize_per_token_int8_" + t; }
 inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_string(D); }
 inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string(D); }
 inline std::string gelu_kernel_name(int D) { return "gelu_" + std::to_string(D); }
@@ -41,6 +53,16 @@ inline std::string kv_cache_kernel_name(const std::string& op, const std::string
 }
 inline std::string paged_attention_kernel_name(const std::string& t, int D) {
   return "paged_attention_" + t + "_" + std::to_string(D);
+}
+inline std::string kv_cache_scatter_fp8_kernel_name(const std::string& t) { return "kv_cache_scatter_fp8_" + t; }
+inline std::string paged_attention_fp8_kernel_name(const std::string& t, int D) {
+  return "paged_attention_fp8_" + t + "_" + std::to_string(D);
+}
+inline std::string paged_attention_partition_kernel_name(const std::string& t, int D) {
+  return "paged_attention_partition_" + t + "_" + std::to_string(D);
+}
+inline std::string paged_attention_reduce_kernel_name(const std::string& t, int D) {
+  return "paged_attention_reduce_" + t + "_" + std::to_string(D);
 }
 inline std::string attn_causal_kernel_name(int D) { return "attn_causal_" + std::to_string(D); }
 inline std::string flux_gelu_kernel_name(const std::string& t) { return "flux_gelu_" + t; }
@@ -132,6 +154,193 @@ void launch_rms_norm(E& e, typename E::in_t x, typename E::in_t w,
   e.in(x, 0); e.in(w, 1); e.out(o, 2);
   e.bytes(M, 3); e.bytes(eps, 4);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- rms_norm_add: x@0 residual@1 w@2 -> o@3 res_out@4 ; M@5(u32) eps@6(f32) ;
+//        grid (M,1,1) group (32,1,1). o = rms_norm(x+residual)*w ; res_out = x+residual -----
+template <class E>
+void launch_rms_norm_add(E& e, typename E::in_t x, typename E::in_t r, typename E::in_t w,
+                         typename E::out_t o, typename E::out_t res_out,
+                         uint32_t M, int D, float eps) {
+  e.pipeline(rms_norm_add_kernel_name(D));
+  e.in(x, 0); e.in(r, 1); e.in(w, 2); e.out(o, 3); e.out(res_out, 4);
+  e.bytes(M, 5); e.bytes(eps, 6);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- layernorm_add: x@0 residual@1 w@2 b@3 -> o@4 res_out@5 ; M@6(u32) eps@7(f32) ;
+//        grid (M,1,1) group (32,1,1). o = layernorm(x+residual)*w+b ; res_out = x+residual -----
+template <class E>
+void launch_layernorm_add(E& e, typename E::in_t x, typename E::in_t r, typename E::in_t w,
+                          typename E::in_t b, typename E::out_t o, typename E::out_t res_out,
+                          uint32_t M, int D, float eps) {
+  e.pipeline(layernorm_add_kernel_name(D));
+  e.in(x, 0); e.in(r, 1); e.in(w, 2); e.in(b, 3); e.out(o, 4); e.out(res_out, 5);
+  e.bytes(M, 6); e.bytes(eps, 7);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- rope_kv_insert: k@0 v@1 cos@2 sin@3 positions@4(i32) slot_mapping@5(i64) ->
+//        key_cache@6 value_cache@7 ; num_kv_heads@8(i32) block_size@9(i32) ; grid (M,1,1).
+//        M = num_tokens*num_kv_heads. caches must be pre-cloned (insert overwrites slot rows). -----
+template <class E>
+void launch_rope_kv_insert(E& e, typename E::in_t k, typename E::in_t v,
+                           typename E::in_t cos, typename E::in_t sin,
+                           typename E::in_t positions, typename E::in_t slot_mapping,
+                           typename E::out_t key_cache, typename E::out_t value_cache,
+                           int M, int num_kv_heads, int block_size, int D) {
+  e.pipeline(rope_kv_insert_kernel_name(D));
+  e.in(k, 0); e.in(v, 1); e.in(cos, 2); e.in(sin, 3);
+  e.in(positions, 4); e.in(slot_mapping, 5);
+  e.out(key_cache, 6); e.out(value_cache, 7);
+  e.bytes(num_kv_heads, 8); e.bytes(block_size, 9);
+  e.dispatch(M, 1, 1, 32, 1, 1);
+}
+
+// ----- moe_route_topk: logits@0(T,E) -> topk_ids@1(i32) topk_weights@2(f32), both (T,K) ;
+//        E@3(i32) K@4(i32) ; grid (num_tokens,1,1), 32 thr. Top-k experts + renormalized softmax. -----
+template <class Enc>
+void launch_moe_route_topk(Enc& e, typename Enc::in_t logits, typename Enc::out_t topk_ids,
+                           typename Enc::out_t topk_weights, int num_tokens, int num_experts,
+                           int k, const std::string& type_name) {
+  e.pipeline(moe_route_topk_kernel_name(type_name));
+  e.in(logits, 0); e.out(topk_ids, 1); e.out(topk_weights, 2);
+  e.bytes(num_experts, 3); e.bytes(k, 4);
+  e.dispatch(num_tokens, 1, 1, 32, 1, 1);
+}
+
+// ----- MoE permute pipeline (all int32). Run in order in one (serial) encoder. -----
+template <class Enc>
+void launch_moe_zero_i32(Enc& e, typename Enc::out_t p, int n) {
+  e.pipeline("moe_zero_i32");
+  e.out(p, 0); e.bytes(n, 1);
+  e.dispatch((n + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class Enc>
+void launch_moe_histogram(Enc& e, typename Enc::in_t topk_ids, typename Enc::out_t counts, int TK) {
+  e.pipeline("moe_histogram");
+  e.in(topk_ids, 0); e.out(counts, 1); e.bytes(TK, 2);
+  e.dispatch((TK + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class Enc>
+void launch_moe_scan_offsets(Enc& e, typename Enc::in_t counts, typename Enc::out_t offsets,
+                             typename Enc::out_t cursor, int num_experts) {
+  e.pipeline("moe_scan_offsets");
+  e.in(counts, 0); e.out(offsets, 1); e.out(cursor, 2); e.bytes(num_experts, 3);
+  e.dispatch(1, 1, 1, 1, 1, 1);
+}
+template <class Enc>
+void launch_moe_scatter(Enc& e, typename Enc::in_t topk_ids, typename Enc::out_t cursor,
+                        typename Enc::out_t sorted_row_idx, typename Enc::out_t inv_idx, int TK) {
+  e.pipeline("moe_scatter");
+  e.in(topk_ids, 0); e.out(cursor, 1); e.out(sorted_row_idx, 2); e.out(inv_idx, 3); e.bytes(TK, 4);
+  e.dispatch((TK + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+// ----- moe_finalize: expert_out@0 inv_idx@1(i32) topk_weights@2(f32) -> out@3 ; K@4 Hdim@5 ;
+//        grid (num_tokens,1,1), 32 thr. k-way weighted reduce via inv_idx (no atomics). -----
+template <class Enc>
+void launch_moe_finalize(Enc& e, typename Enc::in_t expert_out, typename Enc::in_t inv_idx,
+                         typename Enc::in_t topk_weights, typename Enc::out_t out,
+                         int num_tokens, int k, int Hdim, const std::string& type_name) {
+  e.pipeline(moe_finalize_kernel_name(type_name));
+  e.in(expert_out, 0); e.in(inv_idx, 1); e.in(topk_weights, 2); e.out(out, 3);
+  e.bytes(k, 4); e.bytes(Hdim, 5);
+  e.dispatch(num_tokens, 1, 1, 32, 1, 1);
+}
+
+// ----- argmax (greedy sampling): logits@0 -> out_idx@1(i32) ; V@2(i32) ; grid (rows,1,1), 32 thr.
+//        One simdgroup per row finds the argmax token over the vocab dim V. -----
+template <class E>
+void launch_argmax(E& e, typename E::in_t logits, typename E::out_t out_idx,
+                   int rows, int V, const std::string& type_name) {
+  e.pipeline(argmax_kernel_name(type_name));
+  e.in(logits, 0); e.out(out_idx, 1);
+  e.bytes(V, 2);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- sample_categorical: logits@0 -> out_idx@1(i32) ; V@2(i32) seed@3(u32) invtemp@4(f32) ;
+//        grid (rows,1,1), 32 thr. Gumbel-max sampling from softmax(logits/temperature). -----
+template <class E>
+void launch_sample_categorical(E& e, typename E::in_t logits, typename E::out_t out_idx,
+                               int rows, int V, uint32_t seed, float invtemp,
+                               const std::string& type_name) {
+  e.pipeline(sample_categorical_kernel_name(type_name));
+  e.in(logits, 0); e.out(out_idx, 1);
+  e.bytes(V, 2); e.bytes(seed, 3); e.bytes(invtemp, 4);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- top_k_sample: logits@0 -> out_idx@1(i32) ; V@2 K@3(i32) seed@4(u32) invtemp@5(f32) ;
+//        grid (rows,1,1), 32 thr. Gumbel-max sampling restricted to the top-k logits. -----
+template <class E>
+void launch_top_k_sample(E& e, typename E::in_t logits, typename E::out_t out_idx,
+                         int rows, int V, int k, uint32_t seed, float invtemp,
+                         const std::string& type_name) {
+  e.pipeline(top_k_sample_kernel_name(type_name));
+  e.in(logits, 0); e.out(out_idx, 1);
+  e.bytes(V, 2); e.bytes(k, 3); e.bytes(seed, 4); e.bytes(invtemp, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- top_p_sample: logits@0 -> out_idx@1(i32) ; V@2(i32) p@3(f32) seed@4(u32) invtemp@5(f32) ;
+//        grid (rows,1,1), 32 thr. Gumbel-max sampling from the nucleus (cumulative prob >= p). -----
+template <class E>
+void launch_top_p_sample(E& e, typename E::in_t logits, typename E::out_t out_idx,
+                         int rows, int V, float p, uint32_t seed, float invtemp,
+                         const std::string& type_name) {
+  e.pipeline(top_p_sample_kernel_name(type_name));
+  e.in(logits, 0); e.out(out_idx, 1);
+  e.bytes(V, 2); e.bytes(p, 3); e.bytes(seed, 4); e.bytes(invtemp, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- penalty_histogram: prev_tokens@0(i32) -> counts@1(atomic i32) ; V@2 L@3 TL@4 ; grid (TL).
+//        counts[(row,tok)] += 1 for each valid history token. Zero counts first. -----
+template <class E>
+void launch_penalty_histogram(E& e, typename E::in_t prev_tokens, typename E::out_t counts,
+                              int V, int L, int TL) {
+  e.pipeline("penalty_histogram");
+  e.in(prev_tokens, 0); e.out(counts, 1);
+  e.bytes(V, 2); e.bytes(L, 3); e.bytes(TL, 4);
+  e.dispatch((TL + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+// ----- apply_penalty: logits@0 counts@1(i32) -> out@2 ; V@3 invtemp@4 rep@5 presence@6 freq@7 ;
+//        grid (rows,1,1), 32 thr. temperature + repetition/presence/frequency penalties. -----
+template <class E>
+void launch_apply_penalty(E& e, typename E::in_t logits, typename E::in_t counts,
+                          typename E::out_t out, int rows, int V, float invtemp, float rep,
+                          float presence, float freq, const std::string& type_name) {
+  e.pipeline(apply_penalty_kernel_name(type_name));
+  e.in(logits, 0); e.in(counts, 1); e.out(out, 2);
+  e.bytes(V, 3); e.bytes(invtemp, 4); e.bytes(rep, 5); e.bytes(presence, 6); e.bytes(freq, 7);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- quantize_per_token_fp8: x@0 -> codes@1(uint8) scale@2(f32) ; D@3(i32) ; grid (rows,1,1).
+//        Per-row absmax -> scale=absmax/448 ; codes = e4m3(x/scale). -----
+template <class E>
+void launch_quantize_per_token_fp8(E& e, typename E::in_t x, typename E::out_t codes,
+                                   typename E::out_t scale, int rows, int D,
+                                   const std::string& type_name) {
+  e.pipeline(quantize_per_token_fp8_kernel_name(type_name));
+  e.in(x, 0); e.out(codes, 1); e.out(scale, 2);
+  e.bytes(D, 3);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- quantize_per_token_int8: x@0 -> codes@1(int8) scale@2(f32) ; D@3(i32) ; grid (rows,1,1).
+//        Per-row absmax -> scale=absmax/127 ; codes = round_clamp(x/scale). -----
+template <class E>
+void launch_quantize_per_token_int8(E& e, typename E::in_t x, typename E::out_t codes,
+                                    typename E::out_t scale, int rows, int D,
+                                    const std::string& type_name) {
+  e.pipeline(quantize_per_token_int8_kernel_name(type_name));
+  e.in(x, 0); e.out(codes, 1); e.out(scale, 2);
+  e.bytes(D, 3);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
 // ----- softmax (last axis): x@0 -> o@1 ; M@2(u32) ; grid (M,1,1) group (32,1,1) -----
@@ -330,7 +539,8 @@ void launch_kv_cache_scales(
 }
 
 // ----- Paged decode attention: q@0 cacheK@1 cacheV@2 block_table@3 context_lens@4 -> out@5.
-// q/out are (B,H,D), caches are (num_blocks, block_size, H, D), D in {64,128}. -----
+// q/out are (B, num_heads, D); caches are (num_blocks, block_size, num_kv_heads, D), D in {64,128}.
+// GQA/MQA: num_heads may be a multiple of num_kv_heads (kv_head = head / (num_heads/num_kv_heads)). -----
 template <class E>
 void launch_paged_attention(
     E& e,
@@ -342,6 +552,7 @@ void launch_paged_attention(
     typename E::out_t out,
     int batch,
     int num_heads,
+    int num_kv_heads,
     int head_size,
     int block_size,
     int block_table_stride,
@@ -358,6 +569,81 @@ void launch_paged_attention(
   e.bytes(block_table_stride, 7);
   e.bytes(scale, 8);
   e.bytes(num_heads, 9);
+  e.bytes(num_kv_heads, 10);
+  e.dispatch(num_heads, batch, 1, 32, 1, 1);
+}
+
+// ----- fp8 KV cache: zero (uint8), scatter-with-encode, and dequant-on-read paged attention. -----
+template <class E>
+void launch_kv_cache_zero_u8(E& e, typename E::out_t key_cache, typename E::out_t value_cache,
+                             uint64_t n) {
+  e.pipeline("kv_cache_zero_u8");
+  e.out(key_cache, 0); e.out(value_cache, 1); e.bytes(n, 2);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+template <class E>
+void launch_kv_cache_scatter_fp8(E& e, typename E::in_t key, typename E::in_t value,
+                                 typename E::in_t slot_mapping, typename E::out_t key_cache,
+                                 typename E::out_t value_cache, int num_tokens, int num_heads,
+                                 int head_size, int block_size, float k_scale, float v_scale,
+                                 const std::string& type_name) {
+  e.pipeline(kv_cache_scatter_fp8_kernel_name(type_name));
+  e.in(key, 0); e.in(value, 1); e.in(slot_mapping, 2);
+  e.out(key_cache, 3); e.out(value_cache, 4);
+  e.bytes(num_heads, 5); e.bytes(head_size, 6); e.bytes(block_size, 7);
+  e.bytes(k_scale, 8); e.bytes(v_scale, 9);
+  e.dispatch(num_tokens, 1, 1, 256, 1, 1);
+}
+
+template <class E>
+void launch_paged_attention_fp8(E& e, typename E::in_t q, typename E::in_t key_cache,
+                                typename E::in_t value_cache, typename E::in_t block_table,
+                                typename E::in_t context_lens, typename E::out_t out,
+                                int batch, int num_heads, int num_kv_heads, int head_size,
+                                int block_size, int block_table_stride, float scale,
+                                float k_scale, float v_scale, const std::string& type_name) {
+  e.pipeline(paged_attention_fp8_kernel_name(type_name, head_size));
+  e.in(q, 0); e.in(key_cache, 1); e.in(value_cache, 2);
+  e.in(block_table, 3); e.in(context_lens, 4); e.out(out, 5);
+  e.bytes(block_size, 6); e.bytes(block_table_stride, 7); e.bytes(scale, 8);
+  e.bytes(num_heads, 9); e.bytes(num_kv_heads, 10);
+  e.bytes(k_scale, 11); e.bytes(v_scale, 12);
+  e.dispatch(num_heads, batch, 1, 32, 1, 1);
+}
+
+// ----- Paged attention v2 partition: q@0 cacheK@1 cacheV@2 block_table@3 context_lens@4 ->
+//        tmp_out@5 max_logits@6 exp_sums@7 (all fp32) ; scalars 8..14 ; grid (H, B, P), 32 thr.
+//        Each (head,batch,partition) does a local softmax over its KV slice. GQA-aware. -----
+template <class E>
+void launch_paged_attention_partition(
+    E& e, typename E::in_t q, typename E::in_t key_cache, typename E::in_t value_cache,
+    typename E::in_t block_table, typename E::in_t context_lens,
+    typename E::out_t tmp_out, typename E::out_t max_logits, typename E::out_t exp_sums,
+    int batch, int num_heads, int num_kv_heads, int head_size, int block_size,
+    int block_table_stride, float scale, int num_partitions, int partition_size,
+    const std::string& type_name) {
+  e.pipeline(paged_attention_partition_kernel_name(type_name, head_size));
+  e.in(q, 0); e.in(key_cache, 1); e.in(value_cache, 2);
+  e.in(block_table, 3); e.in(context_lens, 4);
+  e.out(tmp_out, 5); e.out(max_logits, 6); e.out(exp_sums, 7);
+  e.bytes(block_size, 8); e.bytes(block_table_stride, 9); e.bytes(scale, 10);
+  e.bytes(num_heads, 11); e.bytes(num_kv_heads, 12);
+  e.bytes(num_partitions, 13); e.bytes(partition_size, 14);
+  e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
+}
+
+// ----- Paged attention v2 reduce: tmp_out@0 max_logits@1 exp_sums@2 (fp32) -> out@3 ;
+//        num_heads@4 num_partitions@5 ; grid (H, B, 1), 32 threads. LSE merge over partitions. -----
+template <class E>
+void launch_paged_attention_reduce(
+    E& e, typename E::in_t tmp_out, typename E::in_t max_logits, typename E::in_t exp_sums,
+    typename E::out_t out, int batch, int num_heads, int head_size, int num_partitions,
+    const std::string& type_name) {
+  e.pipeline(paged_attention_reduce_kernel_name(type_name, head_size));
+  e.in(tmp_out, 0); e.in(max_logits, 1); e.in(exp_sums, 2); e.out(out, 3);
+  e.bytes(num_heads, 4); e.bytes(num_partitions, 5);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 

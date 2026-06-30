@@ -1,0 +1,192 @@
+#include "tk.metal"
+#include <metal_stdlib>
+
+using namespace metal;
+using namespace mittens;
+
+// ---------------------------------------------------------------------------
+// Long-context paged decode attention, two-kernel partition/reduce (vLLM v2).
+//
+// Each (head, batch) query is split across `num_partitions` KV-sequence slices
+// of `partition_size` tokens, so no single threadgroup walks the whole context.
+//
+//   partition: local online-softmax over slice [p*PS, min((p+1)*PS, ctx_len))
+//              -> max_logits[b,h,p] = m_p (local max), exp_sums[b,h,p] = S_p,
+//                 tmp_out[b,h,p,:] = (sum_j e^{l_j-m_p} v_j) / S_p   (locally normalized)
+//   reduce:    m* = max_p m_p ;  rescale_p = S_p * exp(m_p - m*)
+//              out = sum_p tmp_out[p] * rescale_p / (sum_p rescale_p + 1e-6)
+//
+// That recovers the exact global softmax. GQA/MQA: kv_head = head/(H/H_KV).
+// Caches are (num_blocks, block_size, num_kv_heads, D); q/out are (B,H,D); D∈{64,128}.
+// Partials are fp32 for a numerically clean merge. One simdgroup (32 lanes) per block.
+// ---------------------------------------------------------------------------
+
+constant float NEG_INF = -3.4028234663852886e38f;
+
+template <typename T, int D>
+kernel void paged_attention_partition(
+    device const T *q [[buffer(0)]],
+    device const T *key_cache [[buffer(1)]],
+    device const T *value_cache [[buffer(2)]],
+    device const int *block_table [[buffer(3)]],
+    device const int *context_lens [[buffer(4)]],
+    device float *tmp_out [[buffer(5)]],      // (B, H, P, D)
+    device float *max_logits [[buffer(6)]],   // (B, H, P)
+    device float *exp_sums [[buffer(7)]],     // (B, H, P)
+    constant int &block_size [[buffer(8)]],
+    constant int &block_table_stride [[buffer(9)]],
+    constant float &scale [[buffer(10)]],
+    constant int &num_heads [[buffer(11)]],
+    constant int &num_kv_heads [[buffer(12)]],
+    constant int &num_partitions [[buffer(13)]],
+    constant int &partition_size [[buffer(14)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int VALUES_PER_LANE = D / 32;
+
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int part = (int)tgid.z;
+    const int kv_head = head / (num_heads / num_kv_heads);
+    const int context_len = context_lens[batch];
+    const int start = part * partition_size;
+    const int end = min(start + partition_size, context_len);
+
+    const long q_base = ((long)batch * num_heads + head) * D;
+    const long stat_idx = ((long)batch * num_heads + head) * num_partitions + part;
+    const long out_base = stat_idx * D;
+
+    float qv[VALUES_PER_LANE], acc[VALUES_PER_LANE];
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        qv[i] = float(q[q_base + d]);
+        acc[i] = 0.0f;
+    }
+
+    float m = NEG_INF, l = 0.0f;
+    for (int t = start; t < end; ++t) {
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) {
+            continue;
+        }
+        const long cache_base =
+            (((long)block * block_size + slot) * num_kv_heads + kv_head) * D;
+        float partial = 0.0f;
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            partial += qv[i] * float(key_cache[cache_base + d]);
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            acc[i] = acc[i] * alpha + beta * float(value_cache[cache_base + d]);
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    if (lane == 0) {
+        max_logits[stat_idx] = l == 0.0f ? NEG_INF : m;
+        exp_sums[stat_idx] = l;
+    }
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        tmp_out[out_base + d] = l == 0.0f ? 0.0f : (acc[i] / l);
+    }
+}
+
+template <typename T, int D>
+kernel void paged_attention_reduce(
+    device const float *tmp_out [[buffer(0)]],    // (B, H, P, D)
+    device const float *max_logits [[buffer(1)]], // (B, H, P)
+    device const float *exp_sums [[buffer(2)]],   // (B, H, P)
+    device T *out [[buffer(3)]],                   // (B, H, D)
+    constant int &num_heads [[buffer(4)]],
+    constant int &num_partitions [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int VALUES_PER_LANE = D / 32;
+
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const long base = ((long)batch * num_heads + head) * num_partitions;
+
+    float gm = NEG_INF;
+    for (int p = 0; p < num_partitions; ++p) {
+        gm = max(gm, max_logits[base + p]);
+    }
+    float gden = 0.0f;
+    for (int p = 0; p < num_partitions; ++p) {
+        const float mp = max_logits[base + p];
+        if (mp == NEG_INF) {
+            continue;
+        }
+        gden += exp_sums[base + p] * exp(mp - gm);
+    }
+    const float inv = 1.0f / (gden + 1e-6f);
+
+    float acc[VALUES_PER_LANE];
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        acc[i] = 0.0f;
+    }
+    for (int p = 0; p < num_partitions; ++p) {
+        const float mp = max_logits[base + p];
+        if (mp == NEG_INF) {
+            continue;
+        }
+        const float r = exp_sums[base + p] * exp(mp - gm);
+        const long ob = (base + p) * D;
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            acc[i] += tmp_out[ob + d] * r;
+        }
+    }
+    const long out_base = ((long)batch * num_heads + head) * D;
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        out[out_base + d] = gm == NEG_INF ? T(0) : T(acc[i] * inv);
+    }
+}
+
+#define instantiate_paged_v2(type_name, T, DVAL)                              \
+  template [[host_name("paged_attention_partition_" #type_name "_" #DVAL)]]   \
+  [[kernel]] void paged_attention_partition<T, DVAL>(                         \
+      device const T *q [[buffer(0)]],                                        \
+      device const T *key_cache [[buffer(1)]],                                \
+      device const T *value_cache [[buffer(2)]],                              \
+      device const int *block_table [[buffer(3)]],                            \
+      device const int *context_lens [[buffer(4)]],                           \
+      device float *tmp_out [[buffer(5)]],                                    \
+      device float *max_logits [[buffer(6)]],                                 \
+      device float *exp_sums [[buffer(7)]],                                   \
+      constant int &block_size [[buffer(8)]],                                 \
+      constant int &block_table_stride [[buffer(9)]],                         \
+      constant float &scale [[buffer(10)]],                                   \
+      constant int &num_heads [[buffer(11)]],                                 \
+      constant int &num_kv_heads [[buffer(12)]],                              \
+      constant int &num_partitions [[buffer(13)]],                            \
+      constant int &partition_size [[buffer(14)]],                            \
+      uint3 tgid [[threadgroup_position_in_grid]],                            \
+      uint lane [[thread_index_in_simdgroup]]);                               \
+  template [[host_name("paged_attention_reduce_" #type_name "_" #DVAL)]]      \
+  [[kernel]] void paged_attention_reduce<T, DVAL>(                            \
+      device const float *tmp_out [[buffer(0)]],                              \
+      device const float *max_logits [[buffer(1)]],                           \
+      device const float *exp_sums [[buffer(2)]],                             \
+      device T *out [[buffer(3)]],                                            \
+      constant int &num_heads [[buffer(4)]],                                  \
+      constant int &num_partitions [[buffer(5)]],                             \
+      uint3 tgid [[threadgroup_position_in_grid]],                            \
+      uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_paged_v2(float32, float, 64)
+instantiate_paged_v2(float32, float, 128)
+instantiate_paged_v2(float16, half, 64)
+instantiate_paged_v2(float16, half, 128)
+instantiate_paged_v2(bfloat16, bf16, 64)
+instantiate_paged_v2(bfloat16, bf16, 128)

@@ -188,6 +188,47 @@ static at::Tensor rms_norm_mps(const at::Tensor& x_in, const at::Tensor& w_in, d
   return out;
 }
 
+// Fused residual-add + RMSNorm. Returns (out, x+residual).
+static std::tuple<at::Tensor, at::Tensor> rms_norm_add_mps(
+    const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in, double eps) {
+  TORCH_CHECK(x_in.device().is_mps(), "rms_norm_add: x must be an MPS tensor");
+  TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "rms_norm_add: x must be bfloat16");
+  TORCH_CHECK(r_in.sizes() == x_in.sizes(), "rms_norm_add: residual must match x shape");
+  auto x = x_in.contiguous(), r = r_in.contiguous(), w = w_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(D == 256 || D == 512 || D == 768 || D == 1024,
+              "rms_norm_add: last dim must be 256/512/768/1024");
+  const uint32_t M = static_cast<uint32_t>(x.numel() / D);
+  auto out = at::empty_like(x);
+  auto res_out = at::empty_like(x);
+  const float eps_f = static_cast<float>(eps);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rms_norm_add(e, x, r, w, out, res_out, M, D, eps_f);
+  });
+  return {out, res_out};
+}
+
+// Fused residual-add + LayerNorm. Returns (out, x+residual).
+static std::tuple<at::Tensor, at::Tensor> layernorm_add_mps(
+    const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in,
+    const at::Tensor& b_in, double eps) {
+  TORCH_CHECK(x_in.device().is_mps(), "layernorm_add: x must be an MPS tensor");
+  TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "layernorm_add: x must be bfloat16");
+  TORCH_CHECK(r_in.sizes() == x_in.sizes(), "layernorm_add: residual must match x shape");
+  auto x = x_in.contiguous(), r = r_in.contiguous(), w = w_in.contiguous(), b = b_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(D == 256 || D == 512 || D == 768 || D == 1024,
+              "layernorm_add: last dim must be 256/512/768/1024");
+  const uint32_t M = static_cast<uint32_t>(x.numel() / D);
+  auto out = at::empty_like(x);
+  auto res_out = at::empty_like(x);
+  const float eps_f = static_cast<float>(eps);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_layernorm_add(e, x, r, w, b, out, res_out, M, D, eps_f);
+  });
+  return {out, res_out};
+}
+
 static at::Tensor softmax_mps(const at::Tensor& x_in) {
   TORCH_CHECK(x_in.device().is_mps(), "softmax: x must be an MPS tensor");
   TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "softmax: x must be bfloat16");
@@ -406,6 +447,62 @@ static std::tuple<at::Tensor, at::Tensor> kv_cache_scales_mps(
   return {key_scale, value_scale};
 }
 
+// fp8 KV cache: scatter K/V into a uint8 (e4m3) paged cache with per-tensor scales.
+static std::tuple<at::Tensor, at::Tensor> kv_cache_scatter_fp8_mps(
+    const at::Tensor& key_in, const at::Tensor& value_in, const at::Tensor& slot_in,
+    int64_t num_blocks, int64_t block_size, double k_scale, double v_scale) {
+  TORCH_CHECK(key_in.device().is_mps(), "kv_cache_scatter_fp8: key must be an MPS tensor");
+  TORCH_CHECK(key_in.dim() == 3 && value_in.sizes() == key_in.sizes(),
+              "kv_cache_scatter_fp8: key/value must be (num_tokens, num_heads, head_size)");
+  TORCH_CHECK(tk_is_float_dtype(key_in), "kv_cache_scatter_fp8: key/value must be float");
+  TORCH_CHECK(slot_in.dim() == 1 && slot_in.size(0) == key_in.size(0),
+              "kv_cache_scatter_fp8: slot_mapping must be (num_tokens,)");
+  auto key = key_in.contiguous(), value = value_in.contiguous();
+  auto slot = slot_in.to(at::kLong).contiguous();
+  const int T = key.size(0), H = key.size(1), D = key.size(2);
+  auto kc = at::empty({num_blocks, block_size, H, D}, key.options().dtype(at::kByte));
+  auto vc = at::empty({num_blocks, block_size, H, D}, key.options().dtype(at::kByte));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kv_cache_zero_u8(e, kc, vc, static_cast<uint64_t>(kc.numel()));
+    tk::launch_kv_cache_scatter_fp8(e, key, value, slot, kc, vc, T, H, D,
+                                    static_cast<int>(block_size), static_cast<float>(k_scale),
+                                    static_cast<float>(v_scale), tk_type_name(key));
+  });
+  return {kc, vc};
+}
+
+static at::Tensor paged_attention_fp8_mps(
+    const at::Tensor& q_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
+    const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
+    double k_scale, double v_scale, double scale) {
+  TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in), "paged_attention_fp8: q must be float MPS");
+  TORCH_CHECK(q_in.dim() == 3, "paged_attention_fp8: q must be (B,H,D)");
+  TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
+              "paged_attention_fp8: caches must be (num_blocks, block_size, num_kv_heads, D)");
+  TORCH_CHECK(key_cache_in.scalar_type() == at::kByte && value_cache_in.scalar_type() == at::kByte,
+              "paged_attention_fp8: caches must be uint8 (e4m3 codes)");
+  TORCH_CHECK(key_cache_in.size(3) == q_in.size(2), "paged_attention_fp8: head_size mismatch");
+  TORCH_CHECK(key_cache_in.size(2) > 0 && q_in.size(1) % key_cache_in.size(2) == 0,
+              "paged_attention_fp8: num_q_heads must be a positive multiple of num_kv_heads");
+  TORCH_CHECK(block_table_in.scalar_type() == at::kInt && context_lens_in.scalar_type() == at::kInt,
+              "paged_attention_fp8: block_table and context_lens must be int32");
+  const int B = q_in.size(0), H = q_in.size(1), D = q_in.size(2);
+  const int H_KV = key_cache_in.size(2), block_size = key_cache_in.size(1);
+  TORCH_CHECK(D == 64 || D == 128, "paged_attention_fp8: head_size must be 64 or 128");
+  auto q = q_in.contiguous();
+  auto kc = key_cache_in.contiguous(), vc = value_cache_in.contiguous();
+  auto bt = block_table_in.contiguous(), cl = context_lens_in.contiguous();
+  auto out = at::empty_like(q);
+  const float scale_f = scale > 0.0 ? static_cast<float>(scale)
+                                    : 1.0f / std::sqrt(static_cast<float>(D));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_paged_attention_fp8(e, q, kc, vc, bt, cl, out, B, H, H_KV, D, block_size,
+                                   static_cast<int>(bt.size(1)), scale_f, static_cast<float>(k_scale),
+                                   static_cast<float>(v_scale), tk_type_name(q));
+  });
+  return out;
+}
+
 static at::Tensor paged_attention_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in,
     const at::Tensor& value_cache_in, const at::Tensor& block_table_in,
@@ -417,8 +514,10 @@ static at::Tensor paged_attention_mps(
   TORCH_CHECK(q_in.dim() == 3, "paged_attention: q must have shape (B,H,D)");
   TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
               "paged_attention: caches must have shape (num_blocks, block_size, H, D)");
-  TORCH_CHECK(key_cache_in.size(2) == q_in.size(1) && key_cache_in.size(3) == q_in.size(2),
-              "paged_attention: q heads/head_size must match caches");
+  TORCH_CHECK(key_cache_in.size(3) == q_in.size(2),
+              "paged_attention: q head_size must match caches");
+  TORCH_CHECK(key_cache_in.size(2) > 0 && q_in.size(1) % key_cache_in.size(2) == 0,
+              "paged_attention: num_q_heads must be a positive multiple of num_kv_heads (GQA/MQA)");
   TORCH_CHECK(block_table_in.dim() == 2 && block_table_in.size(0) == q_in.size(0),
               "paged_attention: block_table must have shape (B, max_blocks)");
   TORCH_CHECK(context_lens_in.dim() == 1 && context_lens_in.size(0) == q_in.size(0),
@@ -429,6 +528,7 @@ static at::Tensor paged_attention_mps(
   TORCH_CHECK(block_table_in.scalar_type() == at::kInt && context_lens_in.scalar_type() == at::kInt,
               "paged_attention: block_table and context_lens must be int32");
   const int B = q_in.size(0), H = q_in.size(1), D = q_in.size(2);
+  const int H_KV = key_cache_in.size(2);
   TORCH_CHECK(D == 64 || D == 128, "paged_attention: head_size must be 64 or 128");
 
   auto q = q_in.contiguous();
@@ -442,10 +542,291 @@ static at::Tensor paged_attention_mps(
   const std::string tn = tk_type_name(q);
   tk_encode([&](TorchEncoder& e) {
     tk::launch_paged_attention(e, q, key_cache, value_cache, block_table, context_lens,
-                               out, B, H, D, static_cast<int>(key_cache.size(1)),
+                               out, B, H, H_KV, D, static_cast<int>(key_cache.size(1)),
                                static_cast<int>(block_table.size(1)), scale_f, tn);
   });
   return out;
+}
+
+// Fused RoPE on K + paged-KV insert. Returns the two updated caches.
+static std::tuple<at::Tensor, at::Tensor> rope_kv_insert_mps(
+    const at::Tensor& k_in, const at::Tensor& v_in, const at::Tensor& cos_in,
+    const at::Tensor& sin_in, const at::Tensor& positions_in, const at::Tensor& slot_mapping_in,
+    const at::Tensor& key_cache_in, const at::Tensor& value_cache_in) {
+  TORCH_CHECK(k_in.device().is_mps(), "rope_kv_insert: inputs must be MPS tensors");
+  TORCH_CHECK(k_in.dim() == 3 && v_in.sizes() == k_in.sizes(),
+              "rope_kv_insert: k/v must be (num_tokens, num_kv_heads, D)");
+  TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
+              "rope_kv_insert: caches must be (num_blocks, block_size, num_kv_heads, D)");
+  TORCH_CHECK(k_in.scalar_type() == at::kBFloat16 && key_cache_in.scalar_type() == at::kBFloat16,
+              "rope_kv_insert: k/v/caches must be bfloat16");
+  const int num_tokens = k_in.size(0), num_kv_heads = k_in.size(1), D = k_in.size(2);
+  TORCH_CHECK(D == 64 || D == 128, "rope_kv_insert: D must be 64 or 128");
+  TORCH_CHECK(key_cache_in.size(2) == num_kv_heads && key_cache_in.size(3) == D,
+              "rope_kv_insert: cache heads/head_size must match k");
+  const int block_size = key_cache_in.size(1);
+
+  auto k = k_in.contiguous(), v = v_in.contiguous();
+  auto cos = cos_in.to(at::kBFloat16).contiguous(), sin = sin_in.to(at::kBFloat16).contiguous();
+  auto positions = positions_in.to(at::kInt).contiguous();
+  auto slot_mapping = slot_mapping_in.to(at::kLong).contiguous();
+  // Copy the existing caches through; the insert overwrites only the slot rows.
+  auto key_out = key_cache_in.contiguous().clone();
+  auto value_out = value_cache_in.contiguous().clone();
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rope_kv_insert(e, k, v, cos, sin, positions, slot_mapping, key_out, value_out,
+                              num_tokens * num_kv_heads, num_kv_heads, block_size, D);
+  });
+  return {key_out, value_out};
+}
+
+// Long-context paged decode attention (partition/reduce). GQA/MQA aware.
+static at::Tensor paged_attention_v2_mps(
+    const at::Tensor& q_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
+    const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
+    double scale, int64_t partition_size) {
+  TORCH_CHECK(q_in.device().is_mps(), "paged_attention_v2: q must be an MPS tensor");
+  TORCH_CHECK(q_in.dim() == 3, "paged_attention_v2: q must be (B,H,D)");
+  TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
+              "paged_attention_v2: caches must be (num_blocks, block_size, num_kv_heads, D)");
+  TORCH_CHECK(key_cache_in.size(3) == q_in.size(2),
+              "paged_attention_v2: q head_size must match caches");
+  TORCH_CHECK(key_cache_in.size(2) > 0 && q_in.size(1) % key_cache_in.size(2) == 0,
+              "paged_attention_v2: num_q_heads must be a positive multiple of num_kv_heads");
+  TORCH_CHECK(q_in.scalar_type() == key_cache_in.scalar_type() &&
+                  q_in.scalar_type() == value_cache_in.scalar_type() && tk_is_float_dtype(q_in),
+              "paged_attention_v2: q/cache dtype must be float32, float16, or bfloat16");
+  TORCH_CHECK(block_table_in.scalar_type() == at::kInt && context_lens_in.scalar_type() == at::kInt,
+              "paged_attention_v2: block_table and context_lens must be int32");
+  const int B = q_in.size(0), H = q_in.size(1), D = q_in.size(2);
+  const int H_KV = key_cache_in.size(2), block_size = key_cache_in.size(1);
+  TORCH_CHECK(D == 64 || D == 128, "paged_attention_v2: head_size must be 64 or 128");
+  TORCH_CHECK(partition_size > 0 && partition_size % block_size == 0,
+              "paged_attention_v2: partition_size must be a positive multiple of block_size");
+
+  auto q = q_in.contiguous();
+  auto key_cache = key_cache_in.contiguous();
+  auto value_cache = value_cache_in.contiguous();
+  auto block_table = block_table_in.contiguous();
+  auto context_lens = context_lens_in.contiguous();
+  const int max_ctx = static_cast<int>(block_table.size(1)) * block_size;
+  const int num_partitions = std::max(1, (max_ctx + static_cast<int>(partition_size) - 1) /
+                                             static_cast<int>(partition_size));
+  auto f32 = q.options().dtype(at::kFloat);
+  auto tmp_out = at::empty({B, H, num_partitions, D}, f32);
+  auto max_logits = at::empty({B, H, num_partitions}, f32);
+  auto exp_sums = at::empty({B, H, num_partitions}, f32);
+  auto out = at::empty_like(q);
+  const float scale_f = scale > 0.0 ? static_cast<float>(scale)
+                                    : 1.0f / std::sqrt(static_cast<float>(D));
+  const std::string tn = tk_type_name(q);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_paged_attention_partition(
+        e, q, key_cache, value_cache, block_table, context_lens, tmp_out, max_logits, exp_sums,
+        B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f,
+        num_partitions, static_cast<int>(partition_size), tn);
+    tk::launch_paged_attention_reduce(
+        e, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, tn);
+  });
+  return out;
+}
+
+// MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
+static std::tuple<at::Tensor, at::Tensor> moe_route_topk_mps(const at::Tensor& logits_in, int64_t k) {
+  TORCH_CHECK(logits_in.device().is_mps(), "moe_route_topk: logits must be an MPS tensor");
+  TORCH_CHECK(logits_in.dim() == 2, "moe_route_topk: logits must be (num_tokens, num_experts)");
+  TORCH_CHECK(tk_is_float_dtype(logits_in), "moe_route_topk: logits must be float");
+  auto logits = logits_in.contiguous();
+  const int T = logits.size(0), E = logits.size(1);
+  TORCH_CHECK(k > 0 && k <= 16 && k <= E, "moe_route_topk: require 1 <= k <= min(16, num_experts)");
+  auto ids = at::empty({T, (int64_t)k}, logits.options().dtype(at::kInt));
+  auto weights = at::empty({T, (int64_t)k}, logits.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_route_topk(e, logits, ids, weights, T, E, static_cast<int>(k), tk_type_name(logits));
+  });
+  return {ids, weights};
+}
+
+// MoE permute: group T*k routing rows by expert. Returns (sorted_row_idx, offsets, inv_idx).
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_permute_mps(
+    const at::Tensor& topk_ids_in, int64_t num_experts) {
+  TORCH_CHECK(topk_ids_in.device().is_mps(), "moe_permute: topk_ids must be an MPS tensor");
+  TORCH_CHECK(topk_ids_in.dim() == 2, "moe_permute: topk_ids must be (num_tokens, k)");
+  TORCH_CHECK(num_experts > 0, "moe_permute: num_experts must be positive");
+  auto ids = topk_ids_in.to(at::kInt).contiguous();
+  const int T = ids.size(0), K = ids.size(1), TK = T * K;
+  auto opt = ids.options();
+  auto sorted = at::empty({TK}, opt);
+  auto offsets = at::empty({num_experts + 1}, opt);
+  auto inv = at::empty({TK}, opt);
+  auto counts = at::empty({num_experts}, opt);
+  auto cursor = at::empty({num_experts}, opt);
+  const int E = static_cast<int>(num_experts);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_zero_i32(e, counts, E);
+    tk::launch_moe_histogram(e, ids, counts, TK);
+    tk::launch_moe_scan_offsets(e, counts, offsets, cursor, E);
+    tk::launch_moe_scatter(e, ids, cursor, sorted, inv, TK);
+  });
+  return {sorted, offsets, inv};
+}
+
+// MoE finalize: out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim).
+static at::Tensor moe_finalize_mps(const at::Tensor& expert_out_in, const at::Tensor& inv_in,
+                                   const at::Tensor& w_in, int64_t k) {
+  TORCH_CHECK(expert_out_in.device().is_mps(), "moe_finalize: expert_out must be an MPS tensor");
+  TORCH_CHECK(expert_out_in.dim() == 2, "moe_finalize: expert_out must be (T*k, Hdim)");
+  TORCH_CHECK(tk_is_float_dtype(expert_out_in), "moe_finalize: expert_out must be float");
+  auto eo = expert_out_in.contiguous();
+  auto inv = inv_in.to(at::kInt).contiguous();
+  auto w = w_in.to(at::kFloat).contiguous();
+  const int T = w.size(0), Hdim = eo.size(1);
+  auto out = at::empty({T, Hdim}, eo.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_finalize(e, eo, inv, w, out, T, static_cast<int>(k), Hdim, tk_type_name(eo));
+  });
+  return out;
+}
+
+// Greedy sampling: argmax token index over the last (vocab) axis. Returns int32.
+static at::Tensor argmax_sample_mps(const at::Tensor& logits_in) {
+  TORCH_CHECK(logits_in.device().is_mps(), "argmax_sample: logits must be an MPS tensor");
+  TORCH_CHECK(tk_is_float_dtype(logits_in), "argmax_sample: logits must be float32/float16/bfloat16");
+  auto logits = logits_in.contiguous();
+  const int V = logits.size(-1);
+  const int rows = static_cast<int>(logits.numel() / V);
+  std::vector<int64_t> oshape(logits.sizes().begin(), logits.sizes().end() - 1);
+  if (oshape.empty()) oshape.push_back(1);
+  auto out = at::empty(oshape, logits.options().dtype(at::kInt));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_argmax(e, logits, out, rows, V, tk_type_name(logits));
+  });
+  return out;
+}
+
+// Gumbel-max categorical sampling from softmax(logits/temperature). Returns int32.
+static at::Tensor sample_categorical_mps(const at::Tensor& logits_in, double temperature,
+                                         int64_t seed) {
+  TORCH_CHECK(logits_in.device().is_mps(), "sample_categorical: logits must be an MPS tensor");
+  TORCH_CHECK(tk_is_float_dtype(logits_in), "sample_categorical: logits must be float");
+  TORCH_CHECK(temperature > 0.0, "sample_categorical: temperature must be > 0");
+  auto logits = logits_in.contiguous();
+  const int V = logits.size(-1);
+  const int rows = static_cast<int>(logits.numel() / V);
+  std::vector<int64_t> oshape(logits.sizes().begin(), logits.sizes().end() - 1);
+  if (oshape.empty()) oshape.push_back(1);
+  auto out = at::empty(oshape, logits.options().dtype(at::kInt));
+  const uint32_t seed_u = static_cast<uint32_t>(seed);
+  const float invtemp = 1.0f / static_cast<float>(temperature);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_sample_categorical(e, logits, out, rows, V, seed_u, invtemp, tk_type_name(logits));
+  });
+  return out;
+}
+
+// Top-k sampling: Gumbel-max from softmax over the k highest logits. Returns int32.
+static at::Tensor top_k_sample_mps(const at::Tensor& logits_in, int64_t k, double temperature,
+                                   int64_t seed) {
+  TORCH_CHECK(logits_in.device().is_mps(), "top_k_sample: logits must be an MPS tensor");
+  TORCH_CHECK(tk_is_float_dtype(logits_in), "top_k_sample: logits must be float");
+  TORCH_CHECK(temperature > 0.0, "top_k_sample: temperature must be > 0");
+  auto logits = logits_in.contiguous();
+  const int V = logits.size(-1);
+  TORCH_CHECK(k > 0 && k <= 64 && k <= V, "top_k_sample: require 1 <= k <= min(64, vocab)");
+  const int rows = static_cast<int>(logits.numel() / V);
+  std::vector<int64_t> oshape(logits.sizes().begin(), logits.sizes().end() - 1);
+  if (oshape.empty()) oshape.push_back(1);
+  auto out = at::empty(oshape, logits.options().dtype(at::kInt));
+  const uint32_t seed_u = static_cast<uint32_t>(seed);
+  const float invtemp = 1.0f / static_cast<float>(temperature);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_top_k_sample(e, logits, out, rows, V, static_cast<int>(k), seed_u, invtemp,
+                            tk_type_name(logits));
+  });
+  return out;
+}
+
+// Temperature + repetition/presence/frequency penalties. Returns the penalized logits.
+static at::Tensor apply_penalty_mps(const at::Tensor& logits_in, const at::Tensor& prev_in,
+                                    double temperature, double repetition_penalty,
+                                    double presence_penalty, double frequency_penalty) {
+  TORCH_CHECK(logits_in.device().is_mps(), "apply_penalty: logits must be an MPS tensor");
+  TORCH_CHECK(logits_in.dim() == 2, "apply_penalty: logits must be (num_tokens, vocab)");
+  TORCH_CHECK(tk_is_float_dtype(logits_in), "apply_penalty: logits must be float");
+  TORCH_CHECK(prev_in.dim() == 2 && prev_in.size(0) == logits_in.size(0),
+              "apply_penalty: prev_tokens must be (num_tokens, history_len)");
+  TORCH_CHECK(temperature > 0.0, "apply_penalty: temperature must be > 0");
+  auto logits = logits_in.contiguous();
+  auto prev = prev_in.to(at::kInt).contiguous();
+  const int T = logits.size(0), V = logits.size(1), L = prev.size(1);
+  auto out = at::empty_like(logits);
+  auto counts = at::empty({T, V}, logits.options().dtype(at::kInt));
+  const float invtemp = 1.0f / static_cast<float>(temperature);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_zero_i32(e, counts, T * V);
+    tk::launch_penalty_histogram(e, prev, counts, V, L, T * L);
+    tk::launch_apply_penalty(e, logits, counts, out, T, V, invtemp,
+                             static_cast<float>(repetition_penalty),
+                             static_cast<float>(presence_penalty),
+                             static_cast<float>(frequency_penalty), tk_type_name(logits));
+  });
+  return out;
+}
+
+// Top-p (nucleus) sampling. Returns int32.
+static at::Tensor top_p_sample_mps(const at::Tensor& logits_in, double p, double temperature,
+                                   int64_t seed) {
+  TORCH_CHECK(logits_in.device().is_mps(), "top_p_sample: logits must be an MPS tensor");
+  TORCH_CHECK(tk_is_float_dtype(logits_in), "top_p_sample: logits must be float");
+  TORCH_CHECK(temperature > 0.0, "top_p_sample: temperature must be > 0");
+  TORCH_CHECK(p > 0.0 && p <= 1.0, "top_p_sample: p must be in (0, 1]");
+  auto logits = logits_in.contiguous();
+  const int V = logits.size(-1);
+  const int rows = static_cast<int>(logits.numel() / V);
+  std::vector<int64_t> oshape(logits.sizes().begin(), logits.sizes().end() - 1);
+  if (oshape.empty()) oshape.push_back(1);
+  auto out = at::empty(oshape, logits.options().dtype(at::kInt));
+  const uint32_t seed_u = static_cast<uint32_t>(seed);
+  const float invtemp = 1.0f / static_cast<float>(temperature);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_top_p_sample(e, logits, out, rows, V, static_cast<float>(p), seed_u, invtemp,
+                            tk_type_name(logits));
+  });
+  return out;
+}
+
+// Runtime per-row fp8 e4m3 quantization. Returns (codes uint8, scale f32).
+static std::tuple<at::Tensor, at::Tensor> quantize_per_token_fp8_mps(const at::Tensor& x_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "quantize_per_token_fp8: x must be an MPS tensor");
+  TORCH_CHECK(tk_is_float_dtype(x_in), "quantize_per_token_fp8: x must be float32/float16/bfloat16");
+  auto x = x_in.contiguous();
+  const int D = x.size(-1);
+  const int rows = static_cast<int>(x.numel() / D);
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kByte));
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end() - 1);
+  if (sshape.empty()) sshape.push_back(1);
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_quantize_per_token_fp8(e, x, codes, scale, rows, D, tk_type_name(x));
+  });
+  return {codes, scale};
+}
+
+// Runtime per-row symmetric int8 quantization. Returns (codes int8, scale f32).
+static std::tuple<at::Tensor, at::Tensor> quantize_per_token_int8_mps(const at::Tensor& x_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "quantize_per_token_int8: x must be an MPS tensor");
+  TORCH_CHECK(tk_is_float_dtype(x_in), "quantize_per_token_int8: x must be float32/float16/bfloat16");
+  auto x = x_in.contiguous();
+  const int D = x.size(-1);
+  const int rows = static_cast<int>(x.numel() / D);
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kChar));
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end() - 1);
+  if (sshape.empty()) sshape.push_back(1);
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_quantize_per_token_int8(e, x, codes, scale, rows, D, tk_type_name(x));
+  });
+  return {codes, scale};
 }
 
 static at::Tensor attn_causal_mps(const at::Tensor& q_in, const at::Tensor& k_in,
@@ -868,6 +1249,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("matmul_custom", &matmul_custom_mps, "ThunderMittens matmul_custom GEMM (MPS)");
   m.def("attn_fwd", &attn_fwd_mps, "ThunderMittens attention forward (MPS)");
   m.def("rms_norm", &rms_norm_mps, "ThunderMittens RMSNorm (MPS)");
+  m.def("rms_norm_add", &rms_norm_add_mps, "ThunderMittens fused residual-add + RMSNorm (MPS)");
+  m.def("layernorm_add", &layernorm_add_mps, "ThunderMittens fused residual-add + LayerNorm (MPS)");
   m.def("softmax", &softmax_mps, "ThunderMittens softmax (MPS)");
   m.def("rotary", &rotary_mps, "ThunderMittens rotary/RoPE (MPS)");
   m.def("gelu", &gelu_mps, "ThunderMittens GELU (MPS)");
@@ -878,6 +1261,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("kv_cache_copy_blocks", &kv_cache_copy_blocks_mps, "ThunderMittens KV cache block copy (MPS)");
   m.def("kv_cache_scales", &kv_cache_scales_mps, "ThunderMittens KV cache fp8 scales (MPS)");
   m.def("paged_attention", &paged_attention_mps, "ThunderMittens paged decode attention (MPS)");
+  m.def("kv_cache_scatter_fp8", &kv_cache_scatter_fp8_mps, "ThunderMittens fp8 KV cache scatter (MPS)");
+  m.def("paged_attention_fp8", &paged_attention_fp8_mps, "ThunderMittens fp8 paged attention (MPS)");
+  m.def("rope_kv_insert", &rope_kv_insert_mps, "ThunderMittens fused RoPE + paged-KV insert (MPS)");
+  m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)");
+  m.def("moe_route_topk", &moe_route_topk_mps, "ThunderMittens MoE top-k routing (MPS)");
+  m.def("moe_permute", &moe_permute_mps, "ThunderMittens MoE permute (MPS)");
+  m.def("moe_finalize", &moe_finalize_mps, "ThunderMittens MoE finalize reduce (MPS)");
+  m.def("argmax_sample", &argmax_sample_mps, "ThunderMittens greedy argmax sampling (MPS)");
+  m.def("sample_categorical", &sample_categorical_mps, "ThunderMittens Gumbel-max sampling (MPS)");
+  m.def("top_k_sample", &top_k_sample_mps, "ThunderMittens top-k sampling (MPS)");
+  m.def("top_p_sample", &top_p_sample_mps, "ThunderMittens top-p nucleus sampling (MPS)");
+  m.def("apply_penalty", &apply_penalty_mps, "ThunderMittens logit penalties (MPS)");
+  m.def("quantize_per_token_fp8", &quantize_per_token_fp8_mps, "ThunderMittens per-row fp8 quant (MPS)");
+  m.def("quantize_per_token_int8", &quantize_per_token_int8_mps, "ThunderMittens per-row int8 quant (MPS)");
   m.def("attn_causal", &attn_causal_mps, "ThunderMittens causal attention (MPS)");
   m.def("flux_gelu", &flux_gelu_mps, "ThunderMittens fused GEMM+GELU (MPS)");
   m.def("flux_gate", &flux_gate_mps, "ThunderMittens fused GEMM+gate+residual (MPS)");

@@ -61,6 +61,12 @@
 #include "matmul_custom/matmul_custom.h"
 #include "layernorm/layernorm.h"
 #include "rms_norm/rms_norm.h"
+#include "add_norm/add_norm.h"
+#include "rope_kv/rope_kv.h"
+#include "paged_attn_v2/paged_attn_v2.h"
+#include "quant_rt/quant_rt.h"
+#include "sampling/sampling.h"
+#include "moe/moe.h"
 #include "softmax/softmax.h"
 #include "rotary/rotary.h"
 #include "gelu/gelu.h"
@@ -151,6 +157,187 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         rms_norm over the last axis: x * rsqrt(mean(x^2) + eps) * weight
+      )");
+
+    m.def(
+      "rms_norm_add",
+      &rms_norm_add,
+      "x"_a,
+      "residual"_a,
+      "weight"_a,
+      nb::kw_only(),
+      "eps"_a = 1e-5f,
+      "stream"_a = nb::none(),
+      R"(
+        fused residual-add + rms_norm. Returns (out, x+residual):
+        out = rms_norm(x + residual) * weight
+      )");
+
+    m.def(
+      "layernorm_add",
+      &layernorm_add,
+      "x"_a,
+      "residual"_a,
+      "weight"_a,
+      "bias"_a,
+      nb::kw_only(),
+      "eps"_a = 1e-5f,
+      "stream"_a = nb::none(),
+      R"(
+        fused residual-add + layernorm. Returns (out, x+residual):
+        out = layernorm(x + residual) * weight + bias
+      )");
+
+    m.def(
+      "rope_kv_insert",
+      &rope_kv_insert,
+      "k"_a,
+      "v"_a,
+      "cos"_a,
+      "sin"_a,
+      "positions"_a,
+      "slot_mapping"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        fused RoPE (split-half) on K + paged-KV insert. Returns (key_cache, value_cache).
+      )");
+
+    m.def(
+      "paged_attention_v2",
+      &paged_attention_v2,
+      "q"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      nb::kw_only(),
+      "scale"_a = 0.0f,
+      "partition_size"_a = 512,
+      "stream"_a = nb::none(),
+      R"(
+        long-context paged decode attention (partition/reduce). GQA/MQA aware.
+      )");
+
+    m.def(
+      "moe_route_topk",
+      &moe_route_topk,
+      "logits"_a,
+      "k"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
+      )");
+
+    m.def(
+      "moe_permute",
+      &moe_permute,
+      "topk_ids"_a,
+      "num_experts"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        MoE permute: group T*k routing rows by expert. Returns
+        [sorted_row_idx, offsets, inv_idx, counts(scratch), cursor(scratch)] (int32).
+      )");
+
+    m.def(
+      "moe_finalize",
+      &moe_finalize,
+      "expert_out"_a,
+      "inv_idx"_a,
+      "topk_weights"_a,
+      "k"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        MoE finalize: out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim).
+      )");
+
+    m.def(
+      "argmax_sample",
+      &argmax_sample,
+      "logits"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        greedy sampling: argmax token index over the last (vocab) axis. Returns int32.
+      )");
+
+    m.def(
+      "sample_categorical",
+      &sample_categorical,
+      "logits"_a,
+      nb::kw_only(),
+      "temperature"_a = 1.0f,
+      "seed"_a = 0u,
+      "stream"_a = nb::none(),
+      R"(
+        Gumbel-max categorical sampling from softmax(logits/temperature). Returns int32.
+      )");
+
+    m.def(
+      "top_k_sample",
+      &top_k_sample,
+      "logits"_a,
+      "k"_a,
+      nb::kw_only(),
+      "temperature"_a = 1.0f,
+      "seed"_a = 0u,
+      "stream"_a = nb::none(),
+      R"(
+        top-k sampling: Gumbel-max from softmax over the k highest logits. Returns int32.
+      )");
+
+    m.def(
+      "top_p_sample",
+      &top_p_sample,
+      "logits"_a,
+      "p"_a,
+      nb::kw_only(),
+      "temperature"_a = 1.0f,
+      "seed"_a = 0u,
+      "stream"_a = nb::none(),
+      R"(
+        top-p (nucleus) sampling: Gumbel-max from the smallest top-prob set with mass >= p. Returns int32.
+      )");
+
+    m.def(
+      "apply_penalty",
+      &apply_penalty,
+      "logits"_a,
+      "prev_tokens"_a,
+      nb::kw_only(),
+      "temperature"_a = 1.0f,
+      "repetition_penalty"_a = 1.0f,
+      "presence_penalty"_a = 0.0f,
+      "frequency_penalty"_a = 0.0f,
+      "stream"_a = nb::none(),
+      R"(
+        temperature + repetition/presence/frequency penalties. Returns [penalized, counts]; use [0].
+      )");
+
+    m.def(
+      "quantize_per_token_fp8",
+      &quantize_per_token_fp8,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        per-row fp8 e4m3 quantization. Returns (codes uint8, scale f32) with scale=absmax/448.
+      )");
+
+    m.def(
+      "quantize_per_token_int8",
+      &quantize_per_token_int8,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        per-row symmetric int8 quantization. Returns (codes int8, scale f32) with scale=absmax/127.
       )");
 
     m.def(
@@ -274,6 +461,39 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         decode paged attention over caches shaped (num_blocks, block_size, H, D)
+      )");
+
+    m.def(
+      "kv_cache_scatter_fp8",
+      &kv_cache_scatter_fp8,
+      "key"_a,
+      "value"_a,
+      "slot_mapping"_a,
+      "num_blocks"_a,
+      "block_size"_a,
+      "k_scale"_a,
+      "v_scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        scatter K/V into a uint8 (e4m3) paged cache with per-tensor scales. Returns (kc, vc).
+      )");
+
+    m.def(
+      "paged_attention_fp8",
+      &paged_attention_fp8,
+      "q"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      "k_scale"_a,
+      "v_scale"_a,
+      "scale"_a = 0.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        decode paged attention over fp8 (uint8 e4m3) caches, dequantized on read. GQA aware.
       )");
 
     m.def(

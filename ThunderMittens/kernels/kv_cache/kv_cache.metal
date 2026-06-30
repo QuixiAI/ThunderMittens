@@ -183,12 +183,16 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
                             constant int &block_table_stride [[buffer(7)]],
                             constant float &scale [[buffer(8)]],
                             constant int &num_heads [[buffer(9)]],
+                            constant int &num_kv_heads [[buffer(10)]],
                             uint3 tgid [[threadgroup_position_in_grid]],
                             uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
 
-    const int head = (int)tgid.x;
+    const int head = (int)tgid.x;       // query head (grid x ranges over num_heads)
     const int batch = (int)tgid.y;
+    // GQA/MQA: each KV head is shared by (num_heads / num_kv_heads) query heads.
+    // When num_kv_heads == num_heads this is plain MHA (kv_head == head).
+    const int kv_head = head / (num_heads / num_kv_heads);
     const int context_len = context_lens[batch];
     const long row_base = ((long)batch * num_heads + head) * D;
 
@@ -212,7 +216,7 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
         }
 
         const long cache_base =
-            (((long)block * block_size + slot) * num_heads + head) * D;
+            (((long)block * block_size + slot) * num_kv_heads + kv_head) * D;
         float partial = 0.0f;
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             const int d = (int)lane + 32 * i;
@@ -237,6 +241,151 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
         out[row_base + d] = l == 0.0f ? T(0) : T(acc[i] / l);
     }
 }
+
+// --- fp8 KV cache: store e4m3 codes (uint8) with per-tensor K/V scales. ---
+
+kernel void kv_cache_zero_u8(device uchar *key_cache [[buffer(0)]],
+                             device uchar *value_cache [[buffer(1)]],
+                             constant ulong &n [[buffer(2)]],
+                             uint tid [[thread_position_in_grid]]) {
+    if ((ulong)tid >= n) { return; }
+    key_cache[tid] = 0;     // e4m3(0) == 0x00
+    value_cache[tid] = 0;
+}
+
+template <typename T>
+kernel void kv_cache_scatter_fp8(device const T *key [[buffer(0)]],
+                                 device const T *value [[buffer(1)]],
+                                 device const long *slot_mapping [[buffer(2)]],
+                                 device uchar *key_cache [[buffer(3)]],
+                                 device uchar *value_cache [[buffer(4)]],
+                                 constant int &num_heads [[buffer(5)]],
+                                 constant int &head_size [[buffer(6)]],
+                                 constant int &block_size [[buffer(7)]],
+                                 constant float &k_scale [[buffer(8)]],
+                                 constant float &v_scale [[buffer(9)]],
+                                 uint token [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_position_in_threadgroup]],
+                                 uint tptg [[threads_per_threadgroup]]) {
+    const long slot = slot_mapping[token];
+    if (slot < 0) { return; }
+    const long block = slot / block_size;
+    const long block_offset = slot % block_size;
+    const int row_elems = num_heads * head_size;
+    const long src_base = (long)token * row_elems;
+    const long dst_base = ((block * block_size + block_offset) * num_heads) * head_size;
+    const float inv_k = k_scale > 0.0f ? 1.0f / k_scale : 0.0f;
+    const float inv_v = v_scale > 0.0f ? 1.0f / v_scale : 0.0f;
+    for (int i = (int)tid; i < row_elems; i += (int)tptg) {
+        key_cache[dst_base + i] = tk_e4m3_encode(float(key[src_base + i]) * inv_k);
+        value_cache[dst_base + i] = tk_e4m3_encode(float(value[src_base + i]) * inv_v);
+    }
+}
+
+template <typename T, int D>
+kernel void paged_attention_fp8(device const T *q [[buffer(0)]],
+                                device const uchar *key_cache [[buffer(1)]],
+                                device const uchar *value_cache [[buffer(2)]],
+                                device const int *block_table [[buffer(3)]],
+                                device const int *context_lens [[buffer(4)]],
+                                device T *out [[buffer(5)]],
+                                constant int &block_size [[buffer(6)]],
+                                constant int &block_table_stride [[buffer(7)]],
+                                constant float &scale [[buffer(8)]],
+                                constant int &num_heads [[buffer(9)]],
+                                constant int &num_kv_heads [[buffer(10)]],
+                                constant float &k_scale [[buffer(11)]],
+                                constant float &v_scale [[buffer(12)]],
+                                uint3 tgid [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int VALUES_PER_LANE = D / 32;
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int kv_head = head / (num_heads / num_kv_heads);
+    const int context_len = context_lens[batch];
+    const long row_base = ((long)batch * num_heads + head) * D;
+
+    float qv[VALUES_PER_LANE], acc[VALUES_PER_LANE];
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        qv[i] = float(q[row_base + d]);
+        acc[i] = 0.0f;
+    }
+    float m = -3.4028234663852886e38f, l = 0.0f;
+
+    for (int t = 0; t < context_len; ++t) {
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) { continue; }
+        const long cache_base =
+            (((long)block * block_size + slot) * num_kv_heads + kv_head) * D;
+        float partial = 0.0f;
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            partial += qv[i] * (float(tk_e4m3_decode(key_cache[cache_base + d])) * k_scale);
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            acc[i] = acc[i] * alpha + beta * (float(tk_e4m3_decode(value_cache[cache_base + d])) * v_scale);
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        out[row_base + d] = l == 0.0f ? T(0) : T(acc[i] / l);
+    }
+}
+
+#define instantiate_kv_cache_scatter_fp8(type_name, T)                        \
+  template [[host_name("kv_cache_scatter_fp8_" #type_name)]] [[kernel]] void  \
+  kv_cache_scatter_fp8<T>(device const T *key [[buffer(0)]],                  \
+                          device const T *value [[buffer(1)]],                \
+                          device const long *slot_mapping [[buffer(2)]],      \
+                          device uchar *key_cache [[buffer(3)]],              \
+                          device uchar *value_cache [[buffer(4)]],            \
+                          constant int &num_heads [[buffer(5)]],              \
+                          constant int &head_size [[buffer(6)]],              \
+                          constant int &block_size [[buffer(7)]],             \
+                          constant float &k_scale [[buffer(8)]],              \
+                          constant float &v_scale [[buffer(9)]],              \
+                          uint token [[threadgroup_position_in_grid]],        \
+                          uint tid [[thread_position_in_threadgroup]],        \
+                          uint tptg [[threads_per_threadgroup]]);
+
+#define instantiate_paged_attention_fp8(type_name, T, DVAL)                   \
+  template [[host_name("paged_attention_fp8_" #type_name "_" #DVAL)]]         \
+  [[kernel]] void paged_attention_fp8<T, DVAL>(                               \
+      device const T *q [[buffer(0)]],                                        \
+      device const uchar *key_cache [[buffer(1)]],                            \
+      device const uchar *value_cache [[buffer(2)]],                          \
+      device const int *block_table [[buffer(3)]],                            \
+      device const int *context_lens [[buffer(4)]],                          \
+      device T *out [[buffer(5)]],                                            \
+      constant int &block_size [[buffer(6)]],                                 \
+      constant int &block_table_stride [[buffer(7)]],                         \
+      constant float &scale [[buffer(8)]],                                    \
+      constant int &num_heads [[buffer(9)]],                                  \
+      constant int &num_kv_heads [[buffer(10)]],                             \
+      constant float &k_scale [[buffer(11)]],                                 \
+      constant float &v_scale [[buffer(12)]],                                 \
+      uint3 tgid [[threadgroup_position_in_grid]],                            \
+      uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_kv_cache_scatter_fp8(float32, float)
+instantiate_kv_cache_scatter_fp8(float16, half)
+instantiate_kv_cache_scatter_fp8(bfloat16, bf16)
+instantiate_paged_attention_fp8(float32, float, 64)
+instantiate_paged_attention_fp8(float32, float, 128)
+instantiate_paged_attention_fp8(float16, half, 64)
+instantiate_paged_attention_fp8(float16, half, 128)
+instantiate_paged_attention_fp8(bfloat16, bf16, 64)
+instantiate_paged_attention_fp8(bfloat16, bf16, 128)
 
 #define instantiate_kv_cache_type(type_name, T)                               \
   template [[host_name("kv_cache_zero_" #type_name)]] [[kernel]] void        \
@@ -308,6 +457,7 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
       constant int &block_table_stride [[buffer(7)]],                        \
       constant float &scale [[buffer(8)]],                                   \
       constant int &num_heads [[buffer(9)]],                                 \
+      constant int &num_kv_heads [[buffer(10)]],                             \
       uint3 tgid [[threadgroup_position_in_grid]],                           \
       uint lane [[thread_index_in_simdgroup]]);
 

@@ -26,12 +26,18 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "matmul_custom", "matmul_custom.metal"),
     os.path.join(_KERNELS, "layernorm", "layernorm.metal"),
     os.path.join(_KERNELS, "rms_norm", "rms_norm.metal"),
+    os.path.join(_KERNELS, "add_norm", "add_norm.metal"),
     os.path.join(_KERNELS, "softmax", "softmax.metal"),
     os.path.join(_KERNELS, "rotary", "rotary.metal"),
+    os.path.join(_KERNELS, "rope_kv", "rope_kv.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "glu", "glu.metal"),
     os.path.join(_KERNELS, "hadamard", "hadamard.metal"),
     os.path.join(_KERNELS, "kv_cache", "kv_cache.metal"),
+    os.path.join(_KERNELS, "paged_attn_v2", "paged_attn_v2.metal"),
+    os.path.join(_KERNELS, "quant_rt", "quant_rt.metal"),
+    os.path.join(_KERNELS, "sampling", "sampling.metal"),
+    os.path.join(_KERNELS, "moe", "moe.metal"),
     os.path.join(_KERNELS, "attn_causal", "attn_causal.metal"),
     os.path.join(_KERNELS, "flux", "flux.metal"),
     os.path.join(_KERNELS, "gemm_staged", "gemm_staged.metal"),
@@ -118,6 +124,17 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
     return _ext.rms_norm(x, weight, float(eps))
 
 
+def rms_norm_add(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
+    """Fused residual-add + RMSNorm. Returns (out, x+residual). bf16 MPS; D in {256,512,768,1024}."""
+    return _ext.rms_norm_add(x, residual, weight, float(eps))
+
+
+def layernorm_add(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+                  bias: torch.Tensor, eps: float = 1e-5):
+    """Fused residual-add + LayerNorm. Returns (out, x+residual). bf16 MPS; D in {256,512,768,1024}."""
+    return _ext.layernorm_add(x, residual, weight, bias, float(eps))
+
+
 def softmax(x: torch.Tensor):
     """Softmax over the last axis. bf16 MPS tensors; D in {256,512,768,1024}."""
     return _ext.softmax(x)
@@ -126,6 +143,17 @@ def softmax(x: torch.Tensor):
 def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     """RoPE (split-half). x bf16 (B,H,N,D); cos/sin bf16 (N,D/2); D in {64,128}."""
     return _ext.rotary(x, cos, sin)
+
+
+def rope_kv_insert(k: torch.Tensor, v: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                   positions: torch.Tensor, slot_mapping: torch.Tensor,
+                   key_cache: torch.Tensor, value_cache: torch.Tensor):
+    """Fused RoPE on K + paged-KV insert. Returns updated (key_cache, value_cache).
+
+    k/v bf16 (num_tokens, num_kv_heads, D); cos/sin (P, D/2); positions/slot_mapping
+    (num_tokens,); caches (num_blocks, block_size, num_kv_heads, D) bf16; D in {64,128}.
+    """
+    return _ext.rope_kv_insert(k, v, cos, sin, positions, slot_mapping, key_cache, value_cache)
 
 
 def gelu(x: torch.Tensor):
@@ -197,9 +225,85 @@ def paged_attention(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch
     return _ext.paged_attention(q, key_cache, value_cache, block_table, context_lens, float(scale))
 
 
+def kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size, k_scale, v_scale):
+    """Scatter K/V into a uint8 (e4m3) paged cache with per-tensor scales. Returns (kc, vc). MPS."""
+    return _ext.kv_cache_scatter_fp8(key, value, slot_mapping, int(num_blocks), int(block_size),
+                                     float(k_scale), float(v_scale))
+
+
+def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
+                        k_scale, v_scale, scale=0.0):
+    """Decode paged attention over fp8 (uint8 e4m3) caches, dequantized on read. GQA aware. MPS."""
+    return _ext.paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
+                                    float(k_scale), float(v_scale), float(scale))
+
+
 def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     """Causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""
     return _ext.attn_causal(q, k, v)
+
+
+def paged_attention_v2(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
+                       block_table: torch.Tensor, context_lens: torch.Tensor,
+                       scale: float = 0.0, partition_size: int = 512):
+    """Long-context paged decode attention (partition/reduce). GQA/MQA aware.
+    q/out (B,H,D); caches (num_blocks, block_size, num_kv_heads, D); D in {64,128}."""
+    return _ext.paged_attention_v2(q, key_cache, value_cache, block_table, context_lens,
+                                   float(scale), int(partition_size))
+
+
+def moe_route_topk(logits: torch.Tensor, k: int):
+    """MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
+    logits (num_tokens, num_experts) float; k <= min(16, num_experts). MPS."""
+    return _ext.moe_route_topk(logits, int(k))
+
+
+def moe_permute(topk_ids: torch.Tensor, num_experts: int):
+    """Group T*k routing rows by expert. Returns (sorted_row_idx, offsets, inv_idx) int32. MPS."""
+    return _ext.moe_permute(topk_ids, int(num_experts))
+
+
+def moe_finalize(expert_out: torch.Tensor, inv_idx: torch.Tensor, topk_weights: torch.Tensor, k: int):
+    """out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim). MPS."""
+    return _ext.moe_finalize(expert_out, inv_idx, topk_weights, int(k))
+
+
+def argmax_sample(logits: torch.Tensor):
+    """Greedy sampling: argmax token index over the last (vocab) axis. Returns int32. MPS."""
+    return _ext.argmax_sample(logits)
+
+
+def sample_categorical(logits: torch.Tensor, temperature: float = 1.0, seed: int = 0):
+    """Gumbel-max categorical sampling from softmax(logits/temperature). Returns int32. MPS."""
+    return _ext.sample_categorical(logits, float(temperature), int(seed))
+
+
+def top_k_sample(logits: torch.Tensor, k: int, temperature: float = 1.0, seed: int = 0):
+    """Top-k sampling: Gumbel-max from softmax over the k highest logits. Returns int32. MPS."""
+    return _ext.top_k_sample(logits, int(k), float(temperature), int(seed))
+
+
+def top_p_sample(logits: torch.Tensor, p: float, temperature: float = 1.0, seed: int = 0):
+    """Top-p (nucleus) sampling: Gumbel-max from the smallest top-prob set with mass >= p. int32. MPS."""
+    return _ext.top_p_sample(logits, float(p), float(temperature), int(seed))
+
+
+def apply_penalty(logits: torch.Tensor, prev_tokens: torch.Tensor, temperature: float = 1.0,
+                  repetition_penalty: float = 1.0, presence_penalty: float = 0.0,
+                  frequency_penalty: float = 0.0):
+    """Temperature + repetition/presence/frequency penalties. Returns penalized logits (T,V). MPS."""
+    return _ext.apply_penalty(logits, prev_tokens, float(temperature), float(repetition_penalty),
+                              float(presence_penalty), float(frequency_penalty))
+
+
+def quantize_per_token_fp8(x: torch.Tensor):
+    """Per-row fp8 e4m3 quant. Returns (codes uint8, scale f32), scale=absmax/448. MPS, x float."""
+    return _ext.quantize_per_token_fp8(x)
+
+
+def quantize_per_token_int8(x: torch.Tensor):
+    """Per-row symmetric int8 quant. Returns (codes int8, scale f32), scale=absmax/127. MPS, x float."""
+    return _ext.quantize_per_token_int8(x)
 
 
 def flux_gelu(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor):

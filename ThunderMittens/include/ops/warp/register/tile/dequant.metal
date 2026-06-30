@@ -285,6 +285,76 @@ METAL_FUNC half tk_e5m2_decode(uchar v) {
                         : (1.0h + half(m) * 0.25h) * metal::exp2(half((int)e - 15));
     return ((v >> 7) & 1) ? -val : val;
 }
+
+// --- Quantize/pack: round-to-nearest float -> fp8 / int8 codes (inverse of the
+//     decoders above; standard OCP layouts so tk_e4m3_decode/tk_e5m2_decode invert them). ---
+
+// float -> e4m3 (1-4-3, bias 7, max finite 448). NaN/overflow clamp to ±448 (0x7E).
+METAL_FUNC uchar tk_e4m3_encode(float x) {
+    const uint sign = (x < 0.0f) ? 0x80u : 0x00u;
+    float a = metal::fabs(x);
+    if (a >= 448.0f) {
+        return uchar(sign | 0x7Eu);              // clamp to max finite
+    }
+    if (!(a > 1.52587890625e-05f)) {             // < 2^-16 (half the smallest subnormal 2^-9? guard) -> 0
+        // smallest e4m3 subnormal is 2^-9; round-to-zero below 2^-10
+        if (a < 9.765625e-04f) {                 // 2^-10
+            return uchar(sign);
+        }
+    }
+    int e;
+    float m = metal::frexp(a, e);               // a = m * 2^e, m in [0.5,1)
+    (void)m;
+    int E = e - 1;                               // a = (a/2^E) * 2^E, a/2^E in [1,2)
+    if (E < -6) {
+        int mant = int(metal::round(a * 512.0f)); // a / 2^-9
+        if (mant <= 0) return uchar(sign);
+        if (mant >= 8) return uchar(sign | (1u << 3)); // promote to smallest normal
+        return uchar(sign | uint(mant));
+    }
+    float two_m = a / metal::ldexp(1.0f, E);     // in [1,2)
+    int mant = int(metal::round((two_m - 1.0f) * 8.0f));
+    int exp = E + 7;
+    if (mant >= 8) { mant = 0; exp += 1; }
+    if (exp >= 15 && mant >= 7) return uchar(sign | 0x7Eu);
+    if (exp > 15) return uchar(sign | 0x7Eu);
+    return uchar(sign | (uint(exp) << 3) | uint(mant));
+}
+
+// float -> e5m2 (1-5-2, bias 15, max finite 57344). Overflow clamp to ±57344 (0x7B).
+METAL_FUNC uchar tk_e5m2_encode(float x) {
+    const uint sign = (x < 0.0f) ? 0x80u : 0x00u;
+    float a = metal::fabs(x);
+    if (a >= 57344.0f) {
+        return uchar(sign | 0x7Bu);
+    }
+    if (a < 3.0517578125e-05f / 2.0f) {          // < 2^-16 (half smallest subnormal) -> 0
+        return uchar(sign);
+    }
+    int e;
+    float m = metal::frexp(a, e);
+    (void)m;
+    int E = e - 1;
+    if (E < -14) {
+        int mant = int(metal::round(a * 65536.0f)); // a / 2^-16
+        if (mant <= 0) return uchar(sign);
+        if (mant >= 4) return uchar(sign | (1u << 2));
+        return uchar(sign | uint(mant));
+    }
+    float two_m = a / metal::ldexp(1.0f, E);
+    int mant = int(metal::round((two_m - 1.0f) * 4.0f));
+    int exp = E + 15;
+    if (mant >= 4) { mant = 0; exp += 1; }
+    if (exp >= 31) return uchar(sign | 0x7Bu);
+    return uchar(sign | (uint(exp) << 2) | uint(mant));
+}
+
+// float -> symmetric int8 in [-127, 127] (round to nearest, clamp). Returns as uchar bits.
+METAL_FUNC char tk_int8_encode(float x) {
+    float r = metal::round(x);
+    r = metal::clamp(r, -127.0f, 127.0f);
+    return char(int(r));
+}
 // fp6 e3m2 (1-3-2, bias 3): 6-bit code, sign at bit 5.
 METAL_FUNC half tk_e3m2_decode(uint c) {
     const uint e = (c >> 2) & 0x7;

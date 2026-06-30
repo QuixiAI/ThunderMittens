@@ -22,6 +22,8 @@ class Hedgehog : public Primitive {
                          const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(
       const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "Hedgehog"; }
+
   void print(std::ostream& os) override { os << "Hedgehog"; }
   bool is_equivalent(const Primitive& other) const override;
   void eval(const std::vector<array>&, std::vector<array>&);

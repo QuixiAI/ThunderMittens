@@ -58,6 +58,8 @@ class LayerNorm : public Primitive {
       const std::vector<int>& axes) override;
 
   /** Print the primitive. */
+  const char* name() const { return "LayerNorm"; }
+
   void print(std::ostream& os) override {
     os << "LayerNorm";
   }

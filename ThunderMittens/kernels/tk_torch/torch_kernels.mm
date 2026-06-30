@@ -14,7 +14,9 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <cmath>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 
 #include "tk_launch.h"
@@ -230,8 +232,224 @@ static at::Tensor gelu_mps(const at::Tensor& x_in) {
   return out;
 }
 
+static bool valid_glu_mode(const std::string& mode) {
+  return mode == "reglu" || mode == "geglu" || mode == "swiglu" ||
+         mode == "swiglu_oai" || mode == "geglu_erf" ||
+         mode == "geglu_quick";
+}
+
+static at::Tensor glu_mps(const at::Tensor& x_in, const at::Tensor& gate_in,
+                          const std::string& mode, double alpha, double limit) {
+  TORCH_CHECK(x_in.device().is_mps(), "glu: x must be an MPS tensor");
+  TORCH_CHECK(gate_in.device().is_mps(), "glu: gate must be an MPS tensor");
+  TORCH_CHECK(x_in.sizes() == gate_in.sizes(), "glu: x and gate must have the same shape");
+  TORCH_CHECK(valid_glu_mode(mode), "glu: unsupported mode ", mode);
+  TORCH_CHECK(x_in.scalar_type() == gate_in.scalar_type(), "glu: x and gate dtypes must match");
+  TORCH_CHECK(x_in.scalar_type() == at::kFloat || x_in.scalar_type() == at::kHalf ||
+              x_in.scalar_type() == at::kBFloat16,
+              "glu: dtype must be float32, float16, or bfloat16");
+  auto x = x_in.contiguous(), gate = gate_in.contiguous();
+  auto out = at::empty_like(x);
+  const uint32_t n = static_cast<uint32_t>(out.numel());
+  const std::string tn = tk_type_name(x);
+  const float alpha_f = static_cast<float>(alpha);
+  const float limit_f = static_cast<float>(limit);
+  tk_encode([&](TorchEncoder& e) { tk::launch_glu(e, x, gate, out, n, mode, tn, alpha_f, limit_f); });
+  return out;
+}
+
+static at::Tensor hadamard_mps(const at::Tensor& x_in, double scale) {
+  TORCH_CHECK(x_in.device().is_mps(), "hadamard: x must be an MPS tensor");
+  TORCH_CHECK(x_in.numel() > 0 && x_in.dim() > 0,
+              "hadamard: input must be non-empty with a final axis");
+  TORCH_CHECK(x_in.scalar_type() == at::kFloat || x_in.scalar_type() == at::kHalf ||
+              x_in.scalar_type() == at::kBFloat16,
+              "hadamard: dtype must be float32, float16, or bfloat16");
+  auto x = x_in.contiguous();
+  const int D = static_cast<int>(x.size(-1));
+  TORCH_CHECK(D == 64 || D == 128 || D == 256 || D == 512,
+              "hadamard: final axis must be 64, 128, 256, or 512");
+  const int rows = static_cast<int>(x.numel() / D);
+  auto out = at::empty_like(x);
+  const float scale_f = scale > 0.0 ? static_cast<float>(scale)
+                                    : 1.0f / std::sqrt(static_cast<float>(D));
+  const std::string tn = tk_type_name(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_hadamard(e, x, out, rows, D, scale_f, tn);
+  });
+  return out;
+}
+
+static bool tk_is_float_dtype(const at::Tensor& t) {
+  return t.scalar_type() == at::kFloat || t.scalar_type() == at::kHalf ||
+         t.scalar_type() == at::kBFloat16;
+}
+
+static std::tuple<at::Tensor, at::Tensor> kv_cache_scatter_mps(
+    const at::Tensor& key_in, const at::Tensor& value_in,
+    const at::Tensor& slot_mapping_in, int64_t num_blocks, int64_t block_size) {
+  TORCH_CHECK(key_in.device().is_mps(), "kv_cache_scatter: key must be an MPS tensor");
+  TORCH_CHECK(value_in.device().is_mps() && slot_mapping_in.device().is_mps(),
+              "kv_cache_scatter: all inputs must be MPS tensors");
+  TORCH_CHECK(key_in.dim() == 3 && value_in.sizes() == key_in.sizes(),
+              "kv_cache_scatter: key/value must have shape (num_tokens, num_heads, head_size)");
+  TORCH_CHECK(slot_mapping_in.dim() == 1 && slot_mapping_in.size(0) == key_in.size(0),
+              "kv_cache_scatter: slot_mapping must have shape (num_tokens,)");
+  TORCH_CHECK(key_in.scalar_type() == value_in.scalar_type() && tk_is_float_dtype(key_in),
+              "kv_cache_scatter: key/value must share float32, float16, or bfloat16 dtype");
+  TORCH_CHECK(slot_mapping_in.scalar_type() == at::kLong,
+              "kv_cache_scatter: slot_mapping must be int64/torch.long");
+  TORCH_CHECK(num_blocks > 0 && block_size > 0,
+              "kv_cache_scatter: num_blocks and block_size must be positive");
+
+  auto key = key_in.contiguous();
+  auto value = value_in.contiguous();
+  auto slot_mapping = slot_mapping_in.contiguous();
+  const int T = key.size(0), H = key.size(1), D = key.size(2);
+  auto key_cache = at::empty({num_blocks, block_size, H, D}, key.options());
+  auto value_cache = at::empty({num_blocks, block_size, H, D}, key.options());
+  const std::string tn = tk_type_name(key);
+  const uint64_t total = static_cast<uint64_t>(key_cache.numel());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kv_cache_zero(e, key_cache, value_cache, total, tn);
+    tk::launch_kv_cache_scatter(e, key, value, slot_mapping, key_cache, value_cache,
+                                T, H, D, static_cast<int>(block_size), tn);
+  });
+  return {key_cache, value_cache};
+}
+
+static std::tuple<at::Tensor, at::Tensor> kv_cache_gather_mps(
+    const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
+    const at::Tensor& block_table_in, const at::Tensor& cu_seq_lens_in,
+    int64_t num_tokens) {
+  TORCH_CHECK(key_cache_in.device().is_mps(), "kv_cache_gather: key_cache must be MPS");
+  TORCH_CHECK(value_cache_in.device().is_mps() && block_table_in.device().is_mps() &&
+                  cu_seq_lens_in.device().is_mps(),
+              "kv_cache_gather: all inputs must be MPS tensors");
+  TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
+              "kv_cache_gather: caches must have shape (num_blocks, block_size, num_heads, head_size)");
+  TORCH_CHECK(block_table_in.dim() == 2 && cu_seq_lens_in.dim() == 1 &&
+                  cu_seq_lens_in.size(0) == block_table_in.size(0) + 1,
+              "kv_cache_gather: block_table (B,max_blocks), cu_seq_lens (B+1,)");
+  TORCH_CHECK(key_cache_in.scalar_type() == value_cache_in.scalar_type() && tk_is_float_dtype(key_cache_in),
+              "kv_cache_gather: caches must share float32, float16, or bfloat16 dtype");
+  TORCH_CHECK(block_table_in.scalar_type() == at::kInt && cu_seq_lens_in.scalar_type() == at::kInt,
+              "kv_cache_gather: block_table and cu_seq_lens must be int32");
+  TORCH_CHECK(num_tokens >= 0, "kv_cache_gather: num_tokens must be non-negative");
+
+  auto key_cache = key_cache_in.contiguous();
+  auto value_cache = value_cache_in.contiguous();
+  auto block_table = block_table_in.contiguous();
+  auto cu_seq_lens = cu_seq_lens_in.contiguous();
+  const int H = key_cache.size(2), D = key_cache.size(3);
+  auto key_out = at::empty({num_tokens, H, D}, key_cache.options());
+  auto value_out = at::empty({num_tokens, H, D}, key_cache.options());
+  const std::string tn = tk_type_name(key_cache);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kv_cache_gather(e, key_cache, value_cache, key_out, value_out,
+                               block_table, cu_seq_lens, static_cast<int>(num_tokens),
+                               static_cast<int>(cu_seq_lens.size(0) - 1),
+                               static_cast<int>(key_cache.size(1)),
+                               static_cast<int>(block_table.size(1)), H, D, tn);
+  });
+  return {key_out, value_out};
+}
+
+static std::tuple<at::Tensor, at::Tensor> kv_cache_copy_blocks_mps(
+    const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
+    const at::Tensor& block_mapping_in) {
+  TORCH_CHECK(key_cache_in.device().is_mps(), "kv_cache_copy_blocks: key_cache must be MPS");
+  TORCH_CHECK(value_cache_in.device().is_mps() && block_mapping_in.device().is_mps(),
+              "kv_cache_copy_blocks: all inputs must be MPS tensors");
+  TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
+              "kv_cache_copy_blocks: caches must have shape (num_blocks, block_size, num_heads, head_size)");
+  TORCH_CHECK(block_mapping_in.dim() == 2 && block_mapping_in.size(1) == 2,
+              "kv_cache_copy_blocks: block_mapping must have shape (num_pairs, 2)");
+  TORCH_CHECK(key_cache_in.scalar_type() == value_cache_in.scalar_type() && tk_is_float_dtype(key_cache_in),
+              "kv_cache_copy_blocks: caches must share float32, float16, or bfloat16 dtype");
+  TORCH_CHECK(block_mapping_in.scalar_type() == at::kLong,
+              "kv_cache_copy_blocks: block_mapping must be int64/torch.long");
+
+  auto key_cache = key_cache_in.contiguous();
+  auto value_cache = value_cache_in.contiguous();
+  auto block_mapping = block_mapping_in.contiguous();
+  auto key_out = at::empty_like(key_cache);
+  auto value_out = at::empty_like(value_cache);
+  const std::string tn = tk_type_name(key_cache);
+  const uint64_t total = static_cast<uint64_t>(key_cache.numel());
+  const int numel_per_block = key_cache.size(1) * key_cache.size(2) * key_cache.size(3);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kv_cache_clone(e, key_cache, value_cache, key_out, value_out, total, tn);
+    tk::launch_kv_cache_copy_blocks(e, key_out, value_out, block_mapping,
+                                    static_cast<int>(block_mapping.size(0)),
+                                    numel_per_block, tn);
+  });
+  return {key_out, value_out};
+}
+
+static std::tuple<at::Tensor, at::Tensor> kv_cache_scales_mps(
+    const at::Tensor& key_in, const at::Tensor& value_in) {
+  TORCH_CHECK(key_in.device().is_mps(), "kv_cache_scales: key must be MPS");
+  TORCH_CHECK(value_in.device().is_mps(), "kv_cache_scales: value must be MPS");
+  TORCH_CHECK(key_in.sizes() == value_in.sizes(), "kv_cache_scales: key/value shape mismatch");
+  TORCH_CHECK(key_in.scalar_type() == value_in.scalar_type() && tk_is_float_dtype(key_in),
+              "kv_cache_scales: key/value must share float32, float16, or bfloat16 dtype");
+  auto key = key_in.contiguous();
+  auto value = value_in.contiguous();
+  auto key_scale = at::empty({1}, key.options().dtype(at::kFloat));
+  auto value_scale = at::empty({1}, key.options().dtype(at::kFloat));
+  const std::string tn = tk_type_name(key);
+  const uint64_t n = static_cast<uint64_t>(key.numel());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kv_cache_scales(e, key, value, key_scale, value_scale, n, tn);
+  });
+  return {key_scale, value_scale};
+}
+
+static at::Tensor paged_attention_mps(
+    const at::Tensor& q_in, const at::Tensor& key_cache_in,
+    const at::Tensor& value_cache_in, const at::Tensor& block_table_in,
+    const at::Tensor& context_lens_in, double scale) {
+  TORCH_CHECK(q_in.device().is_mps(), "paged_attention: q must be an MPS tensor");
+  TORCH_CHECK(key_cache_in.device().is_mps() && value_cache_in.device().is_mps() &&
+                  block_table_in.device().is_mps() && context_lens_in.device().is_mps(),
+              "paged_attention: all inputs must be MPS tensors");
+  TORCH_CHECK(q_in.dim() == 3, "paged_attention: q must have shape (B,H,D)");
+  TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
+              "paged_attention: caches must have shape (num_blocks, block_size, H, D)");
+  TORCH_CHECK(key_cache_in.size(2) == q_in.size(1) && key_cache_in.size(3) == q_in.size(2),
+              "paged_attention: q heads/head_size must match caches");
+  TORCH_CHECK(block_table_in.dim() == 2 && block_table_in.size(0) == q_in.size(0),
+              "paged_attention: block_table must have shape (B, max_blocks)");
+  TORCH_CHECK(context_lens_in.dim() == 1 && context_lens_in.size(0) == q_in.size(0),
+              "paged_attention: context_lens must have shape (B,)");
+  TORCH_CHECK(q_in.scalar_type() == key_cache_in.scalar_type() &&
+                  q_in.scalar_type() == value_cache_in.scalar_type() && tk_is_float_dtype(q_in),
+              "paged_attention: q/cache dtype must be float32, float16, or bfloat16");
+  TORCH_CHECK(block_table_in.scalar_type() == at::kInt && context_lens_in.scalar_type() == at::kInt,
+              "paged_attention: block_table and context_lens must be int32");
+  const int B = q_in.size(0), H = q_in.size(1), D = q_in.size(2);
+  TORCH_CHECK(D == 64 || D == 128, "paged_attention: head_size must be 64 or 128");
+
+  auto q = q_in.contiguous();
+  auto key_cache = key_cache_in.contiguous();
+  auto value_cache = value_cache_in.contiguous();
+  auto block_table = block_table_in.contiguous();
+  auto context_lens = context_lens_in.contiguous();
+  auto out = at::empty_like(q);
+  const float scale_f = scale > 0.0 ? static_cast<float>(scale)
+                                    : 1.0f / std::sqrt(static_cast<float>(D));
+  const std::string tn = tk_type_name(q);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_paged_attention(e, q, key_cache, value_cache, block_table, context_lens,
+                               out, B, H, D, static_cast<int>(key_cache.size(1)),
+                               static_cast<int>(block_table.size(1)), scale_f, tn);
+  });
+  return out;
+}
+
 static at::Tensor attn_causal_mps(const at::Tensor& q_in, const at::Tensor& k_in,
-                                  const at::Tensor& v_in) {
+                                 const at::Tensor& v_in) {
   TORCH_CHECK(q_in.device().is_mps(), "attn_causal: q must be an MPS tensor");
   TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "attn_causal: q must be bfloat16");
   auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
@@ -653,6 +871,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("softmax", &softmax_mps, "ThunderMittens softmax (MPS)");
   m.def("rotary", &rotary_mps, "ThunderMittens rotary/RoPE (MPS)");
   m.def("gelu", &gelu_mps, "ThunderMittens GELU (MPS)");
+  m.def("glu", &glu_mps, "ThunderMittens GLU-family activation (MPS)");
+  m.def("hadamard", &hadamard_mps, "ThunderMittens Hadamard/FWHT (MPS)");
+  m.def("kv_cache_scatter", &kv_cache_scatter_mps, "ThunderMittens KV cache scatter (MPS)");
+  m.def("kv_cache_gather", &kv_cache_gather_mps, "ThunderMittens KV cache gather (MPS)");
+  m.def("kv_cache_copy_blocks", &kv_cache_copy_blocks_mps, "ThunderMittens KV cache block copy (MPS)");
+  m.def("kv_cache_scales", &kv_cache_scales_mps, "ThunderMittens KV cache fp8 scales (MPS)");
+  m.def("paged_attention", &paged_attention_mps, "ThunderMittens paged decode attention (MPS)");
   m.def("attn_causal", &attn_causal_mps, "ThunderMittens causal attention (MPS)");
   m.def("flux_gelu", &flux_gelu_mps, "ThunderMittens fused GEMM+GELU (MPS)");
   m.def("flux_gate", &flux_gate_mps, "ThunderMittens fused GEMM+gate+residual (MPS)");

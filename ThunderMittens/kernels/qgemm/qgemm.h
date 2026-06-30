@@ -43,6 +43,8 @@ class QGemmFp8Scaled : public Primitive {
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
   std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QGemmFp8Scaled"; }
+
   void print(std::ostream& os) override { os << "QGemmFp8Scaled"; }
   bool is_equivalent(const Primitive& other) const override { return typeid(*this) == typeid(other); }
   void eval(const std::vector<array>&, std::vector<array>&);
@@ -56,6 +58,8 @@ class QGemmBlockScale : public Primitive {
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
   std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QGemmBlockScale"; }
+
   void print(std::ostream& os) override { os << "QGemmBlockScale"; }
   bool is_equivalent(const Primitive& other) const override { return typeid(*this) == typeid(other); }
   void eval(const std::vector<array>&, std::vector<array>&);
@@ -70,6 +74,8 @@ class QGemmActorder : public Primitive {
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
   std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QGemmActorder"; }
+
   void print(std::ostream& os) override { os << "QGemmActorder[" << fmt_ << "]"; }
   bool is_equivalent(const Primitive& other) const override {
     return typeid(*this) == typeid(other) && fmt_ == static_cast<const QGemmActorder&>(other).fmt_;
@@ -91,6 +97,8 @@ class QGemm : public Primitive {
                          const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(
       const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QGemm"; }
+
   void print(std::ostream& os) override { os << "QGemm[" << fmt_ << (direct_ ? ",direct]" : "]"); }
   bool is_equivalent(const Primitive& other) const override;
   void eval(const std::vector<array>&, std::vector<array>&);

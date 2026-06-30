@@ -27,6 +27,8 @@ class AttnQ : public Primitive {
                          const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(
       const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "AttnQ"; }
+
   void print(std::ostream& os) override { os << "AttnQ[" << fmt_ << (causal_ ? ",causal]" : "]"); }
   bool is_equivalent(const Primitive& other) const override;
   void eval(const std::vector<array>&, std::vector<array>&);

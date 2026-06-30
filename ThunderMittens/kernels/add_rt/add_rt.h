@@ -69,6 +69,8 @@ class AddRT : public Primitive {
       const std::vector<int>& axes) override;
 
   /** Print the primitive. */
+  const char* name() const { return "AddRT"; }
+
   void print(std::ostream& os) override {
     os << "AddRT";
   }

@@ -52,6 +52,8 @@ class Rotary : public Primitive {
   std::pair<std::vector<array>, std::vector<int>> vmap(
       const std::vector<array>& inputs,
       const std::vector<int>& axes) override;
+  const char* name() const { return "Rotary"; }
+
 
   void print(std::ostream& os) override {
     os << "Rotary";

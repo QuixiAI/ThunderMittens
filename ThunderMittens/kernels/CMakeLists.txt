@@ -38,6 +38,9 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/softmax/softmax.cpp
     ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/glu/glu.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/hadamard/hadamard.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/kv_cache/kv_cache.cpp
     ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.cpp
     ${CMAKE_CURRENT_LIST_DIR}/flux/flux.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.cpp
@@ -86,6 +89,9 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/softmax/softmax.metal
         ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.metal
         ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.metal
+        ${CMAKE_CURRENT_LIST_DIR}/glu/glu.metal
+        ${CMAKE_CURRENT_LIST_DIR}/hadamard/hadamard.metal
+        ${CMAKE_CURRENT_LIST_DIR}/kv_cache/kv_cache.metal
         ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.metal
         ${CMAKE_CURRENT_LIST_DIR}/flux/flux.metal
         ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.metal
@@ -132,4 +138,3 @@ target_link_libraries(_ext PRIVATE mlx_ext)
 if(BUILD_SHARED_LIBS)
   target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
 endif()
-

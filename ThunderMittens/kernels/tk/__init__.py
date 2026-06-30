@@ -107,6 +107,79 @@ def gelu(x):
     return _mlx().gelu(x)
 
 
+def glu(x, gate, mode="swiglu", alpha=1.0, limit=1.0e20):
+    """GLU-family activation. mode in reglu/geglu/swiglu/swiglu_oai/geglu_erf/geglu_quick."""
+    if _is_torch(x):
+        return _torch().glu(x, gate, mode, alpha, limit)
+    return _mlx().glu(x, gate, mode=mode, alpha=alpha, limit=limit)
+
+
+def reglu(x, gate):
+    return glu(x, gate, mode="reglu")
+
+
+def geglu(x, gate):
+    return glu(x, gate, mode="geglu")
+
+
+def swiglu(x, gate):
+    return glu(x, gate, mode="swiglu")
+
+
+def swiglu_oai(x, gate, alpha=1.0, limit=1.0e20):
+    return glu(x, gate, mode="swiglu_oai", alpha=alpha, limit=limit)
+
+
+def geglu_erf(x, gate):
+    return glu(x, gate, mode="geglu_erf")
+
+
+def geglu_quick(x, gate):
+    return glu(x, gate, mode="geglu_quick")
+
+
+def hadamard(x, scale=0.0):
+    """Walsh-Hadamard transform over the final axis. Default scale is 1/sqrt(D)."""
+    if _is_torch(x):
+        return _torch().hadamard(x, scale)
+    return _mlx().hadamard(x, scale=scale)
+
+
+def kv_cache_scatter(key, value, slot_mapping, num_blocks, block_size):
+    """Scatter key/value rows (T,H,D) into paged KV caches (num_blocks, block_size, H, D)."""
+    if _is_torch(key):
+        return _torch().kv_cache_scatter(key, value, slot_mapping, num_blocks, block_size)
+    return _mlx().kv_cache_scatter(key, value, slot_mapping, num_blocks, block_size)
+
+
+def kv_cache_gather(key_cache, value_cache, block_table, cu_seq_lens, num_tokens):
+    """Gather paged KV caches back to contiguous key/value tensors."""
+    if _is_torch(key_cache):
+        return _torch().kv_cache_gather(key_cache, value_cache, block_table, cu_seq_lens, num_tokens)
+    return _mlx().kv_cache_gather(key_cache, value_cache, block_table, cu_seq_lens, num_tokens)
+
+
+def kv_cache_copy_blocks(key_cache, value_cache, block_mapping):
+    """Copy paged KV cache blocks according to (src, dst) pairs."""
+    if _is_torch(key_cache):
+        return _torch().kv_cache_copy_blocks(key_cache, value_cache, block_mapping)
+    return _mlx().kv_cache_copy_blocks(key_cache, value_cache, block_mapping)
+
+
+def kv_cache_scales(key, value):
+    """Return fp8 KV-cache scales `(key_scale, value_scale)` as absmax / 240."""
+    if _is_torch(key):
+        return _torch().kv_cache_scales(key, value)
+    return _mlx().kv_cache_scales(key, value)
+
+
+def paged_attention(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
+    """Decode paged attention. q/out (B,H,D), caches (num_blocks, block_size, H, D)."""
+    if _is_torch(q):
+        return _torch().paged_attention(q, key_cache, value_cache, block_table, context_lens, scale)
+    return _mlx().paged_attention(q, key_cache, value_cache, block_table, context_lens, scale)
+
+
 def attn_causal(q, k, v):
     """Causal attention forward. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(q):

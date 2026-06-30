@@ -29,6 +29,9 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "softmax", "softmax.metal"),
     os.path.join(_KERNELS, "rotary", "rotary.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
+    os.path.join(_KERNELS, "glu", "glu.metal"),
+    os.path.join(_KERNELS, "hadamard", "hadamard.metal"),
+    os.path.join(_KERNELS, "kv_cache", "kv_cache.metal"),
     os.path.join(_KERNELS, "attn_causal", "attn_causal.metal"),
     os.path.join(_KERNELS, "flux", "flux.metal"),
     os.path.join(_KERNELS, "gemm_staged", "gemm_staged.metal"),
@@ -128,6 +131,70 @@ def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
 def gelu(x: torch.Tensor):
     """GELU (tanh approx) over the last axis. bf16 MPS; D in {256,512,768,1024}."""
     return _ext.gelu(x)
+
+
+def glu(x: torch.Tensor, gate: torch.Tensor, mode: str = "swiglu",
+        alpha: float = 1.0, limit: float = 1.0e20):
+    """GLU-family activation. mode in reglu/geglu/swiglu/swiglu_oai/geglu_erf/geglu_quick."""
+    return _ext.glu(x, gate, mode, float(alpha), float(limit))
+
+
+def reglu(x: torch.Tensor, gate: torch.Tensor):
+    return glu(x, gate, "reglu")
+
+
+def geglu(x: torch.Tensor, gate: torch.Tensor):
+    return glu(x, gate, "geglu")
+
+
+def swiglu(x: torch.Tensor, gate: torch.Tensor):
+    return glu(x, gate, "swiglu")
+
+
+def swiglu_oai(x: torch.Tensor, gate: torch.Tensor, alpha: float = 1.0, limit: float = 1.0e20):
+    return glu(x, gate, "swiglu_oai", alpha, limit)
+
+
+def geglu_erf(x: torch.Tensor, gate: torch.Tensor):
+    return glu(x, gate, "geglu_erf")
+
+
+def geglu_quick(x: torch.Tensor, gate: torch.Tensor):
+    return glu(x, gate, "geglu_quick")
+
+
+def hadamard(x: torch.Tensor, scale: float = 0.0):
+    """Walsh-Hadamard transform over the final axis. Default scale is 1/sqrt(D)."""
+    return _ext.hadamard(x, float(scale))
+
+
+def kv_cache_scatter(key: torch.Tensor, value: torch.Tensor, slot_mapping: torch.Tensor,
+                     num_blocks: int, block_size: int):
+    """Scatter key/value rows (T,H,D) into paged KV caches. MPS tensors."""
+    return _ext.kv_cache_scatter(key, value, slot_mapping, int(num_blocks), int(block_size))
+
+
+def kv_cache_gather(key_cache: torch.Tensor, value_cache: torch.Tensor,
+                    block_table: torch.Tensor, cu_seq_lens: torch.Tensor, num_tokens: int):
+    """Gather paged KV caches back to contiguous key/value tensors. MPS tensors."""
+    return _ext.kv_cache_gather(key_cache, value_cache, block_table, cu_seq_lens, int(num_tokens))
+
+
+def kv_cache_copy_blocks(key_cache: torch.Tensor, value_cache: torch.Tensor,
+                         block_mapping: torch.Tensor):
+    """Copy paged KV cache blocks according to (src, dst) pairs. MPS tensors."""
+    return _ext.kv_cache_copy_blocks(key_cache, value_cache, block_mapping)
+
+
+def kv_cache_scales(key: torch.Tensor, value: torch.Tensor):
+    """Return fp8 KV-cache scales `(key_scale, value_scale)` as absmax / 240. MPS tensors."""
+    return _ext.kv_cache_scales(key, value)
+
+
+def paged_attention(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
+                    block_table: torch.Tensor, context_lens: torch.Tensor, scale: float = 0.0):
+    """Decode paged attention. q/out (B,H,D), caches (num_blocks, block_size, H, D)."""
+    return _ext.paged_attention(q, key_cache, value_cache, block_table, context_lens, float(scale))
 
 
 def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):

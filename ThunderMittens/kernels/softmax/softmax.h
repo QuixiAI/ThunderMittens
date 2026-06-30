@@ -47,6 +47,8 @@ class TKSoftmax : public Primitive {
   std::pair<std::vector<array>, std::vector<int>> vmap(
       const std::vector<array>& inputs,
       const std::vector<int>& axes) override;
+  const char* name() const { return "TKSoftmax"; }
+
 
   void print(std::ostream& os) override {
     os << "TKSoftmax";

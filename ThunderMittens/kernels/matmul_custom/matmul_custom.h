@@ -69,6 +69,8 @@ class MatmulCustom : public Primitive {
       const std::vector<int>& axes) override;
 
   /** Print the primitive. */
+  const char* name() const { return "MatmulCustom"; }
+
   void print(std::ostream& os) override {
     os << "MatmulCustom";
   }

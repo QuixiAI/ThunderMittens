@@ -436,3 +436,85 @@ def test_flux_gate_parity(nkm):
     om = tk.flux_gate(_mk(x, "mlx"), _mk(w, "mlx"), _mk(b, "mlx"), _mk(g, "mlx"), _mk(r, "mlx"))
     ot = tk.flux_gate(_mk(x, "torch"), _mk(w, "torch"), _mk(b, "torch"), _mk(g, "torch"), _mk(r, "torch"))
     _assert_parity(om, ot, atol=2e-2)
+
+
+@pytest.mark.parametrize("dtype,atol", [("f32", 1e-6), ("bf16", 0.0)])
+@pytest.mark.parametrize("D", [64, 256])
+def test_hadamard_parity(dtype, atol, D):
+    rng = np.random.default_rng(D)
+    x = rng.standard_normal((3, D)).astype(np.float32)
+    om = tk.hadamard(_mk(x, "mlx", dtype))
+    ot = tk.hadamard(_mk(x, "torch", dtype))
+    _assert_parity(om, ot, atol=atol)
+
+
+@pytest.mark.parametrize("dtype,atol", [("f32", 1e-6), ("bf16", 0.0)])
+def test_kv_cache_parity(dtype, atol):
+    rng = np.random.default_rng(0)
+    T, H, D = 7, 2, 64
+    num_blocks, block_size = 3, 4
+    key = rng.normal(size=(T, H, D)).astype(np.float32)
+    value = rng.normal(size=(T, H, D)).astype(np.float32)
+    slots = np.array([0, 2, -1, 5, 8, 1, 7], dtype=np.int64)
+    block_table = np.array([[0, 1], [2, 0]], dtype=np.int32)
+    cu_seq_lens = np.array([0, 5, 9], dtype=np.int32)
+    block_mapping = np.array([[0, 2], [1, 0]], dtype=np.int64)
+
+    km, vm = _mk(key, "mlx", dtype), _mk(value, "mlx", dtype)
+    kt, vt = _mk(key, "torch", dtype), _mk(value, "torch", dtype)
+    sm = mx.array(slots)
+    st = torch.from_numpy(slots).to("mps")
+
+    m_kc, m_vc = tk.kv_cache_scatter(km, vm, sm, num_blocks, block_size)
+    t_kc, t_vc = tk.kv_cache_scatter(kt, vt, st, num_blocks, block_size)
+    _assert_parity(m_kc, t_kc, atol=atol)
+    _assert_parity(m_vc, t_vc, atol=atol)
+
+    bm = mx.array(block_table)
+    bt = torch.from_numpy(block_table).to("mps")
+    lm = mx.array(cu_seq_lens)
+    lt = torch.from_numpy(cu_seq_lens).to("mps")
+    m_gk, m_gv = tk.kv_cache_gather(m_kc, m_vc, bm, lm, int(cu_seq_lens[-1]))
+    t_gk, t_gv = tk.kv_cache_gather(t_kc, t_vc, bt, lt, int(cu_seq_lens[-1]))
+    _assert_parity(m_gk, t_gk, atol=atol)
+    _assert_parity(m_gv, t_gv, atol=atol)
+
+    mm = mx.array(block_mapping)
+    mt = torch.from_numpy(block_mapping).to("mps")
+    m_ck, m_cv = tk.kv_cache_copy_blocks(m_kc, m_vc, mm)
+    t_ck, t_cv = tk.kv_cache_copy_blocks(t_kc, t_vc, mt)
+    _assert_parity(m_ck, t_ck, atol=atol)
+    _assert_parity(m_cv, t_cv, atol=atol)
+
+    m_ks, m_vs = tk.kv_cache_scales(km, vm)
+    t_ks, t_vs = tk.kv_cache_scales(kt, vt)
+    _assert_parity(m_ks, t_ks, atol=1e-7)
+    _assert_parity(m_vs, t_vs, atol=1e-7)
+
+
+@pytest.mark.parametrize("dtype,atol", [("f32", 2e-5), ("bf16", 2e-2)])
+def test_paged_attention_parity(dtype, atol):
+    rng = np.random.default_rng(1)
+    B, H, D = 2, 2, 64
+    num_blocks, block_size = 4, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    key_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H, D))).astype(np.float32)
+    value_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H, D))).astype(np.float32)
+    block_table = np.array([[0, 1], [2, 3]], dtype=np.int32)
+    context_lens = np.array([6, 7], dtype=np.int32)
+
+    om = tk.paged_attention(
+        _mk(q, "mlx", dtype),
+        _mk(key_cache, "mlx", dtype),
+        _mk(value_cache, "mlx", dtype),
+        mx.array(block_table),
+        mx.array(context_lens),
+    )
+    ot = tk.paged_attention(
+        _mk(q, "torch", dtype),
+        _mk(key_cache, "torch", dtype),
+        _mk(value_cache, "torch", dtype),
+        torch.from_numpy(block_table).to("mps"),
+        torch.from_numpy(context_lens).to("mps"),
+    )
+    _assert_parity(om, ot, atol=atol)

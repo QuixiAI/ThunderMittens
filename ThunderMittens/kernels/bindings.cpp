@@ -64,6 +64,9 @@
 #include "softmax/softmax.h"
 #include "rotary/rotary.h"
 #include "gelu/gelu.h"
+#include "glu/glu.h"
+#include "hadamard/hadamard.h"
+#include "kv_cache/kv_cache.h"
 #include "attn_causal/attn_causal.h"
 #include "flux/flux.h"
 #include "gemm_staged/gemm_staged.h"
@@ -180,6 +183,97 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         GELU activation (tanh approximation), over the last axis
+      )");
+
+    m.def(
+      "glu",
+      &glu,
+      "x"_a,
+      "gate"_a,
+      nb::kw_only(),
+      "mode"_a = "swiglu",
+      "alpha"_a = 1.0f,
+      "limit"_a = 1.0e20f,
+      "stream"_a = nb::none(),
+      R"(
+        GLU-family activation: reglu, geglu, swiglu, swiglu_oai, geglu_erf, or geglu_quick
+      )");
+
+    m.def(
+      "hadamard",
+      &hadamard,
+      "x"_a,
+      "scale"_a = 0.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Walsh-Hadamard transform over the final axis; default scale is 1/sqrt(D)
+      )");
+
+    m.def(
+      "kv_cache_scatter",
+      &kv_cache_scatter,
+      "key"_a,
+      "value"_a,
+      "slot_mapping"_a,
+      "num_blocks"_a,
+      "block_size"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        scatter packed key/value rows (T,H,D) into paged KV caches (num_blocks, block_size, H, D)
+      )");
+
+    m.def(
+      "kv_cache_gather",
+      &kv_cache_gather,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "cu_seq_lens"_a,
+      "num_tokens"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        gather paged KV caches back into contiguous key/value tensors
+      )");
+
+    m.def(
+      "kv_cache_copy_blocks",
+      &kv_cache_copy_blocks,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_mapping"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        copy KV cache blocks according to (src, dst) block pairs
+      )");
+
+    m.def(
+      "kv_cache_scales",
+      &kv_cache_scales,
+      "key"_a,
+      "value"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        compute fp8 KV-cache scales as absmax(key/value) / 240
+      )");
+
+    m.def(
+      "paged_attention",
+      &paged_attention,
+      "q"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      "scale"_a = 0.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        decode paged attention over caches shaped (num_blocks, block_size, H, D)
       )");
 
     m.def(

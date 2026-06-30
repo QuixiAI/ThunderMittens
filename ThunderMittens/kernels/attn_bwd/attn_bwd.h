@@ -33,6 +33,8 @@ class AttnFwdL : public Primitive {
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
   std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "AttnFwdL"; }
+
   void print(std::ostream& os) override { os << "AttnFwdL"; }
   bool is_equivalent(const Primitive& o) const override {
     return typeid(*this) == typeid(o) && causal_ == static_cast<const AttnFwdL&>(o).causal_;
@@ -49,6 +51,8 @@ class AttnBwdPrep : public Primitive {
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
   std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "AttnBwdPrep"; }
+
   void print(std::ostream& os) override { os << "AttnBwdPrep"; }
   bool is_equivalent(const Primitive&) const override { return true; }
 };
@@ -61,6 +65,8 @@ class AttnBwdDQ : public Primitive {
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
   std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "AttnBwdDQ"; }
+
   void print(std::ostream& os) override { os << "AttnBwdDQ"; }
   bool is_equivalent(const Primitive& o) const override {
     return typeid(*this) == typeid(o) && causal_ == static_cast<const AttnBwdDQ&>(o).causal_;
@@ -77,6 +83,8 @@ class AttnBwdDKV : public Primitive {
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
   std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "AttnBwdDKV"; }
+
   void print(std::ostream& os) override { os << "AttnBwdDKV"; }
   bool is_equivalent(const Primitive& o) const override {
     return typeid(*this) == typeid(o) && causal_ == static_cast<const AttnBwdDKV&>(o).causal_;

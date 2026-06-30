@@ -28,6 +28,8 @@ class QGemvW8A8 : public Primitive {
                          const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(
       const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QGemvW8A8"; }
+
   void print(std::ostream& os) override { os << "QGemvW8A8"; }
   bool is_equivalent(const Primitive&) const override { return true; }
   void eval(const std::vector<array>&, std::vector<array>&);
@@ -44,6 +46,8 @@ class QGemvW2A8 : public Primitive {
                          const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(
       const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QGemvW2A8"; }
+
   void print(std::ostream& os) override { os << "QGemvW2A8"; }
   bool is_equivalent(const Primitive&) const override { return true; }
   void eval(const std::vector<array>&, std::vector<array>&);

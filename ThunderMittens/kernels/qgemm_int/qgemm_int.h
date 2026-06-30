@@ -25,6 +25,8 @@ class QGemmW8A8 : public Primitive {
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
   std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QGemmW8A8"; }
+
   void print(std::ostream& os) override { os << "QGemmW8A8"; }
   bool is_equivalent(const Primitive&) const override { return true; }
   void eval(const std::vector<array>&, std::vector<array>&);
@@ -38,6 +40,8 @@ class QGemmW2A8 : public Primitive {
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
   std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) override;
   std::pair<std::vector<array>, std::vector<int>> vmap(const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QGemmW2A8"; }
+
   void print(std::ostream& os) override { os << "QGemmW2A8"; }
   bool is_equivalent(const Primitive&) const override { return true; }
   void eval(const std::vector<array>&, std::vector<array>&);

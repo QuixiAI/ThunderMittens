@@ -32,6 +32,16 @@ inline std::string rms_norm_kernel_name(int D) { return "rms_norm_" + std::to_st
 inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_string(D); }
 inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string(D); }
 inline std::string gelu_kernel_name(int D) { return "gelu_" + std::to_string(D); }
+inline std::string glu_kernel_name(const std::string& mode, const std::string& t) { return "glu_" + mode + "_" + t; }
+inline std::string hadamard_kernel_name(const std::string& t, int D) {
+  return "hadamard_" + t + "_" + std::to_string(D);
+}
+inline std::string kv_cache_kernel_name(const std::string& op, const std::string& t) {
+  return "kv_cache_" + op + "_" + t;
+}
+inline std::string paged_attention_kernel_name(const std::string& t, int D) {
+  return "paged_attention_" + t + "_" + std::to_string(D);
+}
 inline std::string attn_causal_kernel_name(int D) { return "attn_causal_" + std::to_string(D); }
 inline std::string flux_gelu_kernel_name(const std::string& t) { return "flux_gelu_" + t; }
 inline std::string flux_gate_kernel_name(const std::string& t) { return "flux_gate_" + t; }
@@ -152,6 +162,203 @@ void launch_gelu(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, int 
   e.in(x, 0); e.out(o, 1);
   e.bytes(M, 2);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- glu family: x@0 gate@1 -> out@2 ; n@3(uint32) alpha@4 limit@5 ; flat elementwise. -----
+// Modes mirror llama.cpp's ReGLU/GEGLU/SwiGLU kernels. alpha/limit are only used by swiglu_oai.
+template <class E>
+void launch_glu(E& e, typename E::in_t x, typename E::in_t gate, typename E::out_t o,
+                uint32_t n, const std::string& mode, const std::string& type_name,
+                float alpha, float limit) {
+  e.pipeline(glu_kernel_name(mode, type_name));
+  e.in(x, 0); e.in(gate, 1); e.out(o, 2);
+  e.bytes(n, 3); e.bytes(alpha, 4); e.bytes(limit, 5);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+// ----- Hadamard/FWHT over the final axis: x@0 -> out@1 ; scale@2. D in {64,128,256,512}. -----
+template <class E>
+void launch_hadamard(
+    E& e,
+    typename E::in_t x,
+    typename E::out_t out,
+    int rows,
+    int D,
+    float scale,
+    const std::string& type_name) {
+  e.pipeline(hadamard_kernel_name(type_name, D));
+  e.in(x, 0);
+  e.out(out, 1);
+  e.bytes(scale, 2);
+  e.dispatch(rows, 1, 1, D, 1, 1);
+}
+
+// ----- KV cache zero: key_cache@0 value_cache@1 ; n@2(ulong). Flat memset for fresh caches. -----
+template <class E>
+void launch_kv_cache_zero(
+    E& e,
+    typename E::out_t key_cache,
+    typename E::out_t value_cache,
+    uint64_t n,
+    const std::string& type_name) {
+  e.pipeline(kv_cache_kernel_name("zero", type_name));
+  e.out(key_cache, 0);
+  e.out(value_cache, 1);
+  e.bytes(n, 2);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+// ----- KV cache scatter: key@0 value@1 slot_mapping@2 -> key_cache@3 value_cache@4.
+// key/value are (T,H,D); caches are (num_blocks, block_size, H, D). -----
+template <class E>
+void launch_kv_cache_scatter(
+    E& e,
+    typename E::in_t key,
+    typename E::in_t value,
+    typename E::in_t slot_mapping,
+    typename E::out_t key_cache,
+    typename E::out_t value_cache,
+    int num_tokens,
+    int num_heads,
+    int head_size,
+    int block_size,
+    const std::string& type_name) {
+  e.pipeline(kv_cache_kernel_name("scatter", type_name));
+  e.in(key, 0);
+  e.in(value, 1);
+  e.in(slot_mapping, 2);
+  e.out(key_cache, 3);
+  e.out(value_cache, 4);
+  e.bytes(num_heads, 5);
+  e.bytes(head_size, 6);
+  e.bytes(block_size, 7);
+  e.dispatch(num_tokens, 1, 1, 256, 1, 1);
+}
+
+// ----- KV cache gather: key_cache@0 value_cache@1 -> key_out@2 value_out@3.
+// block_table@4 cu_seq_lens@5; outputs are (num_tokens,H,D). -----
+template <class E>
+void launch_kv_cache_gather(
+    E& e,
+    typename E::in_t key_cache,
+    typename E::in_t value_cache,
+    typename E::out_t key_out,
+    typename E::out_t value_out,
+    typename E::in_t block_table,
+    typename E::in_t cu_seq_lens,
+    int num_tokens,
+    int num_seqs,
+    int block_size,
+    int block_table_stride,
+    int num_heads,
+    int head_size,
+    const std::string& type_name) {
+  e.pipeline(kv_cache_kernel_name("gather", type_name));
+  e.in(key_cache, 0);
+  e.in(value_cache, 1);
+  e.out(key_out, 2);
+  e.out(value_out, 3);
+  e.in(block_table, 4);
+  e.in(cu_seq_lens, 5);
+  e.bytes(num_tokens, 6);
+  e.bytes(num_seqs, 7);
+  e.bytes(block_size, 8);
+  e.bytes(block_table_stride, 9);
+  e.bytes(num_heads, 10);
+  e.bytes(head_size, 11);
+  e.dispatch(num_tokens, 1, 1, 256, 1, 1);
+}
+
+// ----- KV cache clone: key_cache@0 value_cache@1 -> key_out@2 value_out@3 ; n@4. -----
+template <class E>
+void launch_kv_cache_clone(
+    E& e,
+    typename E::in_t key_cache,
+    typename E::in_t value_cache,
+    typename E::out_t key_out,
+    typename E::out_t value_out,
+    uint64_t n,
+    const std::string& type_name) {
+  e.pipeline(kv_cache_kernel_name("clone", type_name));
+  e.in(key_cache, 0);
+  e.in(value_cache, 1);
+  e.out(key_out, 2);
+  e.out(value_out, 3);
+  e.bytes(n, 4);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+// ----- KV cache block copy: in-place over output caches. mapping is (num_pairs,2) int64. -----
+template <class E>
+void launch_kv_cache_copy_blocks(
+    E& e,
+    typename E::out_t key_cache,
+    typename E::out_t value_cache,
+    typename E::in_t block_mapping,
+    int num_pairs,
+    int numel_per_block,
+    const std::string& type_name) {
+  e.pipeline(kv_cache_kernel_name("copy_blocks", type_name));
+  e.out(key_cache, 0);
+  e.out(value_cache, 1);
+  e.in(block_mapping, 2);
+  e.bytes(numel_per_block, 3);
+  e.dispatch(num_pairs, 1, 1, 256, 1, 1);
+}
+
+// ----- KV cache scales: key@0 value@1 -> key_scale@2 value_scale@3 ; n@4.
+// Single threadgroup scans the arrays and emits absmax / 240, matching vLLM's fp8 scale convention. -----
+template <class E>
+void launch_kv_cache_scales(
+    E& e,
+    typename E::in_t key,
+    typename E::in_t value,
+    typename E::out_t key_scale,
+    typename E::out_t value_scale,
+    uint64_t n,
+    const std::string& type_name) {
+  e.pipeline(kv_cache_kernel_name("scales", type_name));
+  e.in(key, 0);
+  e.in(value, 1);
+  e.out(key_scale, 2);
+  e.out(value_scale, 3);
+  e.bytes(n, 4);
+  e.dispatch(1, 1, 1, 256, 1, 1);
+}
+
+// ----- Paged decode attention: q@0 cacheK@1 cacheV@2 block_table@3 context_lens@4 -> out@5.
+// q/out are (B,H,D), caches are (num_blocks, block_size, H, D), D in {64,128}. -----
+template <class E>
+void launch_paged_attention(
+    E& e,
+    typename E::in_t q,
+    typename E::in_t key_cache,
+    typename E::in_t value_cache,
+    typename E::in_t block_table,
+    typename E::in_t context_lens,
+    typename E::out_t out,
+    int batch,
+    int num_heads,
+    int head_size,
+    int block_size,
+    int block_table_stride,
+    float scale,
+    const std::string& type_name) {
+  e.pipeline(paged_attention_kernel_name(type_name, head_size));
+  e.in(q, 0);
+  e.in(key_cache, 1);
+  e.in(value_cache, 2);
+  e.in(block_table, 3);
+  e.in(context_lens, 4);
+  e.out(out, 5);
+  e.bytes(block_size, 6);
+  e.bytes(block_table_stride, 7);
+  e.bytes(scale, 8);
+  e.bytes(num_heads, 9);
+  e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 
 // ----- attn_causal: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) ; grid (N/8, H, B) group (32,1,1) -----

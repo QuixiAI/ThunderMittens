@@ -31,6 +31,70 @@ kernel void qgemv(
     if (lane == 0) D[row] = half(acc);
 }
 
+[[host_name("qgemv_q8_0")]]
+kernel void qgemv_q8_0_fast(
+    device   half*  D  [[buffer(0)]],
+    device   uchar* Wq [[buffer(1)]],
+    device   half*  X  [[buffer(2)]],
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    const int row = tgid.x;
+    const int bpr = K / q8_0::block_k;
+    device const uchar* row_base = Wq + (uint)(row * bpr) * q8_0::block_bytes;
+
+    const int block_offset = (int)(lane >> 2);       // 8 q8_0 blocks per simdgroup iteration
+    const int chunk = (int)(lane & 3);               // 8 contiguous int8 values within the block
+
+    float acc = 0.0f;
+    for (int kb = block_offset; kb < bpr; kb += 8) {
+        device const uchar* block = row_base + (uint)kb * q8_0::block_bytes;
+        const float d = float(((device const half*)block)[0]);
+        device const char* qs = (device const char*)(block + 2 + chunk * 8);
+        const int x0 = (kb << 5) + chunk * 8;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+            acc += d * float(qs[i]) * float(X[x0 + i]);
+        }
+    }
+    acc = metal::simd_sum(acc);
+    if (lane == 0) D[row] = half(acc);
+}
+
+[[host_name("qgemv_q4_0")]]
+kernel void qgemv_q4_0_fast(
+    device   half*  D  [[buffer(0)]],
+    device   uchar* Wq [[buffer(1)]],
+    device   half*  X  [[buffer(2)]],
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    const int row = tgid.x;
+    const int bpr = K / q4_0::block_k;
+    device const uchar* row_base = Wq + (uint)(row * bpr) * q4_0::block_bytes;
+
+    const int block_offset = (int)(lane >> 1);       // 16 q4_0 blocks per simdgroup iteration
+    const int byte_start = (int)(lane & 1) * 8;      // each lane handles 8 packed bytes = 16 weights
+
+    float acc = 0.0f;
+    for (int kb = block_offset; kb < bpr; kb += 16) {
+        device const uchar* block = row_base + (uint)kb * q4_0::block_bytes;
+        const float d = float(((device const half*)block)[0]);
+        device const uchar* qs = block + 2 + byte_start;
+        const int x0 = (kb << 5) + byte_start;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+            const uchar packed = qs[i];
+            acc += d * float((int)(packed & 0x0F) - 8) * float(X[x0 + i]);
+            acc += d * float((int)(packed >> 4) - 8) * float(X[x0 + i + 16]);
+        }
+    }
+    acc = metal::simd_sum(acc);
+    if (lane == 0) D[row] = half(acc);
+}
+
 #define instantiate_qgemv(name, FMT)                                          \
    template [[host_name(name)]] [[kernel]]                                    \
    void qgemv<FMT>(                                                           \
@@ -39,8 +103,8 @@ kernel void qgemv(
      uint3 tgid [[threadgroup_position_in_grid]],                            \
      uint lane [[thread_index_in_simdgroup]]);
 
-instantiate_qgemv("qgemv_q8_0", q8_0);
-instantiate_qgemv("qgemv_q4_0", q4_0);
+instantiate_qgemv("qgemv_q8_0_small", q8_0);
+instantiate_qgemv("qgemv_q4_0_small", q4_0);
 instantiate_qgemv("qgemv_q4_K", q4_K);
 instantiate_qgemv("qgemv_kU4B8", kU4B8);
 instantiate_qgemv("qgemv_kU4", kU4);

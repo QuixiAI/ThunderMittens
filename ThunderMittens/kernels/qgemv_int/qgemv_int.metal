@@ -42,15 +42,14 @@ kernel void qgemv_w2a8(
     const int row = tgid.x;
     const int bpr = K / bitnet::block_k;
     device const uchar* row_base = Wq + (uint)(row * bpr) * bitnet::block_bytes;
-    float facc = 0.0f;
+    float lane_acc = 0.0f;
     for (int g = 0; g < bpr; g++) {
         device const uchar* base = row_base + (uint)g * bitnet::block_bytes;
-        int iacc = 0;
-        for (int k = (int)lane; k < bitnet::block_k; k += 32)
-            iacc += bitnet::code(base, k) * (int)Xq[g * bitnet::block_k + k];
-        iacc = metal::simd_sum(iacc);                          // int32 sum within the group
-        facc += float(iacc) * float(bitnet::gscale(base));     // apply the per-group scale
+        const int k = (int)lane;
+        const int prod = bitnet::code(base, k) * (int)Xq[g * bitnet::block_k + k];
+        lane_acc += float(prod) * float(bitnet::gscale(base));
     }
+    const float facc = metal::simd_sum(lane_acc);
     if (lane == 0) D[row] = half(facc * float(a_scale[0]));
 }
 

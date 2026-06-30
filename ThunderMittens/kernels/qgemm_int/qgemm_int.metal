@@ -49,15 +49,14 @@ kernel void qgemm_w2a8(
     device const uchar* row_base = Wq + (uint)(n * bpr) * bitnet::block_bytes;
     for (int m = 0; m < M; m++) {
         device const char* xrow = Xq + (uint)m * K;
-        float facc = 0.0f;
+        float lane_acc = 0.0f;
         for (int g = 0; g < bpr; g++) {
             device const uchar* base = row_base + (uint)g * bitnet::block_bytes;
-            int iacc = 0;
-            for (int k = (int)lane; k < bitnet::block_k; k += 32)
-                iacc += bitnet::code(base, k) * (int)xrow[g * bitnet::block_k + k];
-            iacc = metal::simd_sum(iacc);
-            facc += float(iacc) * float(bitnet::gscale(base));
+            const int k = (int)lane;
+            const int prod = bitnet::code(base, k) * (int)xrow[g * bitnet::block_k + k];
+            lane_acc += float(prod) * float(bitnet::gscale(base));
         }
+        const float facc = metal::simd_sum(lane_acc);
         if (lane == 0) D[(uint)n * M + m] = half(facc * float(a_scale[m]));
     }
 }

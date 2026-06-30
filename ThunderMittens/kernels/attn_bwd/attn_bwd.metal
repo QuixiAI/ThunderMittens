@@ -143,8 +143,8 @@ kernel void attn_bwd_dq(device   bf16     *q  [[buffer(0)]],
     for (int j = 0; j <= kv_last; j++) {
         rt_bf<TB, D, ducks::rt_layout::col> k_col, v_col;
         rt_bf<TB, D> k_row;
-        load(k_col, gl_k, {block, head, j, 0}, laneId);
         load(k_row, gl_k, {block, head, j, 0}, laneId);
+        swap_layout(k_col, k_row, laneId);
         load(v_col, gl_vv, {block, head, j, 0}, laneId);
 
         rt_fl<TB, TB> att;
@@ -195,12 +195,9 @@ kernel void attn_bwd_dkv(device   bf16     *q  [[buffer(0)]],
     constexpr const float scale = bwd_scale<D>();
     constexpr const bf16 q_mul = (bf16)(scale * 1.44269504089f);
 
-    rt_bf<TB, D> k_row, v_row;
     rt_bf<TB, D, ducks::rt_layout::col> k_col, v_col;
-    load(k_row, gl_k, {block, head, j, 0}, laneId);
     load(k_col, gl_k, {block, head, j, 0}, laneId);
     load(v_col, gl_vv, {block, head, j, 0}, laneId);
-    (void)v_row;
 
     rt_fl<TB, D> dk_reg, dv_reg;
     zero(dk_reg); zero(dv_reg);
@@ -210,8 +207,6 @@ kernel void attn_bwd_dkv(device   bf16     *q  [[buffer(0)]],
         rt_bf<TB, D> q_row, do_row;
         load(q_row, gl_q, {block, head, i, 0}, laneId);
         load(do_row, gl_do, {block, head, i, 0}, laneId);
-        rt_bf<TB, D, ducks::rt_layout::col> q_col;
-        load(q_col, gl_q, {block, head, i, 0}, laneId);
         typename rt_fl<TB, TB>::col_vec L_i, del_i;
         load(L_i, gl_L, {block, head, 0, i}, laneId);
         load(del_i, gl_del, {block, head, 0, i}, laneId);

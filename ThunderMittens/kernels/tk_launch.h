@@ -325,7 +325,8 @@ void launch_based(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t
 template <class E>
 void launch_cmplx_matmul(E& e, typename E::out_t d, typename E::in_t a, typename E::in_t b,
                          int N, int K, int M, const std::string& t) {
-  e.pipeline(cmplx_matmul_kernel_name(t));
+  const bool use_small = K < 512;
+  e.pipeline(cmplx_matmul_kernel_name(t) + (use_small ? "_small" : ""));
   e.out(d, 0); e.in(a, 1); e.in(b, 2);
   e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
   e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
@@ -406,7 +407,8 @@ void launch_qgemm_frag(E& e, typename E::out_t d, typename E::in_t wq, typename 
 template <class E>
 void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t x,
                   int N, int K, const std::string& fmt) {
-  e.pipeline(qgemv_kernel_name(fmt));
+  const bool use_small = K <= 512 && (fmt == "q8_0" || fmt == "q4_0");
+  e.pipeline(use_small ? qgemv_kernel_name(fmt) + "_small" : qgemv_kernel_name(fmt));
   e.out(d, 0); e.in(wq, 1); e.in(x, 2);
   e.bytes(N, 3); e.bytes(K, 4);
   e.dispatch(N, 1, 1, 32, 1, 1);  // one simdgroup per output row

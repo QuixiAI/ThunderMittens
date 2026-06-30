@@ -38,7 +38,7 @@ def test_attn_q(D, fmt):
     assert rel < 0.1, f"{fmt} D{D} rel {rel}"
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "fp8_e4m3"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "fp8_e4m3"])
 @pytest.mark.parametrize("D", [64, 128])
 def test_attn_q_causal(D, fmt):
     B, H, N = 1, 2, 64

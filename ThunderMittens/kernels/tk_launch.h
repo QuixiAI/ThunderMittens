@@ -497,6 +497,27 @@ void launch_mla_cache_clone(E& e, typename E::in_t src, typename E::out_t dst, u
 }
 
 template <class E>
+void launch_mla_cache_clone_u8(E& e, typename E::in_t src, typename E::out_t dst, uint64_t n) {
+  e.pipeline("mla_cache_clone_u8");
+  e.in(src, 0); e.out(dst, 1); e.bytes(n, 2);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+// ----- MLA V4 packed fp8 insert: kv@0(512) cos@1 sin@2 positions@3 slot@4 -> data_cache@5(u8,576)
+//        scale_cache@6(u8,8) ; block_size@7 ; grid (T,1,1) group (32,1,1). -----
+template <class E>
+void launch_mla_kv_insert_fp8(E& e, typename E::in_t kv, typename E::in_t cos, typename E::in_t sin,
+                              typename E::in_t positions, typename E::in_t slot_mapping,
+                              typename E::out_t data_cache, typename E::out_t scale_cache,
+                              int num_tokens, int block_size) {
+  e.pipeline("mla_kv_insert_fp8");
+  e.in(kv, 0); e.in(cos, 1); e.in(sin, 2); e.in(positions, 3); e.in(slot_mapping, 4);
+  e.out(data_cache, 5); e.out(scale_cache, 6); e.bytes(block_size, 7);
+  e.dispatch(num_tokens, 1, 1, 32, 1, 1);
+}
+
+template <class E>
 void launch_mla_kv_insert(E& e, typename E::in_t kv_c, typename E::in_t k_pe, typename E::in_t cos,
                           typename E::in_t sin, typename E::in_t positions,
                           typename E::in_t slot_mapping, typename E::out_t kv_cache,

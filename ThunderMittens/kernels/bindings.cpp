@@ -251,6 +251,13 @@ NB_MODULE(_ext, m) {
          a paged bf16 cache (nb, bs, LATENT+rope_dim). Returns the updated kv_cache.)");
 
     m.def(
+      "mla_kv_insert_fp8", &mla_kv_insert_fp8,
+      "kv"_a, "cos"_a, "sin"_a, "positions"_a, "slot_mapping"_a, "data_cache"_a, "scale_cache"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(DeepSeek-V4 packed MLA KV-insert: 448 NoPE -> e4m3 fp8 with per-64-block UE8M0 scales,
+         64 RoPE -> interleaved bf16. Returns (data_cache (…,576) uint8, scale_cache (…,8) uint8).)");
+
+    m.def(
       "paged_attention_v2",
       &paged_attention_v2,
       "q"_a,

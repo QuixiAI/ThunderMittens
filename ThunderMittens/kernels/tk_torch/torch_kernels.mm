@@ -660,6 +660,33 @@ static at::Tensor mla_kv_insert_mps(
   return out;
 }
 
+// DeepSeek-V4 packed MLA KV-insert. Returns (data_cache uint8 (…,576), scale_cache uint8 (…,8)).
+static std::tuple<at::Tensor, at::Tensor> mla_kv_insert_fp8_mps(
+    const at::Tensor& kv_in, const at::Tensor& cos_in, const at::Tensor& sin_in,
+    const at::Tensor& positions_in, const at::Tensor& slot_in, const at::Tensor& data_in,
+    const at::Tensor& scale_in) {
+  TORCH_CHECK(kv_in.device().is_mps() && kv_in.scalar_type() == at::kBFloat16,
+              "mla_kv_insert_fp8: kv must be bf16 MPS");
+  TORCH_CHECK(kv_in.size(-1) == 512, "mla_kv_insert_fp8: kv must be (…, 512)");
+  TORCH_CHECK(data_in.dim() == 3 && data_in.size(2) == 576 && data_in.scalar_type() == at::kByte,
+              "mla_kv_insert_fp8: data_cache must be (nb, bs, 576) uint8");
+  TORCH_CHECK(scale_in.dim() == 3 && scale_in.size(2) == 8 && scale_in.scalar_type() == at::kByte,
+              "mla_kv_insert_fp8: scale_cache must be (nb, bs, 8) uint8");
+  auto kv = kv_in.contiguous();
+  auto cos = cos_in.to(at::kBFloat16).contiguous(), sin = sin_in.to(at::kBFloat16).contiguous();
+  auto positions = positions_in.to(at::kInt).contiguous();
+  auto slot = slot_in.to(at::kLong).contiguous();
+  auto data_out = data_in.contiguous().clone();
+  auto scale_out = scale_in.contiguous().clone();
+  const int num_tokens = static_cast<int>(kv.numel() / 512);
+  const int block_size = data_in.size(1);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_mla_kv_insert_fp8(e, kv, cos, sin, positions, slot, data_out, scale_out,
+                                 num_tokens, block_size);
+  });
+  return {data_out, scale_out};
+}
+
 static at::Tensor paged_attention_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in,
     const at::Tensor& value_cache_in, const at::Tensor& block_table_in,
@@ -1691,6 +1718,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rope_kv_insert_norm", &rope_kv_insert_norm_mps, "ThunderMittens fused K-norm + RoPE + KV insert (MPS)");
   m.def("mla_q_norm_rope", &mla_q_norm_rope_mps, "ThunderMittens DeepSeek MLA Q-path norm+interleaved-rope (MPS)");
   m.def("mla_kv_insert", &mla_kv_insert_mps, "ThunderMittens DeepSeek MLA classic KV-insert (MPS)");
+  m.def("mla_kv_insert_fp8", &mla_kv_insert_fp8_mps, "ThunderMittens DeepSeek-V4 packed fp8 MLA KV-insert (MPS)");
   m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)");
   m.def("paged_attention_v2_fp8", &paged_attention_v2_fp8_mps, "ThunderMittens long-context fp8 paged attention (MPS)");
   m.def("moe_route_topk", &moe_route_topk_mps, "ThunderMittens MoE top-k routing (MPS)");

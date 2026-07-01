@@ -165,6 +165,18 @@ def mla_kv_insert(kv_c, k_pe, cos, sin, positions, slot_mapping, kv_cache,
                                 norm_weight, rope_dim, norm_mode, eps)
 
 
+def mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache):
+    """DeepSeek-V4 packed MLA KV-insert: kv (…, 512) = [448 NoPE | 64 RoPE]; NoPE is quantized to
+    e4m3 fp8 with per-64-block UE8M0 (power-of-2) scales, RoPE gets interleaved RoPE bf16. Writes
+    into a paged data_cache (nb, bs, 576) uint8 + scale_cache (nb, bs, 8) uint8; returns the
+    updated (data_cache, scale_cache). Dequant: e4m3_decode(code) * 2**(scale_byte-127). MPS/MLX.
+    """
+    if _is_torch(kv):
+        return _torch().mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache)
+    data, scale = _mlx().mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache)
+    return data, scale
+
+
 def rms_norm_add(x, residual, weight, eps=1e-5):
     """Fused residual-add + RMSNorm. Returns (out, x+residual).
 

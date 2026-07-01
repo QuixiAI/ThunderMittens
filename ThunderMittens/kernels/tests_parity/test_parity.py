@@ -390,6 +390,27 @@ def test_mla_kv_insert_parity(norm_mode):
     _assert_parity(om, ot, atol=2e-2)
 
 
+def test_mla_kv_insert_fp8_parity():
+    T, nb, bs = 5, 4, 4
+    rng = np.random.default_rng(23)
+    inv = 10000.0 ** (-(np.arange(0, 64, 2) / 64))
+    ang = np.arange(64)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    kv = (0.5 * rng.standard_normal((T, 512))).astype(np.float32)
+    positions = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+    slot = np.array([0, 5, -1, 6, 11], dtype=np.int64)
+    d0 = np.zeros((nb, bs, 576), dtype=np.uint8)
+    s0 = np.zeros((nb, bs, 8), dtype=np.uint8)
+
+    dm, sm_ = tk.mla_kv_insert_fp8(_mk(kv, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"),
+                                   mx.array(positions), mx.array(slot), mx.array(d0), mx.array(s0))
+    dt, st = tk.mla_kv_insert_fp8(_mk(kv, "torch"), _mk(cos, "torch"), _mk(sin, "torch"),
+                                  torch.from_numpy(positions).to("mps"), torch.from_numpy(slot).to("mps"),
+                                  torch.from_numpy(d0).to("mps"), torch.from_numpy(s0).to("mps"))
+    _assert_parity(dm, dt, atol=0)     # same metallib -> identical packed bytes
+    _assert_parity(sm_, st, atol=0)
+
+
 @pytest.mark.parametrize("D,H_KV", [(64, 2), (128, 1)])
 def test_rope_kv_insert_parity(D, H_KV):
     rng = np.random.default_rng(5)

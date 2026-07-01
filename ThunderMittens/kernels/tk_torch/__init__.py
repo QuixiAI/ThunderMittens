@@ -194,6 +194,11 @@ def mla_kv_insert(kv_c, k_pe, cos, sin, positions, slot_mapping, kv_cache, norm_
                               norm_weight, int(rope_dim), int(norm_mode), float(eps))
 
 
+def mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache):
+    """DeepSeek-V4 packed fp8 MLA KV-insert. Returns (data_cache u8 (…,576), scale_cache u8 (…,8)). MPS."""
+    return _ext.mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache)
+
+
 def gelu(x: torch.Tensor):
     """GELU (tanh approx) over the last axis. bf16 MPS; D in {256,512,768,1024}."""
     return _ext.gelu(x)

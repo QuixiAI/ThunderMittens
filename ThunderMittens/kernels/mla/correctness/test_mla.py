@@ -11,7 +11,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import mla_q_norm_rope, mla_kv_insert
+from tk import mla_q_norm_rope, mla_kv_insert, mla_kv_insert_fp8
+from tk.quant import _e4m3_decode_arr
 
 
 def make_cos_sin(P, rope_dim, base=10000.0):
@@ -110,6 +111,50 @@ def test_mla_kv_insert(norm_mode, latent):
         ref[blk, off, :latent] = lat
         ref[blk, off, latent:] = _rope_interleaved_row(peb[t], cos[positions[t]], sin[positions[t]])
     assert np.max(np.abs(np.array(got.astype(mx.float32)) - ref)) < 3e-2
+
+
+def test_mla_kv_insert_fp8():
+    # DeepSeek-V4 packed: NoPE(448) -> e4m3 fp8 + per-64 UE8M0 scale; RoPE(64) -> interleaved bf16.
+    T, nb, bs = 5, 4, 4
+    rng = np.random.default_rng(3)
+    kv = (0.5 * rng.standard_normal((T, 512))).astype(np.float32)
+    cos, sin = make_cos_sin(64, 64)
+    positions = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+    slot = np.array([0, 5, -1, 6, 11], dtype=np.int64)
+    d0 = np.zeros((nb, bs, 576), dtype=np.uint8)
+    s0 = np.zeros((nb, bs, 8), dtype=np.uint8)
+
+    kvm = mx.array(kv).astype(mx.bfloat16)
+    cm, sm = mx.array(cos).astype(mx.bfloat16), mx.array(sin).astype(mx.bfloat16)
+    data, scale = mla_kv_insert_fp8(kvm, cm, sm, mx.array(positions), mx.array(slot),
+                                    mx.array(d0), mx.array(s0))
+    mx.eval(data, scale)
+    data, scale = np.array(data), np.array(scale)
+    kvb = np.array(kvm.astype(mx.float32))
+
+    for t in range(T):
+        ss = int(slot[t])
+        if ss < 0:
+            continue
+        blk, off = ss // bs, ss % bs
+        nope, rope = kvb[t, :448], kvb[t, 448:]
+        # UE8M0 scale bytes are deterministic — must match exactly.
+        for b in range(7):
+            amax = max(np.abs(nope[b * 64:(b + 1) * 64]).max(), 1e-4)
+            exp = int(np.ceil(np.log2(amax / 448.0)))
+            assert scale[blk, off, b] == min(max(exp + 127, 0), 255)
+        assert scale[blk, off, 7] == 0
+        # NoPE dequant within e4m3 tolerance (2^-4 relative + subnormal floor).
+        deq = np.zeros(448, np.float32)
+        for b in range(7):
+            e = int(scale[blk, off, b])
+            deq[b * 64:(b + 1) * 64] = _e4m3_decode_arr(data[blk, off, b * 64:(b + 1) * 64]) * (2.0 ** (e - 127))
+        assert np.all(np.abs(deq - nope) <= 0.0625 * np.abs(nope) + 2.0 * (2.0 ** -8))
+        # RoPE bytes -> bf16 -> f32, vs interleaved reference.
+        rope_bf = np.frombuffer(data[blk, off, 448:576].tobytes(), dtype=np.uint16)
+        rope_f = (rope_bf.astype(np.uint32) << 16).view(np.float32)
+        ref = _rope_interleaved_row(rope, cos[positions[t]], sin[positions[t]])
+        assert np.max(np.abs(rope_f - ref)) < 3e-2
 
 
 if __name__ == "__main__":

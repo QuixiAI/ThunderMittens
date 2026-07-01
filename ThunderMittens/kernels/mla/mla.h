@@ -56,6 +56,25 @@ array mla_kv_insert(
     float eps = 1e-6f,
     StreamOrDevice s = {});
 
+/**
+ *  DeepSeek-V4/V3.2 packed MLA KV-insert (P3). The 512-wide latent [448 NoPE | 64 RoPE] is packed:
+ *  NoPE → e4m3 fp8 with a per-64-block UE8M0 (power-of-2) scale, RoPE → interleaved RoPE bf16.
+ *  Returns (data_cache uint8 (…, 576) = 448 codes ‖ 128 rope bytes, scale_cache uint8 (…, 8) = 7
+ *  UE8M0 bytes + pad). Clone-then-insert. Dequant: e4m3_decode(code) * 2^(scale_byte-127).
+ *
+ *  kv : (num_tokens, 512).  cos/sin : (max_pos, 32).  positions/slot_mapping : (num_tokens,).
+ *  data_cache/scale_cache : the paged caches to update (num_blocks, block_size, {576, 8}) uint8.
+ **/
+std::vector<array> mla_kv_insert_fp8(
+    const array& kv,
+    const array& cos,
+    const array& sin,
+    const array& positions,
+    const array& slot_mapping,
+    const array& data_cache,
+    const array& scale_cache,
+    StreamOrDevice s = {});
+
 class MlaQNormRope : public Primitive {
  public:
   MlaQNormRope(Stream stream, int num_heads, int nope_dim, int rope_dim, int norm_mode, float eps)
@@ -112,6 +131,24 @@ class MlaKvInsert : public Primitive {
  private:
   int rope_dim_, norm_mode_;
   float eps_;
+};
+
+class MlaKvInsertFp8 : public Primitive {
+ public:
+  explicit MlaKvInsertFp8(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MlaKvInsertFp8"; }
+  void print(std::ostream& os) override { os << "MlaKvInsertFp8"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
 };
 
 } // namespace mlx::core

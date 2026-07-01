@@ -181,10 +181,83 @@ instantiate_mla_kv_insert(128);
 instantiate_mla_kv_insert(256);
 instantiate_mla_kv_insert(512);
 
+// ---------------------------------------------------------------------------
+// P3: mla_kv_insert_fp8 — DeepSeek-V4/V3.2 packed KV-insert. The 512-wide latent is [448 NoPE |
+// 64 RoPE]. NoPE is quantized to e4m3 fp8 with a per-64-block UE8M0 (power-of-2) scale; RoPE gets
+// interleaved RoPE and stays bf16. Per token: data_cache (…, 576 bytes) = 448 code bytes ‖ 128
+// bytes (64 bf16 rope); scale_cache (…, 8 bytes) = 7 UE8M0 exponent bytes + 1 pad. One warp/token,
+// each lane owning 16 contiguous latent elems: lanes 0..27 = 7 NoPE blocks (4 lanes = one 64-block,
+// reduced via simd_shuffle_xor), lanes 28..31 = the 64 RoPE dims. UE8M0: exponent =
+// ceil(log2(absmax/448)); scale_byte = exponent+127; code = e4m3(x·2^-exponent) (matches vLLM).
+// ---------------------------------------------------------------------------
+kernel void mla_kv_insert_fp8(device const bf16 *kv          [[buffer(0)]],   // (T, 512)
+                              device const bf16 *cosb        [[buffer(1)]],   // (P, 32)
+                              device const bf16 *sinb        [[buffer(2)]],
+                              device const int  *positions   [[buffer(3)]],
+                              device const long *slot_mapping [[buffer(4)]],
+                              device uchar *data_cache       [[buffer(5)]],   // (nb, bs, 576)
+                              device uchar *scale_cache      [[buffer(6)]],   // (nb, bs, 8)
+                              constant int &block_size       [[buffer(7)]],
+                              uint3 blockIdx [[threadgroup_position_in_grid]],
+                              uint  laneId   [[thread_index_in_simdgroup]]) {
+    constexpr int LAT = 512, NOPE = 448, PER_LANE = 16, NOPE_LANES = NOPE / PER_LANE;  // 28
+    constexpr float FP8_MAX = 448.0f;
+    const int token = blockIdx.x;
+    const long slot = slot_mapping[token];
+    if (slot < 0) { return; }
+    const long dslot = (slot / block_size) * block_size + (slot % block_size);
+    const long dst_data = dslot * 576;
+    const long dst_scale = dslot * 8;
+    const int pos = positions[token];
+    const long kbase = (long)token * LAT + (long)laneId * PER_LANE;
+
+    float v[PER_LANE];
+    for (int k = 0; k < PER_LANE; ++k) { v[k] = float(kv[kbase + k]); }
+
+    // Per-64-block absmax = max over the 4 lanes in this lane's block (unconditional — the shuffle
+    // is convergent; RoPE lanes 28..31 form their own harmless group we ignore).
+    float amax = 0.0f;
+    for (int k = 0; k < PER_LANE; ++k) { amax = metal::max(amax, metal::fabs(v[k])); }
+    amax = metal::max(amax, metal::simd_shuffle_xor(amax, 1));
+    amax = metal::max(amax, metal::simd_shuffle_xor(amax, 2));
+    const float exponent = metal::ceil(metal::log2(metal::max(amax, 1e-4f) / FP8_MAX));
+    const float inv_scale = metal::exp2(-exponent);
+
+    if ((int)laneId < NOPE_LANES) {
+        for (int k = 0; k < PER_LANE; ++k) {
+            data_cache[dst_data + laneId * PER_LANE + k] = tk_e4m3_encode(v[k] * inv_scale);
+        }
+        if ((laneId & 3) == 0) {   // first lane of each 4-lane (64-elem) block writes its scale byte
+            const int e = metal::clamp((int)exponent + 127, 0, 255);
+            scale_cache[dst_scale + laneId / 4] = (uchar)e;
+        }
+    } else {
+        // RoPE dims [448,512): this lane holds a 16-wide contiguous slice (8 pairs).
+        const int rl = ((int)laneId - NOPE_LANES) * PER_LANE;   // rope-local start: 0,16,32,48
+        device bf16 *rope_out = (device bf16 *)(data_cache + dst_data + NOPE);
+        for (int j = 0; j < PER_LANE; j += 2) {
+            const int p = (rl + j) / 2;                          // rope pair index 0..31
+            const float c = float(cosb[(long)pos * 32 + p]);
+            const float s = float(sinb[(long)pos * 32 + p]);
+            rope_out[rl + j]     = bf16(v[j] * c - v[j + 1] * s);
+            rope_out[rl + j + 1] = bf16(v[j] * s + v[j + 1] * c);
+        }
+    }
+    if (laneId == 0) { scale_cache[dst_scale + 7] = 0; }   // pad byte
+}
+
 // Single-buffer bf16 copy (clone-then-insert prologue for the MLA cache).
 kernel void mla_cache_clone(device const bf16 *src [[buffer(0)]],
                             device bf16       *dst [[buffer(1)]],
                             constant ulong &n      [[buffer(2)]],
                             uint tid [[thread_position_in_grid]]) {
+    if ((ulong)tid < n) { dst[tid] = src[tid]; }
+}
+
+// Single-buffer uchar copy (clone prologue for the packed fp8 data/scale caches).
+kernel void mla_cache_clone_u8(device const uchar *src [[buffer(0)]],
+                               device uchar       *dst [[buffer(1)]],
+                               constant ulong &n       [[buffer(2)]],
+                               uint tid [[thread_position_in_grid]]) {
     if ((ulong)tid < n) { dst[tid] = src[tid]; }
 }

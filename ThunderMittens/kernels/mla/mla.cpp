@@ -165,6 +165,74 @@ void MlaKvInsert::eval_gpu(const std::vector<array>& inputs, std::vector<array>&
                            num_tokens, block_size, rope_dim_, norm_mode_, eps_, latent);
 }
 
+std::vector<array> mla_kv_insert_fp8(
+    const array& kv,
+    const array& cos,
+    const array& sin,
+    const array& positions,
+    const array& slot_mapping,
+    const array& data_cache,
+    const array& scale_cache,
+    StreamOrDevice s) {
+  if (kv.ndim() < 2 || kv.shape(-1) != 512) {
+    throw std::invalid_argument("mla_kv_insert_fp8: kv must be (…, 512) [448 NoPE | 64 RoPE]");
+  }
+  if (data_cache.ndim() != 3 || data_cache.shape(2) != 576) {
+    throw std::invalid_argument("mla_kv_insert_fp8: data_cache must be (num_blocks, block_size, 576) uint8");
+  }
+  if (scale_cache.ndim() != 3 || scale_cache.shape(2) != 8 ||
+      scale_cache.shape(0) != data_cache.shape(0) || scale_cache.shape(1) != data_cache.shape(1)) {
+    throw std::invalid_argument("mla_kv_insert_fp8: scale_cache must be (num_blocks, block_size, 8) uint8");
+  }
+  if (cos.shape(-1) != 32 || sin.shape(-1) != 32) {
+    throw std::invalid_argument("mla_kv_insert_fp8: cos/sin must be (max_pos, 32)");
+  }
+
+  auto kv_c = mla_contig_bf16(kv, s);
+  auto cos_c = mla_contig_bf16(cos, s);
+  auto sin_c = mla_contig_bf16(sin, s);
+  auto pos_c = contiguous(astype(positions, int32, s), false, s);
+  auto slot_c = contiguous(astype(slot_mapping, int64, s), false, s);
+  auto data_c = contiguous(astype(data_cache, uint8, s), false, s);
+  auto scale_c = contiguous(astype(scale_cache, uint8, s), false, s);
+
+  return array::make_arrays(
+      {data_cache.shape(), scale_cache.shape()},
+      {uint8, uint8},
+      std::make_shared<MlaKvInsertFp8>(to_stream(s)),
+      {kv_c, cos_c, sin_c, pos_c, slot_c, data_c, scale_c});
+}
+
+void MlaKvInsertFp8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MlaKvInsertFp8 has no CPU implementation.");
+}
+
+void MlaKvInsertFp8::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& kv = inputs[0];
+  auto& cos = inputs[1];
+  auto& sin = inputs[2];
+  auto& positions = inputs[3];
+  auto& slot_mapping = inputs[4];
+  auto& data_in = inputs[5];
+  auto& scale_in = inputs[6];
+  auto& data_out = outputs[0];
+  auto& scale_out = outputs[1];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  data_out.set_data(allocator::malloc_or_wait(data_out.nbytes()));
+  scale_out.set_data(allocator::malloc_or_wait(scale_out.nbytes()));
+
+  const int num_tokens = static_cast<int>(kv.size() / 512);
+  const int block_size = data_in.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_mla_cache_clone_u8(enc, data_in, data_out, static_cast<uint64_t>(data_out.size()));
+  tk::launch_mla_cache_clone_u8(enc, scale_in, scale_out, static_cast<uint64_t>(scale_out.size()));
+  tk::launch_mla_kv_insert_fp8(enc, kv, cos, sin, positions, slot_mapping, data_out, scale_out,
+                               num_tokens, block_size);
+}
+
 #define TK_MLA_NO_AUTODIFF(CLASS, LABEL)                                     \
   std::vector<array> CLASS::jvp(                                             \
       const std::vector<array>&, const std::vector<array>&,                  \
@@ -183,5 +251,6 @@ void MlaKvInsert::eval_gpu(const std::vector<array>& inputs, std::vector<array>&
 
 TK_MLA_NO_AUTODIFF(MlaQNormRope, "MlaQNormRope")
 TK_MLA_NO_AUTODIFF(MlaKvInsert, "MlaKvInsert")
+TK_MLA_NO_AUTODIFF(MlaKvInsertFp8, "MlaKvInsertFp8")
 
 } // namespace mlx::core

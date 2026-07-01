@@ -69,6 +69,18 @@ array paged_attention_block_sparse(
     float scale = 0.0f,
     StreamOrDevice s = {});
 
+// vLLM x-packed cache decode: reads caches in vLLM's memory order so a ThunderMittens decode can
+// consume a vLLM KV cache directly. key_cache (num_blocks, num_kv_heads, head_size/x, block_size, x);
+// value_cache (num_blocks, num_kv_heads, head_size, block_size). x = 16/sizeof(dtype).
+array paged_attention_xcache(
+    const array& q,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    float scale = 0.0f,
+    StreamOrDevice s = {});
+
 // GQA KV-reuse staged decode: bit-equivalent to paged_attention but stages each KV vector
 // once into threadgroup memory and reuses it across the query heads sharing that kv_head.
 array paged_attention_staged(
@@ -314,6 +326,29 @@ class PagedAttentionStaged : public Primitive {
   void print(std::ostream& os) override { os << "PagedAttentionStaged"; }
   bool is_equivalent(const Primitive& other) const override {
     return scale_ == static_cast<const PagedAttentionStaged&>(other).scale_;
+  }
+
+ private:
+  float scale_;
+};
+
+class PagedAttentionXcache : public Primitive {
+ public:
+  PagedAttentionXcache(Stream stream, float scale) : Primitive(stream), scale_(scale) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "PagedAttentionXcache"; }
+  void print(std::ostream& os) override { os << "PagedAttentionXcache"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return scale_ == static_cast<const PagedAttentionXcache&>(other).scale_;
   }
 
  private:

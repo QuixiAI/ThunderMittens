@@ -302,6 +302,85 @@ array paged_attention_block_sparse(
       {q_c, key_c, value_c, table_c, lens_c, no_alibi, mask_c});
 }
 
+array paged_attention_xcache(
+    const array& q,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    float scale,
+    StreamOrDevice s) {
+  if (q.ndim() != 3) {
+    throw std::invalid_argument("paged_attention_xcache: q must have shape (batch, num_heads, head_size)");
+  }
+  if (key_cache.ndim() != 5) {
+    throw std::invalid_argument("paged_attention_xcache: key_cache must be (num_blocks, num_kv_heads, head_size/x, block_size, x)");
+  }
+  if (value_cache.ndim() != 4) {
+    throw std::invalid_argument("paged_attention_xcache: value_cache must be (num_blocks, num_kv_heads, head_size, block_size)");
+  }
+  const int D = q.shape(2);
+  const int x = key_cache.shape(4);
+  const int num_kv_heads = key_cache.shape(1);
+  const int block_size = key_cache.shape(3);
+  if (!(D == 64 || D == 128)) {
+    throw std::invalid_argument("paged_attention_xcache: head_size must be 64 or 128");
+  }
+  if (x <= 0 || D % x != 0 || key_cache.shape(2) != D / x) {
+    throw std::invalid_argument("paged_attention_xcache: key_cache head_size/x split is inconsistent with q head_size");
+  }
+  if (value_cache.shape(1) != num_kv_heads || value_cache.shape(2) != D || value_cache.shape(3) != block_size ||
+      value_cache.shape(0) != key_cache.shape(0)) {
+    throw std::invalid_argument("paged_attention_xcache: value_cache shape inconsistent with key_cache");
+  }
+  if (num_kv_heads <= 0 || q.shape(1) % num_kv_heads != 0) {
+    throw std::invalid_argument("paged_attention_xcache: num_q_heads must be a positive multiple of num_kv_heads (GQA/MQA)");
+  }
+  auto dtype = promote_types(q.dtype(), key_cache.dtype());
+  dtype = promote_types(dtype, value_cache.dtype());
+  if (!is_supported_float(dtype)) {
+    throw std::invalid_argument("paged_attention_xcache: dtype must be float32, float16, or bfloat16");
+  }
+  auto q_c = contiguous_cast(q, dtype, s);
+  auto key_c = contiguous_cast(key_cache, dtype, s);
+  auto value_c = contiguous_cast(value_cache, dtype, s);
+  auto table_c = contiguous(astype(block_table, int32, s), false, s);
+  auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
+  return array(
+      q.shape(),
+      dtype,
+      std::make_shared<PagedAttentionXcache>(to_stream(s), scale),
+      {q_c, key_c, value_c, table_c, lens_c});
+}
+
+void PagedAttentionXcache::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("PagedAttentionXcache has no CPU implementation.");
+}
+
+void PagedAttentionXcache::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& q = inputs[0];
+  auto& key_cache = inputs[1];
+  auto& value_cache = inputs[2];
+  auto& block_table = inputs[3];
+  auto& context_lens = inputs[4];
+  auto& out = outputs[0];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+
+  const int D = q.shape(2);
+  const int x = key_cache.shape(4);
+  const float scale = scale_ > 0.0f ? scale_ : 1.0f / std::sqrt(static_cast<float>(D));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_paged_attention_xcache(
+      enc, q, key_cache, value_cache, block_table, context_lens, out,
+      q.shape(0), q.shape(1), key_cache.shape(1), D, key_cache.shape(3),
+      block_table.shape(1), scale, x, type_to_name(q));
+}
+
 array paged_attention_staged(
     const array& q,
     const array& key_cache,
@@ -727,5 +806,6 @@ TK_KV_NO_AUTODIFF(KvCacheCopyBlocks, "KvCacheCopyBlocks")
 TK_KV_NO_AUTODIFF(KvCacheScales, "KvCacheScales")
 TK_KV_NO_AUTODIFF(PagedAttention, "PagedAttention")
 TK_KV_NO_AUTODIFF(PagedAttentionStaged, "PagedAttentionStaged")
+TK_KV_NO_AUTODIFF(PagedAttentionXcache, "PagedAttentionXcache")
 
 } // namespace mlx::core

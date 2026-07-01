@@ -254,6 +254,77 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
     }
 }
 
+// vLLM x-packed cache layout: same decode, but the caches use vLLM's memory order so a
+// ThunderMittens decode can read a vLLM KV cache directly. key_cache is
+// (num_blocks, num_kv_heads, head_size/x, block_size, x) — the head dim is split into x-wide
+// chunks with block_size in between (x = 16/sizeof(dtype) for coalesced 16-byte loads);
+// value_cache is (num_blocks, num_kv_heads, head_size, block_size). x is passed at runtime.
+template <typename T, int D>
+kernel void paged_attention_xcache(device const T *q [[buffer(0)]],
+                                   device const T *key_cache [[buffer(1)]],
+                                   device const T *value_cache [[buffer(2)]],
+                                   device const int *block_table [[buffer(3)]],
+                                   device const int *context_lens [[buffer(4)]],
+                                   device T *out [[buffer(5)]],
+                                   constant int &block_size [[buffer(6)]],
+                                   constant int &block_table_stride [[buffer(7)]],
+                                   constant float &scale [[buffer(8)]],
+                                   constant int &num_heads [[buffer(9)]],
+                                   constant int &num_kv_heads [[buffer(10)]],
+                                   constant int &x [[buffer(11)]],
+                                   uint3 tgid [[threadgroup_position_in_grid]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int VALUES_PER_LANE = D / 32;
+
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int kv_head = head / (num_heads / num_kv_heads);
+    const int context_len = context_lens[batch];
+    const long row_base = ((long)batch * num_heads + head) * D;
+    const int dh = D / x;   // head_size / x (number of x-wide chunks)
+
+    float qv[VALUES_PER_LANE], acc[VALUES_PER_LANE];
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        qv[i] = float(q[row_base + d]);
+        acc[i] = 0.0f;
+    }
+
+    float m = -3.4028234663852886e38f, l = 0.0f;
+    for (int t = 0; t < context_len; ++t) {
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) { continue; }
+
+        const long kv_hbase = (long)block * num_kv_heads + kv_head;
+        float partial = 0.0f;
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            // key_cache[block][kv_head][d/x][slot][d%x]
+            const long kidx = (((kv_hbase * dh + d / x) * block_size + slot) * x) + (d % x);
+            partial += qv[i] * float(key_cache[kidx]);
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            // value_cache[block][kv_head][d][slot]
+            const long vidx = (kv_hbase * D + d) * block_size + slot;
+            acc[i] = acc[i] * alpha + beta * float(value_cache[vidx]);
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        out[row_base + d] = l == 0.0f ? T(0) : T(acc[i] / l);
+    }
+}
+
 // GQA KV-reuse staged decode: one threadgroup per (kv_head, batch) with `group_size`
 // simdgroups (one query head each). Each KV token vector is staged into threadgroup memory
 // ONCE and reused by every query head sharing that kv_head, amortizing the cache bandwidth
@@ -590,6 +661,24 @@ instantiate_paged_attention_fp8(bfloat16, bf16, 128)
       uint simd_id [[simdgroup_index_in_threadgroup]],                       \
       uint3 ntg [[threads_per_threadgroup]]);
 
+#define instantiate_paged_attention_xcache(type_name, T, DVAL)                \
+  template [[host_name("paged_attention_xcache_" #type_name "_" #DVAL)]]      \
+  [[kernel]] void paged_attention_xcache<T, DVAL>(                            \
+      device const T *q [[buffer(0)]],                                       \
+      device const T *key_cache [[buffer(1)]],                               \
+      device const T *value_cache [[buffer(2)]],                             \
+      device const int *block_table [[buffer(3)]],                           \
+      device const int *context_lens [[buffer(4)]],                          \
+      device T *out [[buffer(5)]],                                           \
+      constant int &block_size [[buffer(6)]],                                \
+      constant int &block_table_stride [[buffer(7)]],                        \
+      constant float &scale [[buffer(8)]],                                   \
+      constant int &num_heads [[buffer(9)]],                                 \
+      constant int &num_kv_heads [[buffer(10)]],                             \
+      constant int &x [[buffer(11)]],                                        \
+      uint3 tgid [[threadgroup_position_in_grid]],                           \
+      uint lane [[thread_index_in_simdgroup]]);
+
 instantiate_kv_cache_type(float32, float)
 instantiate_kv_cache_type(float16, half)
 instantiate_kv_cache_type(bfloat16, bf16)
@@ -607,3 +696,10 @@ instantiate_paged_attention_staged(float16, half, 64)
 instantiate_paged_attention_staged(float16, half, 128)
 instantiate_paged_attention_staged(bfloat16, bf16, 64)
 instantiate_paged_attention_staged(bfloat16, bf16, 128)
+
+instantiate_paged_attention_xcache(float32, float, 64)
+instantiate_paged_attention_xcache(float32, float, 128)
+instantiate_paged_attention_xcache(float16, half, 64)
+instantiate_paged_attention_xcache(float16, half, 128)
+instantiate_paged_attention_xcache(bfloat16, bf16, 64)
+instantiate_paged_attention_xcache(bfloat16, bf16, 128)

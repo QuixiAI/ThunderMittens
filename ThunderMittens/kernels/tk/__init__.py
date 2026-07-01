@@ -282,6 +282,18 @@ def paged_attention_block_sparse(q, key_cache, value_cache, block_table, context
                                                context_lens, block_mask, scale)
 
 
+def paged_attention_xcache(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
+    """Paged decode over a vLLM x-packed KV cache (so a vLLM cache can be consumed directly):
+    key_cache (num_blocks, num_kv_heads, head_size/x, block_size, x), value_cache
+    (num_blocks, num_kv_heads, head_size, block_size), x = 16/sizeof(dtype). Bit-equivalent to
+    paged_attention on the same values. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().paged_attention_xcache(q, key_cache, value_cache, block_table,
+                                               context_lens, scale)
+    return _mlx().paged_attention_xcache(q, key_cache, value_cache, block_table, context_lens,
+                                         scale)
+
+
 def paged_attention_staged(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
     """GQA KV-reuse staged decode: bit-equivalent to paged_attention, but stages each KV vector
     once into threadgroup memory and reuses it across the query heads sharing that kv_head

@@ -66,6 +66,9 @@ inline std::string paged_attention_kernel_name(const std::string& t, int D) {
 inline std::string paged_attention_gqa_staged_kernel_name(const std::string& t, int D) {
   return "paged_attention_gqa_staged_" + t + "_" + std::to_string(D);
 }
+inline std::string paged_attention_xcache_kernel_name(const std::string& t, int D) {
+  return "paged_attention_xcache_" + t + "_" + std::to_string(D);
+}
 inline std::string kv_cache_scatter_fp8_kernel_name(const std::string& t) { return "kv_cache_scatter_fp8_" + t; }
 inline std::string paged_attention_fp8_kernel_name(const std::string& t, int D) {
   return "paged_attention_fp8_" + t + "_" + std::to_string(D);
@@ -680,6 +683,22 @@ void launch_paged_attention(
   e.bytes(use_alibi, 12);
   e.in(block_mask, 13);
   e.bytes(use_mask, 14);
+  e.dispatch(num_heads, batch, 1, 32, 1, 1);
+}
+
+// vLLM x-packed cache decode: same grid as paged_attention; caches use vLLM's memory order,
+// x@11 (= 16/sizeof(dtype)) selects the packed head-dim stride.
+template <class E>
+void launch_paged_attention_xcache(
+    E& e, typename E::in_t q, typename E::in_t key_cache, typename E::in_t value_cache,
+    typename E::in_t block_table, typename E::in_t context_lens, typename E::out_t out,
+    int batch, int num_heads, int num_kv_heads, int head_size, int block_size,
+    int block_table_stride, float scale, int x, const std::string& type_name) {
+  e.pipeline(paged_attention_xcache_kernel_name(type_name, head_size));
+  e.in(q, 0); e.in(key_cache, 1); e.in(value_cache, 2);
+  e.in(block_table, 3); e.in(context_lens, 4); e.out(out, 5);
+  e.bytes(block_size, 6); e.bytes(block_table_stride, 7); e.bytes(scale, 8);
+  e.bytes(num_heads, 9); e.bytes(num_kv_heads, 10); e.bytes(x, 11);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 

@@ -261,6 +261,12 @@ def paged_attention_block_sparse(q, key_cache, value_cache, block_table, context
                                              block_mask, float(scale))
 
 
+def paged_attention_xcache(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
+    """Paged decode over a vLLM x-packed KV cache: key (nb, nkv, hd/x, bs, x), value (nb, nkv, hd, bs). MPS."""
+    return _ext.paged_attention_xcache(q, key_cache, value_cache, block_table, context_lens,
+                                       float(scale))
+
+
 def paged_attention_staged(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
     """GQA KV-reuse staged decode; bit-equivalent to paged_attention. MPS."""
     return _ext.paged_attention_staged(q, key_cache, value_cache, block_table, context_lens,

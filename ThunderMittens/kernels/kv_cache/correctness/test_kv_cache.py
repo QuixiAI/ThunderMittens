@@ -17,6 +17,7 @@ from tk import (
     paged_attention_block_sparse,
     paged_attention_fp8,
     paged_attention_staged,
+    paged_attention_xcache,
 )
 from tk.quant import _e4m3_decode_arr, _e5m2_decode_arr
 
@@ -294,6 +295,37 @@ def test_paged_attention_alibi(dtype, atol, D, H, H_KV):
         _np(qm).astype(np.float32), _np(km).astype(np.float32), _np(vm).astype(np.float32),
         block_table, context_lens, scale, slopes)
     np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=2e-3)
+
+
+def _to_xcache(dense_key, dense_value, x):
+    """Dense (nb, bs, nkv, hd) K/V -> vLLM x-packed key (nb, nkv, hd/x, bs, x) + value (nb, nkv, hd, bs)."""
+    nb, bs, nkv, hd = dense_key.shape
+    xk = dense_key.transpose(0, 2, 3, 1).reshape(nb, nkv, hd // x, x, bs).transpose(0, 1, 2, 4, 3).copy()
+    xv = dense_value.transpose(0, 2, 3, 1).copy()   # (nb, nkv, hd, bs)
+    return xk, xv
+
+
+@pytest.mark.parametrize("dtype,atol", [("float32", 3e-5), ("bfloat16", 2e-2)])
+@pytest.mark.parametrize("D,x", [(64, 8), (128, 8), (128, 4)])
+@pytest.mark.parametrize("H,H_KV", [(2, 2), (8, 2), (4, 1)])  # MHA, GQA group 4, MQA
+def test_paged_attention_xcache(dtype, atol, D, x, H, H_KV):
+    # Consuming a vLLM x-packed cache must equal the dense paged_attention on the same values.
+    rng = np.random.default_rng(75 + D + H + H_KV + x)
+    B, num_blocks, block_size = 2, 8, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    dk = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    dv = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    block_table = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    context_lens = np.array([10, 16], dtype=np.int32)
+    xk, xv = _to_xcache(dk, dv, x)
+
+    md = _mx_dtype(dtype)
+    base = paged_attention(mx.array(q).astype(md), mx.array(dk).astype(md), mx.array(dv).astype(md),
+                           mx.array(block_table), mx.array(context_lens))
+    got = paged_attention_xcache(mx.array(q).astype(md), mx.array(xk).astype(md), mx.array(xv).astype(md),
+                                 mx.array(block_table), mx.array(context_lens))
+    mx.eval(base, got)
+    np.testing.assert_array_equal(_np(got), _np(base))   # identical values, only memory order differs
 
 
 @pytest.mark.parametrize("dtype,atol", [("float32", 3e-5), ("bfloat16", 2e-2)])

@@ -909,6 +909,25 @@ def test_paged_attention_gqa_parity(H, H_KV):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("H,H_KV,x", [(4, 2, 8), (4, 1, 4)])
+def test_paged_attention_xcache_parity(H, H_KV, x):
+    rng = np.random.default_rng(15)
+    B, D, num_blocks, block_size = 2, 64, 8, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    dk = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    dv = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    xk = dk.transpose(0, 2, 3, 1).reshape(num_blocks, H_KV, D // x, x, block_size).transpose(0, 1, 2, 4, 3).copy()
+    xv = dv.transpose(0, 2, 3, 1).copy()
+
+    om = tk.paged_attention_xcache(_mk(q, "mlx", "bf16"), _mk(xk, "mlx", "bf16"), _mk(xv, "mlx", "bf16"),
+                                   mx.array(bt), mx.array(cl))
+    ot = tk.paged_attention_xcache(_mk(q, "torch", "bf16"), _mk(xk, "torch", "bf16"), _mk(xv, "torch", "bf16"),
+                                   torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"))
+    _assert_parity(om, ot, atol=2e-2)
+
+
 @pytest.mark.parametrize("H,H_KV", [(4, 2), (4, 1)])
 def test_paged_attention_block_sparse_parity(H, H_KV):
     rng = np.random.default_rng(12)

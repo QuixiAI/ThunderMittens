@@ -579,6 +579,21 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "paged_attention_xcache",
+      &paged_attention_xcache,
+      "q"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      "scale"_a = 0.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        paged decode over a vLLM x-packed KV cache: key (nb, nkv, hd/x, bs, x), value (nb, nkv, hd, bs).
+      )");
+
+    m.def(
       "kv_cache_scatter_fp8",
       &kv_cache_scatter_fp8,
       "key"_a,

@@ -233,4 +233,31 @@ prod(thread typename base_types::packing<typename RV::dtype>::unpacked_type &pro
     reduce<base_ops::mul, RV, false>(prod_val, src, src_accum, laneid);
 }
 
+/* ----------  Argmax / argmin with carried index (P1)  ---------- */
+
+/**
+ * @brief Butterfly argmax-with-index all-reduce over a simdgroup.
+ *
+ * Every lane ends with (max value, its index); ties break toward the smaller
+ * index — matching numpy argmax / the TRT-LLM TopK_2 semantics. The all-reduce
+ * (xor butterfly) form lets callers learn the winner on every lane (e.g. to mask
+ * it out for the next top-k iteration). Used by the sampling and MoE routing kernels.
+ */
+static METAL_FUNC void simd_argmax(thread float &val, thread int &idx) {
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = metal::simd_shuffle_xor(val, off);
+        const int oi = metal::simd_shuffle_xor(idx, off);
+        if (ov > val || (ov == val && oi < idx)) { val = ov; idx = oi; }
+    }
+}
+
+/** Butterfly argmin-with-index all-reduce; ties break toward the smaller index. */
+static METAL_FUNC void simd_argmin(thread float &val, thread int &idx) {
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = metal::simd_shuffle_xor(val, off);
+        const int oi = metal::simd_shuffle_xor(idx, off);
+        if (ov < val || (ov == val && oi < idx)) { val = ov; idx = oi; }
+    }
+}
+
 }

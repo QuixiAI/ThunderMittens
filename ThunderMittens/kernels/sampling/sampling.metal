@@ -8,38 +8,13 @@ using namespace mittens;
 // Sampling kernels: keep the final decode step on-GPU. One simdgroup (32 lanes)
 // per row of logits (vocab dimension V, any size, looped with stride 32).
 //
-// P1 — threadgroup argmax-with-index: cross-lane max carrying the index, ties
-// broken toward the smaller index (matches numpy argmax / TRT-LLM TopK_2).
+// Substrate primitives reused: mittens::simd_argmax (P1, argmax-with-index) and
+// mittens::rng_uniform / rng_gumbel (P4, reproducible RNG).
 // ---------------------------------------------------------------------------
 
 constant float SMP_NEG_INF = -3.4028234663852886e38f;
 
 constant int SAMPLE_MAX_K = 64;
-
-// Butterfly argmax-with-index all-reduce: every lane ends with (max val, its idx),
-// ties toward the smaller index. (Lane 0 holds the result too, so the single-winner
-// kernels still write correctly; the all-reduce form lets top-k mask the winner.)
-static inline void simd_argmax(thread float &val, thread int &idx) {
-    for (int off = 16; off > 0; off >>= 1) {
-        const float ov = simd_shuffle_xor(val, off);
-        const int oi = simd_shuffle_xor(idx, off);
-        if (ov > val || (ov == val && oi < idx)) {
-            val = ov;
-            idx = oi;
-        }
-    }
-}
-
-// P4 — counter-based hash RNG (reproducible, NOT cryptographic). u(seed,row,i) in [0,1).
-// A Murmur3-style integer finalizer over a mixed counter; replicated bit-for-bit in numpy
-// so stochastic sampling has an exact, deterministic oracle.
-static inline float rng_uniform(uint seed, uint row, uint i) {
-    uint x = seed * 0x9E3779B9u + row * 0x85EBCA77u + i * 0xC2B2AE3Du;
-    x ^= x >> 16; x *= 0x7FEB352Du;
-    x ^= x >> 15; x *= 0x846CA68Bu;
-    x ^= x >> 16;
-    return float(x >> 8) * (1.0f / 16777216.0f);   // 24-bit mantissa -> [0,1)
-}
 
 template <typename T>
 kernel void argmax(device const T *logits  [[buffer(0)]],
@@ -79,8 +54,7 @@ kernel void sample_categorical(device const T *logits  [[buffer(0)]],
     float best = SMP_NEG_INF;
     int bi = (int)lane < V ? (int)lane : 0;
     for (int i = (int)lane; i < V; i += 32) {
-        const float u = rng_uniform(seed, (uint)row, (uint)i);
-        const float g = -log(-log(max(u, 1e-20f)));     // Gumbel(0,1)
+        const float g = rng_gumbel(seed, (uint)row, (uint)i);   // Gumbel(0,1)
         const float p = float(logits[base + i]) * invtemp + g;
         if (p > best || (p == best && i < bi)) {
             best = p;
@@ -133,8 +107,7 @@ kernel void top_k_sample(device const T *logits  [[buffer(0)]],
     float best = SMP_NEG_INF;
     int bi = chosen_id[0];
     for (int j = 0; j < K; ++j) {
-        const float u = rng_uniform(seed, (uint)row, (uint)chosen_id[j]);
-        const float g = -log(-log(max(u, 1e-20f)));
+        const float g = rng_gumbel(seed, (uint)row, (uint)chosen_id[j]);
         const float p = chosen_logit[j] * invtemp + g;
         if (p > best || (p == best && chosen_id[j] < bi)) {
             best = p;
@@ -160,7 +133,7 @@ kernel void penalty_histogram(device const int *prev_tokens [[buffer(0)]],
     const int row = (int)tid / L;
     const int tok = prev_tokens[tid];
     if (tok >= 0 && tok < V) {
-        atomic_fetch_add_explicit(&counts[(long)row * V + tok], 1, memory_order_relaxed);
+        atomic_add(counts, row * V + tok, 1);   // P3
     }
 }
 
@@ -236,8 +209,7 @@ kernel void top_p_sample(device const T *logits  [[buffer(0)]],
     for (int i = (int)lane; i < V; i += 32) {
         const float ls = float(logits[base + i]) * invtemp;
         if (ls < L) { continue; }
-        const float u = rng_uniform(seed, (uint)row, (uint)i);
-        const float g = -log(-log(max(u, 1e-20f)));
+        const float g = rng_gumbel(seed, (uint)row, (uint)i);
         const float pert = ls + g;
         if (pert > best || (pert == best && i < bi)) {
             best = pert;

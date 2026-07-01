@@ -227,7 +227,7 @@ void launch_moe_scan_offsets(Enc& e, typename Enc::in_t counts, typename Enc::ou
                              typename Enc::out_t cursor, int num_experts) {
   e.pipeline("moe_scan_offsets");
   e.in(counts, 0); e.out(offsets, 1); e.out(cursor, 2); e.bytes(num_experts, 3);
-  e.dispatch(1, 1, 1, 1, 1, 1);
+  e.dispatch(1, 1, 1, 256, 1, 1);   // one threadgroup; parallel P2 scan
 }
 template <class Enc>
 void launch_moe_scatter(Enc& e, typename Enc::in_t topk_ids, typename Enc::out_t cursor,

@@ -19,18 +19,8 @@ using namespace mittens;
 constant float MOE_NEG_INF = -3.4028234663852886e38f;
 constant int MOE_MAX_K = 16;
 
-// Butterfly argmax-with-index all-reduce: every lane ends with (max val, its idx),
-// ties broken toward the smaller index. (max-value, min-index) is associative+commutative.
-static inline void moe_simd_argmax(thread float &val, thread int &idx) {
-    for (int off = 16; off > 0; off >>= 1) {
-        const float ov = simd_shuffle_xor(val, off);
-        const int oi = simd_shuffle_xor(idx, off);
-        if (ov > val || (ov == val && oi < idx)) {
-            val = ov;
-            idx = oi;
-        }
-    }
-}
+// Substrate reused: mittens::simd_argmax (P1), threadgroup_exclusive_scan_i32 (P2),
+// atomic_add / atomic_fetch_inc (P3).
 
 template <typename T>
 kernel void moe_route_topk(device const T *logits       [[buffer(0)]],
@@ -59,7 +49,7 @@ kernel void moe_route_topk(device const T *logits       [[buffer(0)]],
                 bi = i;
             }
         }
-        moe_simd_argmax(best, bi);   // all lanes now hold the k-th expert
+        simd_argmax(best, bi);   // all lanes now hold the k-th expert (P1)
         chosen_id[k] = bi;
         chosen_logit[k] = best;
     }
@@ -108,24 +98,39 @@ kernel void moe_histogram(device const int *topk_ids [[buffer(0)]],
                           constant int &TK [[buffer(2)]],
                           uint tid [[thread_position_in_grid]]) {
     if ((int)tid >= TK) { return; }
-    const int e = topk_ids[tid];
-    atomic_fetch_add_explicit(&counts[e], 1, memory_order_relaxed);
+    atomic_add(counts, topk_ids[tid], 1);   // P3
 }
 
 // Single-thread exclusive prefix sum over E experts; also seeds the scatter cursor.
+// Parallel exclusive prefix sum of the per-expert counts (P2 substrate scan), with a
+// running prefix across tiles so any E is supported. offsets[e] = sum(counts[0..e-1]);
+// offsets[E] = total; cursor seeded to offsets for the scatter. One threadgroup.
+constant uint MOE_SCAN_NT = 256;
+
 kernel void moe_scan_offsets(device const int *counts  [[buffer(0)]],
                              device int       *offsets [[buffer(1)]],   // (E+1)
                              device int       *cursor  [[buffer(2)]],   // (E)
                              constant int &E [[buffer(3)]],
-                             uint tid [[thread_position_in_grid]]) {
-    if (tid != 0) { return; }
-    int acc = 0;
-    for (int e = 0; e < E; ++e) {
-        offsets[e] = acc;
-        cursor[e] = acc;
-        acc += counts[e];
+                             uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup int sg_sums[MOE_SCAN_NT / 32];
+    threadgroup int running;
+    if (tid == 0) { running = 0; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int b = 0; b < E; b += (int)MOE_SCAN_NT) {
+        const int e = b + (int)tid;
+        const int v = (e < E) ? counts[e] : 0;
+        int total;
+        const int excl = threadgroup_exclusive_scan_i32(v, tid, MOE_SCAN_NT, sg_sums, total);
+        if (e < E) {
+            offsets[e] = running + excl;
+            cursor[e] = running + excl;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) { running += total; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    offsets[E] = acc;
+    if (tid == 0) { offsets[E] = running; }
 }
 
 kernel void moe_scatter(device const int *topk_ids       [[buffer(0)]],
@@ -135,8 +140,7 @@ kernel void moe_scatter(device const int *topk_ids       [[buffer(0)]],
                         constant int &TK [[buffer(4)]],
                         uint tid [[thread_position_in_grid]]) {
     if ((int)tid >= TK) { return; }
-    const int e = topk_ids[tid];
-    const int pos = atomic_fetch_add_explicit(&cursor[e], 1, memory_order_relaxed);
+    const int pos = atomic_fetch_inc(cursor, topk_ids[tid]);   // P3 atomic cursor
     sorted_row_idx[pos] = (int)tid;
     inv_idx[tid] = pos;
 }

@@ -48,7 +48,7 @@ def test_moe_route_topk(dtype, E, K):
         np.testing.assert_array_equal(ids, order)
 
 
-@pytest.mark.parametrize("E,K", [(8, 2), (4, 1), (16, 4)])
+@pytest.mark.parametrize("E,K", [(8, 2), (4, 1), (16, 4), (300, 2)])  # E=300 spans >1 scan tile
 def test_moe_permute(E, K):
     rng = np.random.default_rng(0)
     T = 50

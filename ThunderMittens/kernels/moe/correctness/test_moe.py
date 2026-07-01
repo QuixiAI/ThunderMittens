@@ -154,6 +154,50 @@ def test_moe_grouped_gemm(dtype, atol, H):
     np.testing.assert_allclose(np.array(out.astype(mx.float32)), ref, atol=atol, rtol=2e-2)
 
 
+@pytest.mark.parametrize("E,K", [(8, 2), (16, 4)])
+def test_moe_forward_grouped_gemm(E, K):
+    # Full fused MoE forward using the grouped GEMM: route -> permute -> (host-padded gather)
+    # -> moe_grouped_gemm -> finalize, vs a dense per-expert reference.
+    rng = np.random.default_rng(7)
+    T, H = 40, 64
+    x = (0.1 * rng.standard_normal((T, H))).astype(np.float32)
+    rl = rng.standard_normal((T, E)).astype(np.float32)
+    W = (0.1 * rng.standard_normal((E, H, H))).astype(np.float32)
+    xm, Wm = mx.array(x), mx.array(W)
+
+    ids, weights = moe_route_topk(mx.array(rl), K)
+    sidx, offsets, inv = moe_permute(ids, E)
+    mx.eval(ids, weights, sidx, offsets, inv)
+    ids_np, w_np = np.array(ids), np.array(weights)
+    off, sidx_np, inv_np = np.array(offsets), np.array(sidx), np.array(inv)
+
+    counts = np.diff(off)
+    padded = (((counts + 31) // 32) * 32).astype(np.int64)
+    off_pad = np.concatenate([[0], np.cumsum(padded)]).astype(np.int64)
+    total_pad = int(off_pad[-1])
+    tb = off_pad // 32
+    eot = np.zeros(total_pad // 32, np.int32)
+    for e in range(E):
+        eot[tb[e]:tb[e + 1]] = e
+    padpos = np.zeros(len(sidx_np), np.int64)
+    for e in range(E):
+        s, en = int(off[e]), int(off[e + 1])
+        padpos[s:en] = off_pad[e] + np.arange(en - s)
+    gather_idx = np.zeros(total_pad, np.int64)
+    gather_idx[padpos] = sidx_np // K
+
+    permuted_x = xm[mx.array(gather_idx)]                      # (total_pad, H)
+    out_pad = moe_grouped_gemm(permuted_x, Wm, mx.array(eot))  # (total_pad, H)
+    inv_pad = mx.array(padpos[inv_np].astype(np.int32))
+    y = np.array(moe_finalize(out_pad, inv_pad, mx.array(w_np), K))
+
+    ref = np.zeros((T, H), np.float32)
+    for t in range(T):
+        for j in range(K):
+            ref[t] += w_np[t, j] * (x[t] @ W[ids_np[t, j]])
+    np.testing.assert_allclose(y, ref, atol=1e-2, rtol=1e-2)
+
+
 if __name__ == "__main__":
     for E, K in [(8, 2), (64, 4), (16, 1), (128, 8)]:
         test_moe_route_topk("float32", E, K)

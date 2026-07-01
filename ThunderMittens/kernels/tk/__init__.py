@@ -259,6 +259,17 @@ def paged_attention(q, key_cache, value_cache, block_table, context_lens, scale=
     return _mlx().paged_attention(q, key_cache, value_cache, block_table, context_lens, scale)
 
 
+def paged_attention_alibi(q, key_cache, value_cache, block_table, context_lens, alibi_slopes,
+                          scale=0.0):
+    """Paged decode with a per-head ALiBi linear position bias. alibi_slopes is (num_heads,);
+    each score gets slope[h]*(t - context_len + 1). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().paged_attention_alibi(q, key_cache, value_cache, block_table,
+                                              context_lens, alibi_slopes, scale)
+    return _mlx().paged_attention_alibi(q, key_cache, value_cache, block_table, context_lens,
+                                        alibi_slopes, scale)
+
+
 def paged_attention_staged(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
     """GQA KV-reuse staged decode: bit-equivalent to paged_attention, but stages each KV vector
     once into threadgroup memory and reuses it across the query heads sharing that kv_head

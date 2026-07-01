@@ -45,6 +45,18 @@ array paged_attention(
     float scale = 0.0f,
     StreamOrDevice s = {});
 
+// Paged decode with ALiBi: adds a per-head linear position bias slope[h]*(t-ctx+1) to each score.
+// alibi_slopes is (num_heads,). (Runs the same kernel as paged_attention with use_alibi=1.)
+array paged_attention_alibi(
+    const array& q,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    const array& alibi_slopes,
+    float scale = 0.0f,
+    StreamOrDevice s = {});
+
 // GQA KV-reuse staged decode: bit-equivalent to paged_attention but stages each KV vector
 // once into threadgroup memory and reuses it across the query heads sharing that kv_head.
 array paged_attention_staged(
@@ -242,7 +254,8 @@ class PagedAttentionFp8 : public Primitive {
 
 class PagedAttention : public Primitive {
  public:
-  PagedAttention(Stream stream, float scale) : Primitive(stream), scale_(scale) {}
+  PagedAttention(Stream stream, float scale, bool use_alibi = false)
+      : Primitive(stream), scale_(scale), use_alibi_(use_alibi) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
@@ -262,11 +275,13 @@ class PagedAttention : public Primitive {
 
   void print(std::ostream& os) override { os << "PagedAttention"; }
   bool is_equivalent(const Primitive& other) const override {
-    return scale_ == static_cast<const PagedAttention&>(other).scale_;
+    auto& o = static_cast<const PagedAttention&>(other);
+    return scale_ == o.scale_ && use_alibi_ == o.use_alibi_;
   }
 
  private:
   float scale_;
+  bool use_alibi_;
 };
 
 class PagedAttentionStaged : public Primitive {

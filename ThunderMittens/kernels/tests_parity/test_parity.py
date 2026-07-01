@@ -909,6 +909,26 @@ def test_paged_attention_gqa_parity(H, H_KV):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("H,H_KV", [(4, 2), (4, 1)])
+def test_paged_attention_alibi_parity(H, H_KV):
+    rng = np.random.default_rng(9)
+    B, D = 2, 64
+    num_blocks, block_size = 4, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1], [2, 3]], dtype=np.int32)
+    cl = np.array([6, 7], dtype=np.int32)
+    slopes = (0.1 * (1.0 + np.arange(H))).astype(np.float32)
+
+    om = tk.paged_attention_alibi(_mk(q, "mlx", "bf16"), _mk(kc, "mlx", "bf16"), _mk(vc, "mlx", "bf16"),
+                                  mx.array(bt), mx.array(cl), mx.array(slopes))
+    ot = tk.paged_attention_alibi(_mk(q, "torch", "bf16"), _mk(kc, "torch", "bf16"), _mk(vc, "torch", "bf16"),
+                                  torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"),
+                                  torch.from_numpy(slopes).to("mps"))
+    _assert_parity(om, ot, atol=2e-2)
+
+
 @pytest.mark.parametrize("H,H_KV", [(8, 2), (4, 1)])  # GQA group 4, MQA
 def test_paged_attention_staged_parity(H, H_KV):
     rng = np.random.default_rng(7)

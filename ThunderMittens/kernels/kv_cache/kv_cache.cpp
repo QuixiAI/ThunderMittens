@@ -195,12 +195,59 @@ array paged_attention(
   auto value_c = contiguous_cast(value_cache, dtype, s);
   auto table_c = contiguous(astype(block_table, int32, s), false, s);
   auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
+  auto no_alibi = zeros({1}, float32, s);   // buffer 11 placeholder; use_alibi=0 ignores it
 
   return array(
       q.shape(),
       dtype,
-      std::make_shared<PagedAttention>(to_stream(s), scale),
-      {q_c, key_c, value_c, table_c, lens_c});
+      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/false),
+      {q_c, key_c, value_c, table_c, lens_c, no_alibi});
+}
+
+array paged_attention_alibi(
+    const array& q,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    const array& alibi_slopes,
+    float scale,
+    StreamOrDevice s) {
+  if (q.ndim() != 3) {
+    throw std::invalid_argument("paged_attention_alibi: q must have shape (batch, num_heads, head_size)");
+  }
+  if (key_cache.ndim() != 4 || value_cache.ndim() != 4 || key_cache.shape() != value_cache.shape()) {
+    throw std::invalid_argument("paged_attention_alibi: caches must have shape (num_blocks, block_size, num_kv_heads, head_size)");
+  }
+  if (key_cache.shape(3) != q.shape(2)) {
+    throw std::invalid_argument("paged_attention_alibi: q head_size must match cache head_size");
+  }
+  if (key_cache.shape(2) <= 0 || q.shape(1) % key_cache.shape(2) != 0) {
+    throw std::invalid_argument("paged_attention_alibi: num_q_heads must be a positive multiple of num_kv_heads (GQA/MQA)");
+  }
+  if (alibi_slopes.ndim() != 1 || alibi_slopes.shape(0) != q.shape(1)) {
+    throw std::invalid_argument("paged_attention_alibi: alibi_slopes must be (num_heads,)");
+  }
+  const int D = q.shape(2);
+  if (!(D == 64 || D == 128)) {
+    throw std::invalid_argument("paged_attention_alibi: head_size must be 64 or 128");
+  }
+  auto dtype = promote_types(q.dtype(), key_cache.dtype());
+  dtype = promote_types(dtype, value_cache.dtype());
+  if (!is_supported_float(dtype)) {
+    throw std::invalid_argument("paged_attention_alibi: dtype must be float32, float16, or bfloat16");
+  }
+  auto q_c = contiguous_cast(q, dtype, s);
+  auto key_c = contiguous_cast(key_cache, dtype, s);
+  auto value_c = contiguous_cast(value_cache, dtype, s);
+  auto table_c = contiguous(astype(block_table, int32, s), false, s);
+  auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
+  auto slopes_c = contiguous(astype(alibi_slopes, float32, s), false, s);
+  return array(
+      q.shape(),
+      dtype,
+      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/true),
+      {q_c, key_c, value_c, table_c, lens_c, slopes_c});
 }
 
 array paged_attention_staged(
@@ -390,6 +437,7 @@ void PagedAttention::eval_gpu(
   auto& value_cache = inputs[2];
   auto& block_table = inputs[3];
   auto& context_lens = inputs[4];
+  auto& alibi_slopes = inputs[5];
   auto& out = outputs[0];
 
   auto& s = stream();
@@ -415,6 +463,8 @@ void PagedAttention::eval_gpu(
       key_cache.shape(1),
       block_table.shape(1),
       scale,
+      alibi_slopes,
+      use_alibi_ ? 1 : 0,
       type_to_name(q));
 }
 

@@ -247,6 +247,13 @@ def paged_attention(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch
     return _ext.paged_attention(q, key_cache, value_cache, block_table, context_lens, float(scale))
 
 
+def paged_attention_alibi(q, key_cache, value_cache, block_table, context_lens, alibi_slopes,
+                          scale=0.0):
+    """Paged decode with a per-head ALiBi linear position bias (alibi_slopes is (num_heads,)). MPS."""
+    return _ext.paged_attention_alibi(q, key_cache, value_cache, block_table, context_lens,
+                                      alibi_slopes, float(scale))
+
+
 def paged_attention_staged(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
     """GQA KV-reuse staged decode; bit-equivalent to paged_attention. MPS."""
     return _ext.paged_attention_staged(q, key_cache, value_cache, block_table, context_lens,

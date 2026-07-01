@@ -184,6 +184,8 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
                             constant float &scale [[buffer(8)]],
                             constant int &num_heads [[buffer(9)]],
                             constant int &num_kv_heads [[buffer(10)]],
+                            device const float *alibi_slopes [[buffer(11)]],  // (num_heads,)
+                            constant int &use_alibi [[buffer(12)]],            // 0 = off
                             uint3 tgid [[threadgroup_position_in_grid]],
                             uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
@@ -223,7 +225,10 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
             partial += qv[i] * float(key_cache[cache_base + d]);
         }
 
-        const float score = simd_sum(partial) * scale;
+        // ALiBi: linear per-head position bias; key t is at distance (context_len-1 - t) from
+        // the (implicit) most-recent query position, so bias = slope * (t - context_len + 1) <= 0.
+        float score = simd_sum(partial) * scale;
+        if (use_alibi) { score += alibi_slopes[head] * float(t - context_len + 1); }
         const float new_m = max(m, score);
         const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
         const float beta = exp(score - new_m);
@@ -552,6 +557,8 @@ instantiate_paged_attention_fp8(bfloat16, bf16, 128)
       constant float &scale [[buffer(8)]],                                   \
       constant int &num_heads [[buffer(9)]],                                 \
       constant int &num_kv_heads [[buffer(10)]],                             \
+      device const float *alibi_slopes [[buffer(11)]],                       \
+      constant int &use_alibi [[buffer(12)]],                                \
       uint3 tgid [[threadgroup_position_in_grid]],                           \
       uint lane [[thread_index_in_simdgroup]]);
 

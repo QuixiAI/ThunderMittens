@@ -13,6 +13,7 @@ from tk import (
     kv_cache_scatter,
     kv_cache_scatter_fp8,
     paged_attention,
+    paged_attention_alibi,
     paged_attention_fp8,
     paged_attention_staged,
 )
@@ -239,6 +240,58 @@ def test_paged_attention_gqa(dtype, atol, D, H, H_KV):
         context_lens,
         scale,
     )
+    np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=2e-3)
+
+
+def _paged_ref_gqa_alibi(q, key_cache, value_cache, block_table, context_lens, scale, slopes):
+    B, H, D = q.shape
+    H_KV = key_cache.shape[2]
+    group = H // H_KV
+    bs = key_cache.shape[1]
+    out = np.zeros_like(q, np.float32)
+    for b in range(B):
+        for h in range(H):
+            kvh = h // group
+            sc, vs = [], []
+            for t in range(int(context_lens[b])):
+                blk = block_table[b, t // bs]
+                slot = t % bs
+                bias = slopes[h] * (t - int(context_lens[b]) + 1)
+                sc.append(float(np.dot(q[b, h], key_cache[blk, slot, kvh]) * scale + bias))
+                vs.append(value_cache[blk, slot, kvh])
+            if not sc:
+                continue
+            s = np.array(sc, np.float32)
+            p = np.exp(s - s.max())
+            p /= p.sum()
+            out[b, h] = np.sum(p[:, None] * np.stack(vs), axis=0)
+    return out
+
+
+@pytest.mark.parametrize("dtype,atol", [("float32", 3e-5), ("bfloat16", 2e-2)])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("H,H_KV", [(2, 2), (8, 2), (4, 1)])  # MHA, GQA group 4, MQA
+def test_paged_attention_alibi(dtype, atol, D, H, H_KV):
+    rng = np.random.default_rng(80 + D + H + H_KV)
+    B, num_blocks, block_size = 2, 4, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    key_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    value_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    block_table = np.array([[0, 1], [2, 3]], dtype=np.int32)
+    context_lens = np.array([6, 7], dtype=np.int32)
+    slopes = (0.1 * (1.0 + np.arange(H))).astype(np.float32)   # distinct per-head slope
+    scale = 1.0 / math.sqrt(D)
+
+    qm = mx.array(q).astype(_mx_dtype(dtype))
+    km = mx.array(key_cache).astype(_mx_dtype(dtype))
+    vm = mx.array(value_cache).astype(_mx_dtype(dtype))
+    got = paged_attention_alibi(qm, km, vm, mx.array(block_table), mx.array(context_lens),
+                                mx.array(slopes), scale=0.0)
+    mx.eval(got)
+
+    ref = _paged_ref_gqa_alibi(
+        _np(qm).astype(np.float32), _np(km).astype(np.float32), _np(vm).astype(np.float32),
+        block_table, context_lens, scale, slopes)
     np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=2e-3)
 
 

@@ -532,6 +532,22 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "paged_attention_alibi",
+      &paged_attention_alibi,
+      "q"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      "alibi_slopes"_a,
+      "scale"_a = 0.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        paged decode with a per-head ALiBi linear position bias (alibi_slopes is (num_heads,)).
+      )");
+
+    m.def(
       "paged_attention_staged",
       &paged_attention_staged,
       "q"_a,

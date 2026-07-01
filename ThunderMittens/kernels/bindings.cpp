@@ -361,6 +361,15 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "quantize_per_tensor_fp8", &quantize_per_tensor_fp8,
+      "x"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(per-tensor fp8 e4m3 quant (global absmax/448 via atomic-max). Returns [codes, scale, scratch].)");
+    m.def(
+      "quantize_per_tensor_int8", &quantize_per_tensor_int8,
+      "x"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(per-tensor symmetric int8 quant (global absmax/127). Returns [codes, scale, scratch].)");
+
+    m.def(
       "quantize_per_token_fp8",
       &quantize_per_token_fp8,
       "x"_a,

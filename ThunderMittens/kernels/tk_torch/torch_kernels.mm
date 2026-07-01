@@ -912,6 +912,30 @@ static at::Tensor top_p_sample_mps(const at::Tensor& logits_in, double p, double
   return out;
 }
 
+// Per-tensor (global) dynamic quant via atomic-max. Returns (codes, scale scalar).
+static std::tuple<at::Tensor, at::Tensor> quantize_per_tensor_mps(const at::Tensor& x_in,
+                                                                  bool is_int8) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
+              "quantize_per_tensor: x must be float MPS");
+  auto x = x_in.contiguous();
+  const int n = static_cast<int>(x.numel());
+  auto codes = at::empty(x.sizes(), x.options().dtype(is_int8 ? at::kChar : at::kByte));
+  auto scale = at::empty({1}, x.options().dtype(at::kFloat));
+  auto scale_u = at::empty({1}, x.options().dtype(at::kInt));   // 4-byte atomic scratch
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_zero_i32(e, scale_u, 1);
+    tk::launch_quant_tensor_absmax(e, x, scale_u, n, tk_type_name(x));
+    tk::launch_quant_tensor_encode(e, x, scale_u, codes, scale, n, is_int8, tk_type_name(x));
+  });
+  return {codes, scale};
+}
+static std::tuple<at::Tensor, at::Tensor> quantize_per_tensor_fp8_mps(const at::Tensor& x) {
+  return quantize_per_tensor_mps(x, false);
+}
+static std::tuple<at::Tensor, at::Tensor> quantize_per_tensor_int8_mps(const at::Tensor& x) {
+  return quantize_per_tensor_mps(x, true);
+}
+
 // Runtime per-row fp8 e4m3 quantization. Returns (codes uint8, scale f32).
 static std::tuple<at::Tensor, at::Tensor> quantize_per_token_fp8_mps(const at::Tensor& x_in) {
   TORCH_CHECK(x_in.device().is_mps(), "quantize_per_token_fp8: x must be an MPS tensor");
@@ -1396,6 +1420,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("top_k_sample", &top_k_sample_mps, "ThunderMittens top-k sampling (MPS)");
   m.def("top_p_sample", &top_p_sample_mps, "ThunderMittens top-p nucleus sampling (MPS)");
   m.def("apply_penalty", &apply_penalty_mps, "ThunderMittens logit penalties (MPS)");
+  m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8_mps, "ThunderMittens per-tensor fp8 quant (MPS)");
+  m.def("quantize_per_tensor_int8", &quantize_per_tensor_int8_mps, "ThunderMittens per-tensor int8 quant (MPS)");
   m.def("quantize_per_token_fp8", &quantize_per_token_fp8_mps, "ThunderMittens per-row fp8 quant (MPS)");
   m.def("quantize_per_token_int8", &quantize_per_token_int8_mps, "ThunderMittens per-row int8 quant (MPS)");
   m.def("attn_causal", &attn_causal_mps, "ThunderMittens causal attention (MPS)");

@@ -237,6 +237,16 @@ def test_sample_categorical_parity(shape, temp):
 
 
 @pytest.mark.parametrize("shape", [(8, 256), (3, 513)])
+def test_quantize_per_tensor_fp8_parity(shape):
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(shape) * 2.0).astype(np.float32)
+    cm, sm = tk.quantize_per_tensor_fp8(_mk(x, "mlx", "f32"))
+    ct, st = tk.quantize_per_tensor_fp8(_mk(x, "torch", "f32"))
+    _assert_parity(cm, ct, atol=0)        # same metallib -> identical codes
+    _assert_parity(sm, st, atol=1e-6)
+
+
+@pytest.mark.parametrize("shape", [(8, 256), (3, 513)])
 def test_quantize_per_token_fp8_parity(shape):
     rng = np.random.default_rng(0)
     x = (rng.standard_normal(shape) * 2.0).astype(np.float32)

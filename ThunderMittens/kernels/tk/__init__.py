@@ -387,6 +387,28 @@ def apply_penalty(logits, prev_tokens, temperature=1.0, repetition_penalty=1.0,
         min_length=min_length, gen_len=gen_len)[0]
 
 
+def quantize_per_tensor_fp8(x):
+    """Per-tensor fp8 e4m3 quant (global absmax/448 via atomic-max). Returns (codes uint8, scale).
+
+    Accepts mlx.array or torch.Tensor (MPS). Reconstruct as scale * e4m3_decode(codes).
+    """
+    if _is_torch(x):
+        return _torch().quantize_per_tensor_fp8(x)
+    codes, scale, _ = _mlx().quantize_per_tensor_fp8(x)[:3]
+    return codes, scale
+
+
+def quantize_per_tensor_int8(x):
+    """Per-tensor symmetric int8 quant (global absmax/127). Returns (codes int8, scale).
+
+    Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(x):
+        return _torch().quantize_per_tensor_int8(x)
+    codes, scale, _ = _mlx().quantize_per_tensor_int8(x)[:3]
+    return codes, scale
+
+
 def quantize_per_token_fp8(x):
     """Per-row fp8 e4m3 quant. Returns (codes uint8, scale f32), scale=absmax/448.
 

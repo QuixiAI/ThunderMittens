@@ -10,7 +10,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import quantize_per_token_fp8, quantize_per_token_int8
+from tk import (quantize_per_token_fp8, quantize_per_token_int8,
+                quantize_per_tensor_fp8, quantize_per_tensor_int8)
 from tk.quant import _e4m3_decode_arr
 
 _MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
@@ -65,8 +66,42 @@ def test_quantize_per_token_int8(dtype, shape):
     assert np.all(np.abs(deq - xd) <= 0.5 * ssafe + 1e-6)
 
 
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("shape", SHAPES)
+def test_quantize_per_tensor_fp8(dtype, shape):
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(shape) * 2.0).astype(np.float32)
+    xq = mx.array(x).astype(_MX[dtype])
+    codes, scale = quantize_per_tensor_fp8(xq)
+    mx.eval(codes, scale)
+    xd = np.array(xq.astype(mx.float32))
+    ref_scale = np.abs(xd).max() / 448.0
+    np.testing.assert_allclose(float(np.array(scale).reshape(-1)[0]), ref_scale, rtol=1e-3, atol=1e-8)
+    ssafe = max(ref_scale, 1e-30)
+    deq = _e4m3_decode_arr(np.array(codes)) * ssafe
+    assert np.all(np.abs(deq - xd) <= 0.0625 * np.abs(xd) + 2.0 * ssafe)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("shape", SHAPES)
+def test_quantize_per_tensor_int8(dtype, shape):
+    rng = np.random.default_rng(1)
+    x = (rng.standard_normal(shape) * 2.0).astype(np.float32)
+    xq = mx.array(x).astype(_MX[dtype])
+    codes, scale = quantize_per_tensor_int8(xq)
+    mx.eval(codes, scale)
+    xd = np.array(xq.astype(mx.float32))
+    ref_scale = np.abs(xd).max() / 127.0
+    np.testing.assert_allclose(float(np.array(scale).reshape(-1)[0]), ref_scale, rtol=1e-3, atol=1e-8)
+    ssafe = max(ref_scale, 1e-30)
+    c = np.array(codes).astype(np.int32)
+    assert c.min() >= -127 and c.max() <= 127
+    deq = c.astype(np.float32) * ssafe
+    assert np.all(np.abs(deq - xd) <= 0.5 * ssafe + 1e-6)
+
+
 if __name__ == "__main__":
     for shp in SHAPES:
         test_quantize_per_token_fp8("float32", shp)
-        test_quantize_per_token_int8("float32", shp)
+        test_quantize_per_tensor_fp8("float32", shp)
         print("ok", shp)

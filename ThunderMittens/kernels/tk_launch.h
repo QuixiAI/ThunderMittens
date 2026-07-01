@@ -45,6 +45,9 @@ inline std::string sample_categorical_kernel_name(const std::string& t) { return
 inline std::string top_k_sample_kernel_name(const std::string& t) { return "top_k_sample_" + t; }
 inline std::string top_p_sample_kernel_name(const std::string& t) { return "top_p_sample_" + t; }
 inline std::string apply_penalty_kernel_name(const std::string& t) { return "apply_penalty_" + t; }
+inline std::string quant_tensor_absmax_kernel_name(const std::string& t) { return "quant_tensor_absmax_" + t; }
+inline std::string quant_tensor_encode_fp8_kernel_name(const std::string& t) { return "quant_tensor_encode_fp8_" + t; }
+inline std::string quant_tensor_encode_int8_kernel_name(const std::string& t) { return "quant_tensor_encode_int8_" + t; }
 inline std::string quantize_per_token_fp8_kernel_name(const std::string& t) { return "quantize_per_token_fp8_" + t; }
 inline std::string quantize_per_token_int8_kernel_name(const std::string& t) { return "quantize_per_token_int8_" + t; }
 inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_string(D); }
@@ -353,6 +356,24 @@ void launch_apply_penalty(E& e, typename E::in_t logits, typename E::in_t counts
   e.bytes(V, 3); e.bytes(invtemp, 4); e.bytes(rep, 5); e.bytes(presence, 6); e.bytes(freq, 7);
   e.in(bias, 8); e.bytes(eos_id, 9); e.bytes(min_length, 10); e.bytes(gen_len, 11);
   e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- per-tensor dynamic quant (2 passes): absmax@1(atomic_uint) reduce, then encode. -----
+template <class E>
+void launch_quant_tensor_absmax(E& e, typename E::in_t x, typename E::out_t scale_u, int n,
+                                const std::string& type_name) {
+  e.pipeline(quant_tensor_absmax_kernel_name(type_name));
+  e.in(x, 0); e.out(scale_u, 1); e.bytes(n, 2);
+  e.dispatch((n + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_quant_tensor_encode(E& e, typename E::in_t x, typename E::in_t scale_u,
+                                typename E::out_t codes, typename E::out_t scale_out, int n,
+                                bool is_int8, const std::string& type_name) {
+  e.pipeline(is_int8 ? quant_tensor_encode_int8_kernel_name(type_name)
+                     : quant_tensor_encode_fp8_kernel_name(type_name));
+  e.in(x, 0); e.in(scale_u, 1); e.out(codes, 2); e.out(scale_out, 3); e.bytes(n, 4);
+  e.dispatch((n + 255) / 256, 1, 1, 256, 1, 1);
 }
 
 // ----- quantize_per_token_fp8: x@0 -> codes@1(uint8) scale@2(f32) ; D@3(i32) ; grid (rows,1,1).

@@ -521,6 +521,22 @@ def test_top_p_sample_distribution():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(8, 256), (3, 513)])
+def test_quantize_per_tensor_fp8(dtype, shape):
+    import numpy as np
+    from tk.quant import _e4m3_decode_arr
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(shape) * 2.0).astype(np.float32)
+    codes, scale = tk_torch.quantize_per_tensor_fp8(torch.from_numpy(x).to(dtype).to("mps"))
+    xd = torch.from_numpy(x).to(dtype).float().numpy()
+    ref_scale = np.abs(xd).max() / 448.0
+    np.testing.assert_allclose(float(scale.cpu().numpy().reshape(-1)[0]), ref_scale, rtol=1e-3, atol=1e-8)
+    ssafe = max(ref_scale, 1e-30)
+    deq = _e4m3_decode_arr(codes.cpu().numpy()) * ssafe
+    assert np.all(np.abs(deq - xd) <= 0.0625 * np.abs(xd) + 2.0 * ssafe)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(8, 256), (4, 64, 128), (3, 513)])
 def test_quantize_per_token_fp8(dtype, shape):
     import numpy as np

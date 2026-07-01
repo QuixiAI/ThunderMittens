@@ -328,6 +328,16 @@ def apply_penalty(logits: torch.Tensor, prev_tokens: torch.Tensor, temperature: 
                               float(frequency_penalty), int(eos_id), int(min_length), int(gen_len))
 
 
+def quantize_per_tensor_fp8(x: torch.Tensor):
+    """Per-tensor fp8 e4m3 quant (global absmax/448). Returns (codes uint8, scale scalar). MPS."""
+    return _ext.quantize_per_tensor_fp8(x)
+
+
+def quantize_per_tensor_int8(x: torch.Tensor):
+    """Per-tensor symmetric int8 quant (global absmax/127). Returns (codes int8, scale scalar). MPS."""
+    return _ext.quantize_per_tensor_int8(x)
+
+
 def quantize_per_token_fp8(x: torch.Tensor):
     """Per-row fp8 e4m3 quant. Returns (codes uint8, scale f32), scale=absmax/448. MPS, x float."""
     return _ext.quantize_per_token_fp8(x)

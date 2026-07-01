@@ -21,6 +21,36 @@ namespace mlx::core {
 std::vector<array> quantize_per_token_fp8(const array& x, StreamOrDevice s = {});
 std::vector<array> quantize_per_token_int8(const array& x, StreamOrDevice s = {});
 
+/**
+ *  Per-tensor (global) dynamic quantization: one scale = global_absmax / QMAX (via a P3
+ *  atomic-max reduction). Returns [codes, scale (scalar), scale_u (uint32 scratch)]; callers
+ *  use the first two. fp8 e4m3 (QMAX=448) or symmetric int8 (QMAX=127).
+ **/
+std::vector<array> quantize_per_tensor_fp8(const array& x, StreamOrDevice s = {});
+std::vector<array> quantize_per_tensor_int8(const array& x, StreamOrDevice s = {});
+
+class QuantizePerTensor : public Primitive {
+ public:
+  QuantizePerTensor(Stream stream, bool is_int8) : Primitive(stream), is_int8_(is_int8) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QuantizePerTensor"; }
+  void print(std::ostream& os) override { os << "QuantizePerTensor"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return is_int8_ == static_cast<const QuantizePerTensor&>(other).is_int8_;
+  }
+
+ private:
+  bool is_int8_;
+};
+
 class QuantizePerTokenFp8 : public Primitive {
  public:
   explicit QuantizePerTokenFp8(Stream stream) : Primitive(stream) {}

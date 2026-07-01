@@ -265,6 +265,13 @@ NB_MODULE(_ext, m) {
          a shared latent cache (nb,bs,576); value over the 512 latent only. Returns o (B,N,512).)");
 
     m.def(
+      "mla_decode_fp8", &mla_decode_fp8,
+      "q"_a, "data_cache"_a, "scale_cache"_a, "block_table"_a, "context_lens"_a, "scale"_a = 0.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(DeepSeek-V4 dense latent decode over the UE8M0-packed cache: q (B,N,512) attends the packed
+         (data (…,576) uint8, scale (…,8) uint8) cache, score/value over 512, scale 512^-0.5. -> o (B,N,512).)");
+
+    m.def(
       "mla_kv_insert_fp8", &mla_kv_insert_fp8,
       "kv"_a, "cos"_a, "sin"_a, "positions"_a, "slot_mapping"_a, "data_cache"_a, "scale_cache"_a,
       nb::kw_only(), "stream"_a = nb::none(),

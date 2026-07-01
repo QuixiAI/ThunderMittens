@@ -195,6 +195,17 @@ def mla_decode(q, kv_cache, block_table, context_lens, scale=0.0):
     return _mlx().mla_decode(q, kv_cache, block_table, context_lens, scale)
 
 
+def mla_decode_fp8(q, data_cache, scale_cache, block_table, context_lens, scale=0.0):
+    """DeepSeek-V4 dense latent decode over the UE8M0-packed cache (from mla_kv_insert_fp8). q
+    (B,N,512) [the absorbed query] attends the packed cache with dequant-on-read; score and value
+    both over the full 512, scale 512^-0.5. Returns o (B,N,512); the inverse-RoPE of o[448:512] +
+    the wo_a/wo_b output projection are caller-applied. Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(q):
+        return _torch().mla_decode_fp8(q, data_cache, scale_cache, block_table, context_lens, scale)
+    return _mlx().mla_decode_fp8(q, data_cache, scale_cache, block_table, context_lens, scale)
+
+
 def mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache):
     """DeepSeek-V4 packed MLA KV-insert: kv (…, 512) = [448 NoPE | 64 RoPE]; NoPE is quantized to
     e4m3 fp8 with per-64-block UE8M0 (power-of-2) scales, RoPE gets interleaved RoPE bf16. Writes

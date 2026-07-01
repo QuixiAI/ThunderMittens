@@ -93,6 +93,21 @@ array mla_decode(
     float scale = 0.0f,
     StreamOrDevice s = {});
 
+/**
+ *  DeepSeek-V4 dense latent decode over the UE8M0-packed cache (P4a). q (B, N, 512) [the absorbed
+ *  512-wide query] attends the packed cache (data_cache (nb,bs,576) uint8 + scale_cache (nb,bs,8)
+ *  uint8) with dequant-on-read; score and value both over the full 512, scale = 512^-0.5. Returns
+ *  o (B, N, 512) bf16 (the inverse-RoPE of o[448:512] and wo_a/wo_b are caller-applied).
+ **/
+array mla_decode_fp8(
+    const array& q,
+    const array& data_cache,
+    const array& scale_cache,
+    const array& block_table,
+    const array& context_lens,
+    float scale = 0.0f,
+    StreamOrDevice s = {});
+
 class MlaQNormRope : public Primitive {
  public:
   MlaQNormRope(Stream stream, int num_heads, int nope_dim, int rope_dim, int norm_mode, float eps)
@@ -168,6 +183,28 @@ class MlaDecode : public Primitive {
   void print(std::ostream& os) override { os << "MlaDecode"; }
   bool is_equivalent(const Primitive& other) const override {
     return scale_ == static_cast<const MlaDecode&>(other).scale_;
+  }
+
+ private:
+  float scale_;
+};
+
+class MlaDecodeFp8 : public Primitive {
+ public:
+  MlaDecodeFp8(Stream stream, float scale) : Primitive(stream), scale_(scale) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MlaDecodeFp8"; }
+  void print(std::ostream& os) override { os << "MlaDecodeFp8"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return scale_ == static_cast<const MlaDecodeFp8&>(other).scale_;
   }
 
  private:

@@ -325,6 +325,74 @@ kernel void mla_decode(device const bf16 *q            [[buffer(0)]],   // (B, N
 
 instantiate_mla_decode(512, 64);
 
+// ---------------------------------------------------------------------------
+// P4a: mla_decode_fp8 — DeepSeek-V4 dense latent decode over the UE8M0-packed cache (P3). The V4
+// latent is 512 = [448 NoPE | 64 RoPE], and (unlike classic MLA) BOTH the score and the value are
+// over the full 512 (rope included), scale = 512^-0.5. Per cached token this dequantizes the 448
+// NoPE (e4m3_decode * 2^(scale_byte-127), per-64 UE8M0 block) and reads the 64 bf16 RoPE, then does
+// the online-softmax decode. Output o (B, num_heads, 512); the inverse-RoPE of o[448:512] + the
+// grouped wo_a/wo_b projection are the caller's (phase 4d). MQA: one shared latent per token.
+// ---------------------------------------------------------------------------
+kernel void mla_decode_fp8(device const bf16 *q            [[buffer(0)]],   // (B, N, 512)
+                           device const uchar *data_cache  [[buffer(1)]],   // (nb, bs, 576)
+                           device const uchar *scale_cache [[buffer(2)]],   // (nb, bs, 8)
+                           device const int  *block_table  [[buffer(3)]],
+                           device const int  *context_lens [[buffer(4)]],
+                           device bf16       *out          [[buffer(5)]],   // (B, N, 512)
+                           constant int &block_size        [[buffer(6)]],
+                           constant int &block_table_stride [[buffer(7)]],
+                           constant float &scale           [[buffer(8)]],
+                           constant int &num_heads         [[buffer(9)]],
+                           uint3 tgid [[threadgroup_position_in_grid]],
+                           uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr int LATENT = 512, NOPE = 448, VPL = LATENT / 32;   // 16 per lane
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int context_len = context_lens[batch];
+    const long q_base = ((long)batch * num_heads + head) * LATENT;
+
+    float qv[VPL], acc[VPL];
+    for (int i = 0; i < VPL; ++i) { qv[i] = float(q[q_base + lane + 32 * i]); acc[i] = 0.0f; }
+
+    float m = -3.4028234663852886e38f, l = 0.0f;
+    for (int t = 0; t < context_len; ++t) {
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) { continue; }
+        const long dslot = (long)block * block_size + slot;
+        const long dbase = dslot * 576;      // packed data bytes
+        const long sbase = dslot * 8;         // UE8M0 scale bytes
+        device const bf16 *rope = (device const bf16 *)(data_cache + dbase + NOPE);
+
+        float lat[VPL];
+        float partial = 0.0f;
+        for (int i = 0; i < VPL; ++i) {
+            const int d = lane + 32 * i;
+            if (d < NOPE) {
+                const uchar code = data_cache[dbase + d];
+                const int e = (int)scale_cache[sbase + d / 64];
+                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+            } else {
+                lat[i] = float(rope[d - NOPE]);
+            }
+            partial += qv[i] * lat[i];
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VPL; ++i) { acc[i] = acc[i] * alpha + beta * lat[i]; }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    const long out_base = ((long)batch * num_heads + head) * LATENT;
+    for (int i = 0; i < VPL; ++i) {
+        out[out_base + lane + 32 * i] = l == 0.0f ? bf16(0) : bf16(acc[i] / l);
+    }
+}
+
 // Single-buffer bf16 copy (clone-then-insert prologue for the MLA cache).
 kernel void mla_cache_clone(device const bf16 *src [[buffer(0)]],
                             device bf16       *dst [[buffer(1)]],

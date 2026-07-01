@@ -204,6 +204,11 @@ def mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_c
     return _ext.mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache)
 
 
+def mla_decode_fp8(q, data_cache, scale_cache, block_table, context_lens, scale=0.0):
+    """DeepSeek-V4 dense latent decode over the UE8M0-packed cache. q (B,N,512) -> o (B,N,512). MPS."""
+    return _ext.mla_decode_fp8(q, data_cache, scale_cache, block_table, context_lens, float(scale))
+
+
 def mla_decode(q, kv_cache, block_table, context_lens, scale=0.0):
     """DeepSeek MLA absorb-path latent flash-decode (MQA). q (B,N,576), cache (nb,bs,576) -> o (B,N,512). MPS."""
     return _ext.mla_decode(q, kv_cache, block_table, context_lens, float(scale))

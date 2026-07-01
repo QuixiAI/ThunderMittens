@@ -118,6 +118,29 @@ def rope_kv_insert_norm(k, v, cos, sin, positions, slot_mapping, key_cache, valu
                                       key_cache, value_cache, norm_weight, eps, gemma)
 
 
+def mla_q_norm_rope(q, cos, sin, positions, num_heads, nope_dim, rope_dim,
+                    norm_mode=0, eps=1e-6, norm_weight=None):
+    """DeepSeek MLA Q-path: optional RMSNorm over the full head dim (norm_mode 0=none, 1=rms
+    no-weight, 2=rms + norm_weight) then GPT-J interleaved RoPE on the last rope_dim dims.
+
+    q (…, head_dim) bf16, head_dim=nope_dim+rope_dim (%64==0); cos/sin (max_pos, rope_dim/2);
+    positions (num_tokens,). Accepts mlx.array or torch.Tensor (MPS).
+    """
+    head_dim = q.shape[-1]
+    if norm_weight is None:   # dummy (unused unless norm_mode==2)
+        if _is_torch(q):
+            import torch
+            norm_weight = torch.ones(head_dim, dtype=torch.bfloat16, device=q.device)
+        else:
+            import mlx.core as mx
+            norm_weight = mx.ones((head_dim,), dtype=mx.bfloat16)
+    if _is_torch(q):
+        return _torch().mla_q_norm_rope(q, cos, sin, positions, norm_weight, num_heads,
+                                        nope_dim, rope_dim, norm_mode, eps)
+    return _mlx().mla_q_norm_rope(q, cos, sin, positions, norm_weight, num_heads,
+                                  nope_dim, rope_dim, norm_mode, eps)
+
+
 def rms_norm_add(x, residual, weight, eps=1e-5):
     """Fused residual-add + RMSNorm. Returns (out, x+residual).
 

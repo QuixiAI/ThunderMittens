@@ -63,6 +63,7 @@
 #include "rms_norm/rms_norm.h"
 #include "add_norm/add_norm.h"
 #include "rope_kv/rope_kv.h"
+#include "mla/mla.h"
 #include "paged_attn_v2/paged_attn_v2.h"
 #include "quant_rt/quant_rt.h"
 #include "sampling/sampling.h"
@@ -232,6 +233,14 @@ NB_MODULE(_ext, m) {
       "key_cache"_a, "value_cache"_a, "norm_weight"_a, "eps"_a, "gemma"_a,
       nb::kw_only(), "stream"_a = nb::none(),
       R"(fused K RMSNorm + RoPE + paged-KV insert. gemma=True uses (1+weight). Returns (kc, vc).)");
+
+    m.def(
+      "mla_q_norm_rope", &mla_q_norm_rope,
+      "q"_a, "cos"_a, "sin"_a, "positions"_a, "norm_weight"_a,
+      "num_heads"_a, "nope_dim"_a, "rope_dim"_a, "norm_mode"_a, "eps"_a = 1e-6f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(DeepSeek MLA Q-path: optional RMSNorm (mode 0/1/2) + GPT-J interleaved RoPE on the last
+         rope_dim dims. head_dim=nope_dim+rope_dim, %64==0; cos/sin (max_pos, rope_dim/2).)");
 
     m.def(
       "paged_attention_v2",

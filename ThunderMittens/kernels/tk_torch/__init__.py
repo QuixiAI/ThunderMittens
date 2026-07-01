@@ -30,6 +30,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "softmax", "softmax.metal"),
     os.path.join(_KERNELS, "rotary", "rotary.metal"),
     os.path.join(_KERNELS, "rope_kv", "rope_kv.metal"),
+    os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "glu", "glu.metal"),
     os.path.join(_KERNELS, "hadamard", "hadamard.metal"),
@@ -177,6 +178,13 @@ def rope_kv_insert_norm(k, v, cos, sin, positions, slot_mapping, key_cache, valu
     """Fused K RMSNorm + RoPE + paged-KV insert. gemma=True uses (1+weight). Returns (kc, vc). MPS."""
     return _ext.rope_kv_insert_norm(k, v, cos, sin, positions, slot_mapping, key_cache,
                                     value_cache, norm_weight, float(eps), bool(gemma))
+
+
+def mla_q_norm_rope(q, cos, sin, positions, norm_weight, num_heads, nope_dim, rope_dim,
+                    norm_mode, eps):
+    """DeepSeek MLA Q-path: optional RMSNorm + GPT-J interleaved RoPE on the last rope_dim dims. MPS."""
+    return _ext.mla_q_norm_rope(q, cos, sin, positions, norm_weight, int(num_heads),
+                                int(nope_dim), int(rope_dim), int(norm_mode), float(eps))
 
 
 def gelu(x: torch.Tensor):

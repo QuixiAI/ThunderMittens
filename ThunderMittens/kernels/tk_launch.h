@@ -53,6 +53,7 @@ inline std::string quantize_per_token_int8_kernel_name(const std::string& t) { r
 inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_string(D); }
 inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string(D); }
 inline std::string rotary_interleaved_kernel_name(int D) { return "rotary_interleaved_" + std::to_string(D); }
+inline std::string mla_q_norm_rope_kernel_name(int D) { return "mla_q_norm_rope_" + std::to_string(D); }
 inline std::string gelu_kernel_name(int D) { return "gelu_" + std::to_string(D); }
 inline std::string glu_kernel_name(const std::string& mode, const std::string& t) { return "glu_" + mode + "_" + t; }
 inline std::string hadamard_kernel_name(const std::string& t, int D) {
@@ -468,6 +469,20 @@ void launch_rotary(E& e, typename E::in_t x, typename E::in_t cos, typename E::i
   e.in(x, 0); e.in(cos, 1); e.in(sin, 2); e.out(o, 3);
   e.bytes(N, 4);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- MLA Q-path: q@0 cos@1 sin@2 positions@3 -> out@4 ; num_heads@5 nope@6 rope@7 norm_mode@8
+//        eps@9 ; norm_weight@10 (read iff mode 2) ; grid (M=tokens*heads,1,1) group (32,1,1). -----
+template <class E>
+void launch_mla_q_norm_rope(E& e, typename E::in_t q, typename E::in_t cos, typename E::in_t sin,
+                            typename E::in_t positions, typename E::in_t norm_weight,
+                            typename E::out_t out, int M, int num_heads, int nope_dim, int rope_dim,
+                            int norm_mode, float eps, int head_dim) {
+  e.pipeline(mla_q_norm_rope_kernel_name(head_dim));
+  e.in(q, 0); e.in(cos, 1); e.in(sin, 2); e.in(positions, 3); e.out(out, 4);
+  e.bytes(num_heads, 5); e.bytes(nope_dim, 6); e.bytes(rope_dim, 7); e.bytes(norm_mode, 8);
+  e.bytes(eps, 9); e.in(norm_weight, 10);
+  e.dispatch(M, 1, 1, 32, 1, 1);
 }
 
 // ----- gelu (elementwise, last axis): x@0 -> o@1 ; M@2(u32) ; grid (M,1,1) group (32,1,1) -----

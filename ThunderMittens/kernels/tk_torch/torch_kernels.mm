@@ -603,6 +603,33 @@ static std::tuple<at::Tensor, at::Tensor> rope_kv_insert_norm_mps(
   return {key_out, value_out};
 }
 
+// DeepSeek MLA Q-path: optional RMSNorm + GPT-J interleaved RoPE on the last rope_dim dims.
+static at::Tensor mla_q_norm_rope_mps(
+    const at::Tensor& q_in, const at::Tensor& cos_in, const at::Tensor& sin_in,
+    const at::Tensor& positions_in, const at::Tensor& nw_in, int64_t num_heads,
+    int64_t nope_dim, int64_t rope_dim, int64_t norm_mode, double eps) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.scalar_type() == at::kBFloat16,
+              "mla_q_norm_rope: q must be bf16 MPS");
+  const int head_dim = q_in.size(-1);
+  TORCH_CHECK(head_dim % 64 == 0 && head_dim == nope_dim + rope_dim,
+              "mla_q_norm_rope: head_dim must be nope+rope and %64==0");
+  TORCH_CHECK(cos_in.size(-1) == rope_dim / 2 && sin_in.size(-1) == rope_dim / 2,
+              "mla_q_norm_rope: cos/sin must be (max_pos, rope_dim/2)");
+  auto q = q_in.contiguous();
+  auto cos = cos_in.to(at::kBFloat16).contiguous(), sin = sin_in.to(at::kBFloat16).contiguous();
+  auto positions = positions_in.to(at::kInt).contiguous();
+  auto nw = nw_in.to(at::kBFloat16).contiguous();
+  auto out = at::empty_like(q);
+  const int M = static_cast<int>(q.numel() / head_dim);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_mla_q_norm_rope(e, q, cos, sin, positions, nw, out, M,
+                               static_cast<int>(num_heads), static_cast<int>(nope_dim),
+                               static_cast<int>(rope_dim), static_cast<int>(norm_mode),
+                               static_cast<float>(eps), head_dim);
+  });
+  return out;
+}
+
 static at::Tensor paged_attention_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in,
     const at::Tensor& value_cache_in, const at::Tensor& block_table_in,
@@ -1320,7 +1347,7 @@ static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
   const int Bsz = C.size(0), H = C.size(1);
   const unsigned N = static_cast<unsigned>(C.size(2));
   const int D = C.size(3);
-  TORCH_CHECK(D == 64, "mamba2: D must be 64");
+  TORCH_CHECK(D == 64 || D == 128, "mamba2: D must be 64 or 128");
   TORCH_CHECK(N % 8 == 0, "mamba2: N must be a multiple of 8");
   auto out = at::empty_like(C);
   tk_encode([&](TorchEncoder& e) { tk::launch_mamba2(e, C, B, X, cl, out, N, H, Bsz, D); });
@@ -1632,6 +1659,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("paged_attention_fp8", &paged_attention_fp8_mps, "ThunderMittens fp8 paged attention (MPS)");
   m.def("rope_kv_insert", &rope_kv_insert_mps, "ThunderMittens fused RoPE + paged-KV insert (MPS)");
   m.def("rope_kv_insert_norm", &rope_kv_insert_norm_mps, "ThunderMittens fused K-norm + RoPE + KV insert (MPS)");
+  m.def("mla_q_norm_rope", &mla_q_norm_rope_mps, "ThunderMittens DeepSeek MLA Q-path norm+interleaved-rope (MPS)");
   m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)");
   m.def("paged_attention_v2_fp8", &paged_attention_v2_fp8_mps, "ThunderMittens long-context fp8 paged attention (MPS)");
   m.def("moe_route_topk", &moe_route_topk_mps, "ThunderMittens MoE top-k routing (MPS)");

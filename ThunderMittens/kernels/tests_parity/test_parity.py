@@ -342,6 +342,28 @@ def test_rope_kv_insert_norm_parity(D, gemma):
     _assert_parity(vm, vt, atol=2e-2)
 
 
+@pytest.mark.parametrize("norm_mode", [0, 1, 2])
+@pytest.mark.parametrize("T,H,nope,rope", [(2, 16, 128, 64), (2, 4, 448, 64)])
+def test_mla_q_norm_rope_parity(norm_mode, T, H, nope, rope):
+    Dh = nope + rope
+    rng = np.random.default_rng(21)
+    inv = 10000.0 ** (-(np.arange(0, rope, 2) / rope))
+    ang = np.arange(64)[:, None] * inv[None, :]
+    cos = np.cos(ang).astype(np.float32)
+    sin = np.sin(ang).astype(np.float32)
+    q = (0.5 * rng.standard_normal((T, H, Dh))).astype(np.float32)
+    w = (0.5 + 0.1 * rng.standard_normal(Dh)).astype(np.float32)
+    positions = np.arange(T, dtype=np.int32)
+    wm = _mk(w, "mlx") if norm_mode == 2 else None
+    wt = _mk(w, "torch") if norm_mode == 2 else None
+    om = tk.mla_q_norm_rope(_mk(q, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"), mx.array(positions),
+                            H, nope, rope, norm_mode=norm_mode, norm_weight=wm)
+    ot = tk.mla_q_norm_rope(_mk(q, "torch"), _mk(cos, "torch"), _mk(sin, "torch"),
+                            torch.from_numpy(positions).to("mps"), H, nope, rope,
+                            norm_mode=norm_mode, norm_weight=wt)
+    _assert_parity(om, ot, atol=2e-2)
+
+
 @pytest.mark.parametrize("D,H_KV", [(64, 2), (128, 1)])
 def test_rope_kv_insert_parity(D, H_KV):
     rng = np.random.default_rng(5)

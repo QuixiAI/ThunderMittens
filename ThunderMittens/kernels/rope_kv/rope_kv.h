@@ -41,6 +41,47 @@ std::vector<array> rope_kv_insert_norm(
     const array& slot_mapping, const array& key_cache, const array& value_cache,
     const array& norm_weight, float eps, bool gemma, StreamOrDevice s = {});
 
+/**
+ *  Q-path: rotate (split-half) and optionally weighted-RMSNorm Q into a contiguous q_out (Q is
+ *  not paged). q (num_tokens, num_q_heads, D); cos/sin (P, D/2); positions (num_tokens,).
+ *  do_norm=true applies RMSNorm over D with norm_weight (D,) (gemma uses 1+weight). {f16,bf16,f32}.
+ **/
+array rope_q(
+    const array& q,
+    const array& cos,
+    const array& sin,
+    const array& positions,
+    const array& norm_weight,
+    bool do_norm,
+    bool gemma,
+    float eps = 1e-6f,
+    StreamOrDevice s = {});
+
+class RopeQ : public Primitive {
+ public:
+  RopeQ(Stream stream, bool do_norm, bool gemma, float eps)
+      : Primitive(stream), do_norm_(do_norm), gemma_(gemma), eps_(eps) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "RopeQ"; }
+  void print(std::ostream& os) override { os << "RopeQ"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const RopeQ&>(other);
+    return do_norm_ == o.do_norm_ && gemma_ == o.gemma_ && eps_ == o.eps_;
+  }
+
+ private:
+  bool do_norm_, gemma_;
+  float eps_;
+};
+
 class RopeKvInsertNorm : public Primitive {
  public:
   RopeKvInsertNorm(Stream stream, float eps, bool gemma)

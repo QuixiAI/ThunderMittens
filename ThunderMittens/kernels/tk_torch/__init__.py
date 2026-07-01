@@ -180,6 +180,11 @@ def rope_kv_insert_norm(k, v, cos, sin, positions, slot_mapping, key_cache, valu
                                     value_cache, norm_weight, float(eps), bool(gemma))
 
 
+def rope_q(q, cos, sin, positions, norm_weight, do_norm, gemma, eps):
+    """Q-path RoPE (+optional weighted RMSNorm) into a contiguous q_out. MPS."""
+    return _ext.rope_q(q, cos, sin, positions, norm_weight, bool(do_norm), bool(gemma), float(eps))
+
+
 def mla_q_norm_rope(q, cos, sin, positions, norm_weight, num_heads, nope_dim, rope_dim,
                     norm_mode, eps):
     """DeepSeek MLA Q-path: optional RMSNorm + GPT-J interleaved RoPE on the last rope_dim dims. MPS."""

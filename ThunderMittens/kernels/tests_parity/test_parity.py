@@ -461,6 +461,27 @@ def test_mla_kv_insert_fp8_parity():
 
 
 @pytest.mark.parametrize("dt", ["f32", "f16", "bf16"])
+@pytest.mark.parametrize("do_norm", [False, True])
+def test_rope_q_parity(dt, do_norm):
+    D, H, nt, P = 128, 4, 5, 16
+    rng = np.random.default_rng(8)
+    half = D // 2
+    inv = 1.0 / (10000.0 ** (np.arange(half) / half))
+    ang = np.arange(P)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    q = (0.3 * rng.normal(size=(nt, H, D))).astype(np.float32)
+    w = (0.5 + 0.1 * rng.normal(size=(D,))).astype(np.float32)
+    positions = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+    wm = _mk(w, "mlx", dt) if do_norm else None
+    wt = _mk(w, "torch", dt) if do_norm else None
+    om = tk.rope_q(_mk(q, "mlx", dt), _mk(cos, "mlx", dt), _mk(sin, "mlx", dt),
+                   mx.array(positions), norm_weight=wm, gemma=True)
+    ot = tk.rope_q(_mk(q, "torch", dt), _mk(cos, "torch", dt), _mk(sin, "torch", dt),
+                   torch.from_numpy(positions).to("mps"), norm_weight=wt, gemma=True)
+    _assert_parity(om, ot, atol=2e-2)
+
+
+@pytest.mark.parametrize("dt", ["f32", "f16", "bf16"])
 @pytest.mark.parametrize("D,H_KV", [(64, 2), (128, 1)])
 def test_rope_kv_insert_parity(dt, D, H_KV):
     rng = np.random.default_rng(5)

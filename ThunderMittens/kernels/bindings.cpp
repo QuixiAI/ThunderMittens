@@ -235,6 +235,13 @@ NB_MODULE(_ext, m) {
       R"(fused K RMSNorm + RoPE + paged-KV insert. gemma=True uses (1+weight). Returns (kc, vc).)");
 
     m.def(
+      "rope_q", &rope_q,
+      "q"_a, "cos"_a, "sin"_a, "positions"_a, "norm_weight"_a, "do_norm"_a, "gemma"_a,
+      "eps"_a = 1e-6f, nb::kw_only(), "stream"_a = nb::none(),
+      R"(rotate (+optional weighted RMSNorm) Q into a contiguous q_out (split-half RoPE). q
+         (num_tokens, num_q_heads, D); cos/sin (P, D/2). {f16,bf16,f32}.)");
+
+    m.def(
       "mla_q_norm_rope", &mla_q_norm_rope,
       "q"_a, "cos"_a, "sin"_a, "positions"_a, "norm_weight"_a,
       "num_heads"_a, "nope_dim"_a, "rope_dim"_a, "norm_mode"_a, "eps"_a = 1e-6f,

@@ -198,11 +198,81 @@ kernel void rope_kv_insert_norm(device   T    *k            [[buffer(0)]],
                        uint3 blockIdx [[threadgroup_position_in_grid]],        \
                        uint  laneId   [[thread_index_in_simdgroup]]);
 
+// Q-path: rotate (optionally weighted-RMSNorm, gemma-(1+w)) Q into a contiguous q_out. Q is
+// (num_tokens, num_q_heads, D) flattened to (M, D); out row = in row (Q is NOT paged/scattered).
+// Split-half RoPE, positions-indexed like the K insert — the Q companion of rope_kv_insert.
+template <typename T, int D>
+kernel void rope_q(device   T    *q            [[buffer(0)]],
+                   device   T    *cosb         [[buffer(1)]],
+                   device   T    *sinb         [[buffer(2)]],
+                   device   const int *positions [[buffer(3)]],
+                   device   T    *q_out        [[buffer(4)]],
+                   constant int  &num_heads    [[buffer(5)]],
+                   constant int  &do_norm      [[buffer(6)]],   // 0 none, 1 weighted RMSNorm
+                   constant int  &gemma        [[buffer(7)]],
+                   constant float &eps         [[buffer(8)]],
+                   device   T    *norm_weight  [[buffer(9)]],   // (D,), read iff do_norm
+                   uint3 blockIdx [[threadgroup_position_in_grid]],
+                   uint  laneId   [[thread_index_in_simdgroup]]) {
+    constexpr int D2 = D / 2;
+    static_assert(D2 % TILE_DIM == 0, "D/2 must be divisible by 8");
+    const int row = blockIdx.x;
+    const int token = row / num_heads;
+    const int pos = positions[token];
+
+    using row_gl = gl<T, 1, 1, -1, D>;
+    using cs_gl  = gl<T, 1, 1, -1, D2>;
+    row_gl gl_q(q, nullptr, nullptr, 1, nullptr);
+    row_gl gl_o(q_out, nullptr, nullptr, 1, nullptr);
+    cs_gl  gl_c(cosb, nullptr, nullptr, 1, nullptr);
+    cs_gl  gl_s(sinb, nullptr, nullptr, 1, nullptr);
+    cs_gl  gl_w(norm_weight, nullptr, nullptr, 1, nullptr);
+
+    using vecH = rv_fl<D2>;
+    vecH q1, q2, cv, sv, o1, o2, tmp, w1, w2, sq;
+    load(q1, gl_q, {0, 0, row, 0}, laneId);
+    load(q2, gl_q, {0, 0, row, 1}, laneId);
+    if (do_norm) {
+        float ss1 = 0.f, ss2 = 0.f;
+        mul(sq, q1, q1); sum(ss1, sq, laneId);
+        mul(sq, q2, q2); sum(ss2, sq, laneId);
+        const float rms = metal::rsqrt((ss1 + ss2) / (float)D + eps);
+        mul(q1, q1, rms); mul(q2, q2, rms);
+        load(w1, gl_w, {0, 0, 0, 0}, laneId);
+        load(w2, gl_w, {0, 0, 0, 1}, laneId);
+        if (gemma) { add(w1, w1, 1.0f); add(w2, w2, 1.0f); }
+        mul(q1, q1, w1); mul(q2, q2, w2);
+    }
+    load(cv, gl_c, {0, 0, pos, 0}, laneId);
+    load(sv, gl_s, {0, 0, pos, 0}, laneId);
+    mul(o1, q1, cv); mul(tmp, q2, sv); sub(o1, o1, tmp);
+    mul(o2, q2, cv); mul(tmp, q1, sv); add(o2, o2, tmp);
+    store(gl_o, o1, {0, 0, row, 0}, laneId);
+    store(gl_o, o2, {0, 0, row, 1}, laneId);
+}
+
+#define instantiate_rope_q(type_name, T, DVAL)                                 \
+  template [[host_name("rope_q_" #type_name "_" #DVAL)]] [[kernel]] void        \
+  rope_q<T, DVAL>(device T *q [[buffer(0)]],                                    \
+                  device T *cosb [[buffer(1)]],                                 \
+                  device T *sinb [[buffer(2)]],                                 \
+                  device const int *positions [[buffer(3)]],                    \
+                  device T *q_out [[buffer(4)]],                                \
+                  constant int &num_heads [[buffer(5)]],                        \
+                  constant int &do_norm [[buffer(6)]],                          \
+                  constant int &gemma [[buffer(7)]],                            \
+                  constant float &eps [[buffer(8)]],                            \
+                  device T *norm_weight [[buffer(9)]],                          \
+                  uint3 blockIdx [[threadgroup_position_in_grid]],              \
+                  uint laneId [[thread_index_in_simdgroup]]);
+
 #define instantiate_rope_kv_all(type_name, T)                                  \
   instantiate_rope_kv_insert(type_name, T, 64)                                 \
   instantiate_rope_kv_insert(type_name, T, 128)                               \
   instantiate_rope_kv_insert_norm(type_name, T, 64)                            \
-  instantiate_rope_kv_insert_norm(type_name, T, 128)
+  instantiate_rope_kv_insert_norm(type_name, T, 128)                           \
+  instantiate_rope_q(type_name, T, 64)                                         \
+  instantiate_rope_q(type_name, T, 128)
 
 instantiate_rope_kv_all(float32, float)
 instantiate_rope_kv_all(float16, half)

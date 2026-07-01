@@ -604,6 +604,29 @@ static std::tuple<at::Tensor, at::Tensor> rope_kv_insert_norm_mps(
   return {key_out, value_out};
 }
 
+// Q-path RoPE (+ optional weighted RMSNorm) into a contiguous q_out.
+static at::Tensor rope_q_mps(
+    const at::Tensor& q_in, const at::Tensor& cos_in, const at::Tensor& sin_in,
+    const at::Tensor& positions_in, const at::Tensor& nw_in, bool do_norm, bool gemma, double eps) {
+  TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in), "rope_q: q must be float MPS");
+  TORCH_CHECK(q_in.dim() == 3, "rope_q: q must be (num_tokens, num_q_heads, D)");
+  const int num_heads = q_in.size(1), D = q_in.size(2);
+  TORCH_CHECK(D == 64 || D == 128, "rope_q: D must be 64 or 128");
+  TORCH_CHECK(cos_in.size(-1) == D / 2 && sin_in.size(-1) == D / 2, "rope_q: cos/sin (P, D/2)");
+  const auto dt = q_in.scalar_type();
+  auto q = q_in.contiguous();
+  auto cos = cos_in.to(dt).contiguous(), sin = sin_in.to(dt).contiguous();
+  auto positions = positions_in.to(at::kInt).contiguous();
+  auto nw = nw_in.to(dt).contiguous();
+  auto out = at::empty_like(q);
+  const int M = static_cast<int>(q.numel() / D);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rope_q(e, q, cos, sin, positions, out, nw, M, num_heads, do_norm ? 1 : 0,
+                      gemma ? 1 : 0, static_cast<float>(eps), D, tk_type_name(q));
+  });
+  return out;
+}
+
 // DeepSeek MLA Q-path: optional RMSNorm + GPT-J interleaved RoPE on the last rope_dim dims.
 static at::Tensor mla_q_norm_rope_mps(
     const at::Tensor& q_in, const at::Tensor& cos_in, const at::Tensor& sin_in,
@@ -1465,7 +1488,7 @@ static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
   const int Bsz = C.size(0), H = C.size(1);
   const unsigned N = static_cast<unsigned>(C.size(2));
   const int D = C.size(3);
-  TORCH_CHECK(D == 64 || D == 128, "mamba2: D must be 64 or 128");
+  TORCH_CHECK(D == 64, "mamba2: D must be 64");
   TORCH_CHECK(N % 8 == 0, "mamba2: N must be a multiple of 8");
   auto out = at::empty_like(C);
   tk_encode([&](TorchEncoder& e) { tk::launch_mamba2(e, C, B, X, cl, out, N, H, Bsz, D); });
@@ -1797,6 +1820,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("paged_attention_fp8", &paged_attention_fp8_mps, "ThunderMittens fp8 paged attention (MPS)");
   m.def("rope_kv_insert", &rope_kv_insert_mps, "ThunderMittens fused RoPE + paged-KV insert (MPS)");
   m.def("rope_kv_insert_norm", &rope_kv_insert_norm_mps, "ThunderMittens fused K-norm + RoPE + KV insert (MPS)");
+  m.def("rope_q", &rope_q_mps, "ThunderMittens Q-path RoPE (+optional norm) (MPS)");
   m.def("mla_q_norm_rope", &mla_q_norm_rope_mps, "ThunderMittens DeepSeek MLA Q-path norm+interleaved-rope (MPS)");
   m.def("mla_kv_insert", &mla_kv_insert_mps, "ThunderMittens DeepSeek MLA classic KV-insert (MPS)");
   m.def("mla_decode", &mla_decode_mps, "ThunderMittens DeepSeek MLA latent flash-decode (MPS)");

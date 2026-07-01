@@ -37,6 +37,9 @@ inline std::string rope_kv_insert_kernel_name(const std::string& t, int D) {
 inline std::string rope_kv_insert_norm_kernel_name(const std::string& t, int D) {
   return "rope_kv_insert_norm_" + t + "_" + std::to_string(D);
 }
+inline std::string rope_q_kernel_name(const std::string& t, int D) {
+  return "rope_q_" + t + "_" + std::to_string(D);
+}
 inline std::string rms_norm_add_fp8_kernel_name(int D) { return "rms_norm_add_fp8_" + std::to_string(D); }
 inline std::string rms_norm_add_fp8_dyn_kernel_name(int D) { return "rms_norm_add_fp8_dyn_" + std::to_string(D); }
 inline std::string layernorm_add_fp8_kernel_name(int D) { return "layernorm_add_fp8_" + std::to_string(D); }
@@ -244,6 +247,20 @@ void launch_rope_kv_insert_norm(E& e, typename E::in_t k, typename E::in_t v,
   e.in(positions, 4); e.in(slot_mapping, 5);
   e.out(key_cache, 6); e.out(value_cache, 7); e.in(norm_weight, 8);
   e.bytes(num_kv_heads, 9); e.bytes(block_size, 10); e.bytes(eps, 11); e.bytes(gemma, 12);
+  e.dispatch(M, 1, 1, 32, 1, 1);
+}
+
+// ----- rope_q: q@0 cos@1 sin@2 positions@3 -> q_out@4 ; num_heads@5 do_norm@6 gemma@7 eps@8 ;
+//        norm_weight@9 ; grid (M=tokens*heads,1,1), 32 thr. Rotate (+opt norm) Q, out row = in row. -----
+template <class E>
+void launch_rope_q(E& e, typename E::in_t q, typename E::in_t cos, typename E::in_t sin,
+                   typename E::in_t positions, typename E::out_t q_out, typename E::in_t norm_weight,
+                   int M, int num_heads, int do_norm, int gemma, float eps, int D,
+                   const std::string& type_name) {
+  e.pipeline(rope_q_kernel_name(type_name, D));
+  e.in(q, 0); e.in(cos, 1); e.in(sin, 2); e.in(positions, 3); e.out(q_out, 4);
+  e.bytes(num_heads, 5); e.bytes(do_norm, 6); e.bytes(gemma, 7); e.bytes(eps, 8);
+  e.in(norm_weight, 9);
   e.dispatch(M, 1, 1, 32, 1, 1);
 }
 

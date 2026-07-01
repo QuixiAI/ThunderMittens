@@ -10,7 +10,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import rope_kv_insert, rope_kv_insert_norm
+from tk import rope_kv_insert, rope_kv_insert_norm, rope_q
 
 
 def _cos_sin(P, D):
@@ -126,8 +126,38 @@ def test_rope_kv_insert_norm(D, gemma):
     np.testing.assert_allclose(np.array(vc.astype(mx.float32)), ref_v, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("do_norm,gemma", [(False, False), (True, False), (True, True)])
+def test_rope_q(dtype, D, do_norm, gemma):
+    md = _MX[dtype]
+    rng = np.random.default_rng(30 + D)
+    H, nt, P = 4, 5, 16
+    q = (0.3 * rng.normal(size=(nt, H, D))).astype(np.float32)
+    w = (0.5 + 0.1 * rng.normal(size=(D,))).astype(np.float32)
+    cos, sin = _cos_sin(P, D)
+    positions = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+
+    out = rope_q(mx.array(q).astype(md), mx.array(cos).astype(md), mx.array(sin).astype(md),
+                 mx.array(positions), norm_weight=(mx.array(w).astype(md) if do_norm else None),
+                 gemma=gemma)
+    mx.eval(out)
+    assert out.dtype == md
+
+    qb, cb, sb, wb = _round(q, md), _round(cos, md), _round(sin, md), _round(w, md)
+    ref = qb.copy()
+    for t in range(nt):
+        for h in range(H):
+            x = qb[t, h].copy()
+            if do_norm:
+                x = x / np.sqrt((x * x).mean() + 1e-6)
+                x = x * ((1.0 + wb) if gemma else wb)
+            ref[t, h] = _rope_half(x, cb[positions[t]], sb[positions[t]])
+    np.testing.assert_allclose(np.array(out.astype(mx.float32)), ref, atol=2e-2, rtol=2e-2)
+
+
 if __name__ == "__main__":
     for D in (64, 128):
         for H_KV in (1, 2):
-            test_rope_kv_insert(D, H_KV)
+            test_rope_kv_insert("bfloat16", D, H_KV)
             print("ok", D, H_KV)

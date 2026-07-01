@@ -118,6 +118,25 @@ def rope_kv_insert_norm(k, v, cos, sin, positions, slot_mapping, key_cache, valu
                                       key_cache, value_cache, norm_weight, eps, gemma)
 
 
+def rope_q(q, cos, sin, positions, norm_weight=None, gemma=False, eps=1e-6):
+    """Rotate (split-half) and optionally weighted-RMSNorm Q into a contiguous q_out (Q is not
+    paged). q (num_tokens, num_q_heads, D); cos/sin (P, D/2). If norm_weight is given, RMSNorm over
+    D is applied (gemma=True uses 1+weight). Accepts mlx.array or torch.Tensor (MPS). {f16,bf16,f32}.
+    """
+    D = q.shape[-1]
+    do_norm = norm_weight is not None
+    if norm_weight is None:   # dummy (unused)
+        if _is_torch(q):
+            import torch
+            norm_weight = torch.ones(D, dtype=q.dtype, device=q.device)
+        else:
+            import mlx.core as mx
+            norm_weight = mx.ones((D,), dtype=q.dtype)
+    if _is_torch(q):
+        return _torch().rope_q(q, cos, sin, positions, norm_weight, do_norm, gemma, eps)
+    return _mlx().rope_q(q, cos, sin, positions, norm_weight, do_norm, gemma, eps)
+
+
 def mla_q_norm_rope(q, cos, sin, positions, num_heads, nope_dim, rope_dim,
                     norm_mode=0, eps=1e-6, norm_weight=None):
     """DeepSeek MLA Q-path: optional RMSNorm over the full head dim (norm_mode 0=none, 1=rms

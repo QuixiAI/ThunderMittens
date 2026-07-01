@@ -52,6 +52,7 @@ inline std::string quantize_per_token_fp8_kernel_name(const std::string& t) { re
 inline std::string quantize_per_token_int8_kernel_name(const std::string& t) { return "quantize_per_token_int8_" + t; }
 inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_string(D); }
 inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string(D); }
+inline std::string rotary_interleaved_kernel_name(int D) { return "rotary_interleaved_" + std::to_string(D); }
 inline std::string gelu_kernel_name(int D) { return "gelu_" + std::to_string(D); }
 inline std::string glu_kernel_name(const std::string& mode, const std::string& t) { return "glu_" + mode + "_" + t; }
 inline std::string hadamard_kernel_name(const std::string& t, int D) {
@@ -462,8 +463,8 @@ void launch_softmax(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, i
 //        (N, D/2); each row uses seq position n = row % N. -----
 template <class E>
 void launch_rotary(E& e, typename E::in_t x, typename E::in_t cos, typename E::in_t sin,
-                   typename E::out_t o, uint32_t M, unsigned N, int D) {
-  e.pipeline(rotary_kernel_name(D));
+                   typename E::out_t o, uint32_t M, unsigned N, int D, bool interleaved = false) {
+  e.pipeline(interleaved ? rotary_interleaved_kernel_name(D) : rotary_kernel_name(D));
   e.in(x, 0); e.in(cos, 1); e.in(sin, 2); e.out(o, 3);
   e.bytes(N, 4);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);

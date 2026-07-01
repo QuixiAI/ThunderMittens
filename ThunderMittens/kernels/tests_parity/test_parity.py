@@ -421,6 +421,20 @@ def test_rotary_parity(shape):
     _assert_parity(om, ot, atol=1e-2)
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 256, 64), (1, 2, 128, 128)])
+def test_rotary_interleaved_parity(shape):
+    B, H, N, D = shape
+    rng = np.random.default_rng(1)
+    base = 10000.0
+    inv_freq = base ** (-(np.arange(0, D, 2).astype(np.float32) / D))
+    ang = np.arange(N, dtype=np.float32)[:, None] * inv_freq[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    x = rng.standard_normal((B, H, N, D)).astype(np.float32)
+    om = tk.rotary(_mk(x, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"), interleaved=True)
+    ot = tk.rotary(_mk(x, "torch"), _mk(cos, "torch"), _mk(sin, "torch"), interleaved=True)
+    _assert_parity(om, ot, atol=1e-2)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (1, 256, 768)])
 def test_gelu_parity(shape):
     rng = np.random.default_rng(0)

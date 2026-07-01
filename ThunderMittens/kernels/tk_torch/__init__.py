@@ -155,9 +155,10 @@ def softmax(x: torch.Tensor):
     return _ext.softmax(x)
 
 
-def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """RoPE (split-half). x bf16 (B,H,N,D); cos/sin bf16 (N,D/2); D in {64,128}."""
-    return _ext.rotary(x, cos, sin)
+def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False):
+    """RoPE. x bf16 (B,H,N,D); cos/sin bf16 (N,D/2); D in {64,128}.
+    interleaved=False: split-half (GPT-NeoX); True: GPT-J adjacent pairs."""
+    return _ext.rotary(x, cos, sin, interleaved)
 
 
 def rope_kv_insert(k: torch.Tensor, v: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,

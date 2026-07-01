@@ -30,6 +30,7 @@ array rotary(
     const array& x,
     const array& cos,
     const array& sin,
+    bool interleaved /* = false */,
     StreamOrDevice s /* = {} */
 ) {
   assert(x.dtype() == bfloat16 && cos.dtype() == bfloat16 && sin.dtype() == bfloat16);
@@ -45,7 +46,7 @@ array rotary(
       /* const std::vector<int>& shape = */ x.shape(),
       /* Dtype dtype = */ bfloat16,
       /* std::shared_ptr<Primitive> primitive = */
-      std::make_shared<Rotary>(to_stream(s)),
+      std::make_shared<Rotary>(to_stream(s), interleaved),
       /* const std::vector<array>& inputs = */ {x, cos, sin});
 }
 
@@ -89,7 +90,7 @@ void Rotary::eval_gpu(
 
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
-  tk::launch_rotary(enc, x, cos, sin, out, M, N, D);
+  tk::launch_rotary(enc, x, cos, sin, out, M, N, D, interleaved_);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -118,7 +119,7 @@ std::pair<std::vector<array>, std::vector<int>> Rotary::vmap(
 }
 
 bool Rotary::is_equivalent(const Primitive& other) const {
-  return true;
+  return interleaved_ == static_cast<const Rotary&>(other).interleaved_;
 }
 
 } // namespace mlx::core

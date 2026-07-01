@@ -72,4 +72,53 @@ kernel void rotary(device   bf16 *x    [[buffer(0)]],
 instantiate_rotary(64);
 instantiate_rotary(128);
 
+// ---------------------------------------------------------------------------
+// Rotary, GPT-J *interleaved* convention, matching mx.fast.rope(traditional=True).
+// Rotates adjacent pairs (x[2p], x[2p+1]) rather than the two halves:
+//     o[2p]   = x[2p]*cos[p] - x[2p+1]*sin[p]
+//     o[2p+1] = x[2p]*sin[p] + x[2p+1]*cos[p]
+// cos/sin are (N, D/2) as before (one entry per pair). Instead of the strided
+// rv_fl load (whose column map w*32+lane splits an interleaved pair across two
+// lanes), each lane owns D/32 CONTIGUOUS elements = D/64 within-lane pairs, so a
+// pair is always resident in one lane — no cross-lane shuffle. Needs D%64==0.
+// ---------------------------------------------------------------------------
+template <int D>
+kernel void rotary_interleaved(device   bf16 *x    [[buffer(0)]],
+                               device   bf16 *cosb [[buffer(1)]],
+                               device   bf16 *sinb [[buffer(2)]],
+                               device   bf16 *o    [[buffer(3)]],
+                               constant uint &N    [[buffer(4)]],
+                               uint3 blockIdx [[threadgroup_position_in_grid]],
+                               uint  laneId   [[thread_index_in_simdgroup]]) {
+    static_assert(D % 64 == 0, "interleaved rotary needs D divisible by 64");
+    constexpr int PER_LANE = D / 32;        // contiguous elements owned by this lane
+    constexpr int PAIRS = PER_LANE / 2;     // within-lane pairs = D/64
+    const int row = blockIdx.x;
+    const int n = row % (int)N;
+    const long xbase = (long)row * D + (long)laneId * PER_LANE;
+    const long csbase = (long)n * (D / 2);
+    for (int j = 0; j < PAIRS; ++j) {
+        const int p = (int)laneId * PAIRS + j;      // global pair index
+        const float xe = float(x[xbase + 2 * j]);
+        const float xo = float(x[xbase + 2 * j + 1]);
+        const float c = float(cosb[csbase + p]);
+        const float s = float(sinb[csbase + p]);
+        o[xbase + 2 * j]     = bf16(xe * c - xo * s);
+        o[xbase + 2 * j + 1] = bf16(xe * s + xo * c);
+    }
+}
+
+#define instantiate_rotary_interleaved(DVAL)                                   \
+  template [[host_name("rotary_interleaved_" #DVAL)]] [[kernel]] void          \
+  rotary_interleaved<DVAL>(device   bf16 *x    [[buffer(0)]],                  \
+                           device   bf16 *cosb [[buffer(1)]],                  \
+                           device   bf16 *sinb [[buffer(2)]],                  \
+                           device   bf16 *o    [[buffer(3)]],                  \
+                           constant uint &N    [[buffer(4)]],                  \
+                           uint3 blockIdx [[threadgroup_position_in_grid]],    \
+                           uint  laneId   [[thread_index_in_simdgroup]]);
+
+instantiate_rotary_interleaved(64);
+instantiate_rotary_interleaved(128);
+
 }

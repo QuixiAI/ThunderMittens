@@ -172,11 +172,12 @@ def softmax(x):
     return _mlx().softmax(x)
 
 
-def rotary(x, cos, sin):
-    """RoPE (split-half). x is (B,H,N,D), cos/sin (N,D/2). mlx.array or torch.Tensor (MPS)."""
+def rotary(x, cos, sin, interleaved=False):
+    """RoPE. x is (B,H,N,D), cos/sin (N,D/2). mlx.array or torch.Tensor (MPS).
+    interleaved=False: split-half (GPT-NeoX); True: GPT-J adjacent pairs."""
     if _is_torch(x):
-        return _torch().rotary(x, cos, sin)
-    return _mlx().rotary(x, cos, sin)
+        return _torch().rotary(x, cos, sin, interleaved)
+    return _mlx().rotary(x, cos, sin, interleaved)
 
 
 def gelu(x):

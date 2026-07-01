@@ -22,6 +22,7 @@ array rotary(
     const array& x,   // (B, H, N, D)
     const array& cos, // (N, D/2)
     const array& sin, // (N, D/2)
+    bool interleaved = false,  // false = split-half (NeoX); true = GPT-J interleaved
     StreamOrDevice s = {}
 );
 
@@ -31,7 +32,8 @@ array rotary(
 
 class Rotary : public Primitive {
  public:
-  explicit Rotary(Stream stream) : Primitive(stream) {};
+  explicit Rotary(Stream stream, bool interleaved = false)
+      : Primitive(stream), interleaved_(interleaved) {};
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
@@ -62,6 +64,9 @@ class Rotary : public Primitive {
   bool is_equivalent(const Primitive& other) const override;
 
   void eval(const std::vector<array>& inputs, std::vector<array>& outputs);
+
+ private:
+  bool interleaved_;
 };
 
 } // namespace mlx::core

@@ -306,7 +306,7 @@ static at::Tensor softmax_mps(const at::Tensor& x_in) {
 }
 
 static at::Tensor rotary_mps(const at::Tensor& x_in, const at::Tensor& cos_in,
-                             const at::Tensor& sin_in) {
+                             const at::Tensor& sin_in, bool interleaved) {
   TORCH_CHECK(x_in.device().is_mps(), "rotary: x must be an MPS tensor");
   TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "rotary: x must be bfloat16");
   TORCH_CHECK(x_in.dim() == 4, "rotary: x must be (B,H,N,D)");
@@ -319,7 +319,7 @@ static at::Tensor rotary_mps(const at::Tensor& x_in, const at::Tensor& cos_in,
               "rotary: cos/sin must be (N, D/2)");
   const uint32_t M = static_cast<uint32_t>(x.numel() / D);
   auto out = at::empty_like(x);
-  tk_encode([&](TorchEncoder& e) { tk::launch_rotary(e, x, cos, sin, out, M, N, D); });
+  tk_encode([&](TorchEncoder& e) { tk::launch_rotary(e, x, cos, sin, out, M, N, D, interleaved); });
   return out;
 }
 

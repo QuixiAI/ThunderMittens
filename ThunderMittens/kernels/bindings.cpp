@@ -424,10 +424,12 @@ NB_MODULE(_ext, m) {
       "x"_a,
       "cos"_a,
       "sin"_a,
+      "interleaved"_a = false,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        rotary positional embedding (split-half / GPT-NeoX); x is (B,H,N,D), cos/sin are (N,D/2)
+        rotary positional embedding; x is (B,H,N,D), cos/sin are (N,D/2).
+        interleaved=False: split-half (GPT-NeoX); interleaved=True: GPT-J adjacent pairs.
       )");
 
     m.def(

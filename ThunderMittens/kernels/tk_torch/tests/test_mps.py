@@ -193,6 +193,52 @@ def test_paged_attention_v2(D, H, H_KV, partition_size):
 
 
 @pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("gemma", [False, True])
+def test_rope_kv_insert_norm(D, gemma):
+    import numpy as np
+    rng = np.random.default_rng(4 + D + int(gemma))
+    nb, bs, nt, H_KV = 4, 4, 5, 2
+    P, eps, half = nb * bs, 1e-5, D // 2
+    inv = 1.0 / (10000.0 ** (np.arange(half) / half))
+    ang = np.arange(P)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    k = (0.3 * rng.normal(size=(nt, H_KV, D))).astype(np.float32)
+    v = (0.3 * rng.normal(size=(nt, H_KV, D))).astype(np.float32)
+    positions = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+    slot = np.array([0, 5, -1, 6, 11], dtype=np.int64)
+    w = rng.normal(size=(D,)).astype(np.float32)
+    kc0 = (0.1 * rng.normal(size=(nb, bs, H_KV, D))).astype(np.float32)
+    vc0 = (0.1 * rng.normal(size=(nb, bs, H_KV, D))).astype(np.float32)
+
+    def bf(x):
+        return torch.from_numpy(x.astype(np.float32)).to(torch.bfloat16).to("mps")
+
+    kc, vc = tk_torch.rope_kv_insert_norm(
+        bf(k), bf(v), bf(cos), bf(sin), torch.from_numpy(positions).to("mps"),
+        torch.from_numpy(slot).to("mps"), bf(kc0), bf(vc0), bf(w), eps, gemma)
+
+    def tb(x):
+        return torch.from_numpy(x).to(torch.bfloat16).float().numpy()
+    kb, vb, cb, sb, wb = tb(k), tb(v), tb(cos), tb(sin), tb(w)
+    ref_k, ref_v = tb(kc0), tb(vc0)
+    for t in range(nt):
+        s = int(slot[t])
+        if s < 0:
+            continue
+        blk, boff = s // bs, s % bs
+        for h in range(H_KV):
+            ms = (kb[t, h] ** 2).mean()
+            weff = (1.0 + wb) if gemma else wb
+            kn = kb[t, h] / np.sqrt(ms + eps) * weff
+            x1, x2 = kn[:half], kn[half:]
+            c, sn = cb[positions[t]], sb[positions[t]]
+            ref_k[blk, boff, h] = np.concatenate([x1 * c - x2 * sn, x2 * c + x1 * sn])
+            ref_v[blk, boff, h] = vb[t, h]
+    assert _maxdiff(kc.float(), torch.from_numpy(ref_k).to("mps")) < 0.03
+    assert _maxdiff(vc.float(), torch.from_numpy(ref_v).to("mps")) < 0.03
+
+
+@pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("H_KV", [1, 2])
 def test_rope_kv_insert(D, H_KV):
     import numpy as np

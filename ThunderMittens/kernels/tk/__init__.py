@@ -90,6 +90,19 @@ def rope_kv_insert(k, v, cos, sin, positions, slot_mapping, key_cache, value_cac
     return _mlx().rope_kv_insert(k, v, cos, sin, positions, slot_mapping, key_cache, value_cache)
 
 
+def rope_kv_insert_norm(k, v, cos, sin, positions, slot_mapping, key_cache, value_cache,
+                        norm_weight, eps=1e-5, gemma=False):
+    """Fused K RMSNorm + RoPE (split-half) + paged-KV insert. gemma=True uses (1+weight).
+
+    Returns updated (key_cache, value_cache). Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(k):
+        return _torch().rope_kv_insert_norm(k, v, cos, sin, positions, slot_mapping,
+                                            key_cache, value_cache, norm_weight, eps, gemma)
+    return _mlx().rope_kv_insert_norm(k, v, cos, sin, positions, slot_mapping,
+                                      key_cache, value_cache, norm_weight, eps, gemma)
+
+
 def rms_norm_add(x, residual, weight, eps=1e-5):
     """Fused residual-add + RMSNorm. Returns (out, x+residual).
 

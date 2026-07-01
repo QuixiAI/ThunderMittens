@@ -269,6 +269,34 @@ def test_paged_attention_v2_parity(H, H_KV, ps):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("D,gemma", [(64, False), (128, True)])
+def test_rope_kv_insert_norm_parity(D, gemma):
+    rng = np.random.default_rng(6)
+    nb, bs, nt, H_KV = 4, 4, 5, 2
+    P, half = nb * bs, D // 2
+    inv = 1.0 / (10000.0 ** (np.arange(half) / half))
+    ang = np.arange(P)[:, None] * inv[None, :]
+    cos = np.cos(ang).astype(np.float32)
+    sin = np.sin(ang).astype(np.float32)
+    k = (0.3 * rng.normal(size=(nt, H_KV, D))).astype(np.float32)
+    v = (0.3 * rng.normal(size=(nt, H_KV, D))).astype(np.float32)
+    positions = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+    slot = np.array([0, 5, -1, 6, 11], dtype=np.int64)
+    w = rng.normal(size=(D,)).astype(np.float32)
+    kc0 = (0.1 * rng.normal(size=(nb, bs, H_KV, D))).astype(np.float32)
+    vc0 = (0.1 * rng.normal(size=(nb, bs, H_KV, D))).astype(np.float32)
+    km, vm = tk.rope_kv_insert_norm(
+        _mk(k, "mlx"), _mk(v, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"),
+        mx.array(positions), mx.array(slot), _mk(kc0, "mlx"), _mk(vc0, "mlx"),
+        _mk(w, "mlx"), 1e-5, gemma)
+    kt, vt = tk.rope_kv_insert_norm(
+        _mk(k, "torch"), _mk(v, "torch"), _mk(cos, "torch"), _mk(sin, "torch"),
+        torch.from_numpy(positions).to("mps"), torch.from_numpy(slot).to("mps"),
+        _mk(kc0, "torch"), _mk(vc0, "torch"), _mk(w, "torch"), 1e-5, gemma)
+    _assert_parity(km, kt, atol=2e-2)
+    _assert_parity(vm, vt, atol=2e-2)
+
+
 @pytest.mark.parametrize("D,H_KV", [(64, 2), (128, 1)])
 def test_rope_kv_insert_parity(D, H_KV):
     rng = np.random.default_rng(5)

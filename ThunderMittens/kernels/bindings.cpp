@@ -227,6 +227,13 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "rope_kv_insert_norm", &rope_kv_insert_norm,
+      "k"_a, "v"_a, "cos"_a, "sin"_a, "positions"_a, "slot_mapping"_a,
+      "key_cache"_a, "value_cache"_a, "norm_weight"_a, "eps"_a, "gemma"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused K RMSNorm + RoPE + paged-KV insert. gemma=True uses (1+weight). Returns (kc, vc).)");
+
+    m.def(
       "paged_attention_v2",
       &paged_attention_v2,
       "q"_a,

@@ -93,6 +93,99 @@ kernel void rope_kv_insert(device   bf16 *k            [[buffer(0)]],
     store(gl_vc, vv, {0, 0, (int)dst_row, 0}, laneId);
 }
 
+// Same as rope_kv_insert, but RMSNorms K over the head dim before RoPE (fused
+// Q/K-norm + RoPE + insert, the reference pattern). norm over all D of the K row:
+// rms = rsqrt(mean(k^2)+eps); k = k*rms*w  (or k*rms*(1+w) for gemma=1). bf16.
+template <int D>
+kernel void rope_kv_insert_norm(device   bf16 *k            [[buffer(0)]],
+                                device   bf16 *v            [[buffer(1)]],
+                                device   bf16 *cosb         [[buffer(2)]],
+                                device   bf16 *sinb         [[buffer(3)]],
+                                device   const int  *positions    [[buffer(4)]],
+                                device   const long *slot_mapping [[buffer(5)]],
+                                device   bf16 *key_cache    [[buffer(6)]],
+                                device   bf16 *value_cache  [[buffer(7)]],
+                                device   bf16 *norm_weight  [[buffer(8)]],
+                                constant int  &num_kv_heads [[buffer(9)]],
+                                constant int  &block_size   [[buffer(10)]],
+                                constant float &eps         [[buffer(11)]],
+                                constant int  &gemma        [[buffer(12)]],
+                                uint3 blockIdx [[threadgroup_position_in_grid]],
+                                uint  laneId   [[thread_index_in_simdgroup]]) {
+    constexpr int D2 = D / 2;
+    static_assert(D2 % TILE_DIM == 0, "D/2 must be divisible by 8");
+    const int row = blockIdx.x;
+    const int token = row / num_kv_heads;
+    const int kv_head = row % num_kv_heads;
+    const long slot = slot_mapping[token];
+    if (slot < 0) { return; }
+    const long block = slot / block_size;
+    const long block_offset = slot % block_size;
+    const long dst_row =
+        (block * block_size + block_offset) * (long)num_kv_heads + (long)kv_head;
+    const int pos = positions[token];
+
+    using row_gl = gl<bf16, 1, 1, -1, D>;
+    using cs_gl  = gl<bf16, 1, 1, -1, D2>;
+    row_gl gl_k(k,            nullptr, nullptr, 1, nullptr);
+    row_gl gl_v(v,            nullptr, nullptr, 1, nullptr);
+    row_gl gl_kc(key_cache,   nullptr, nullptr, 1, nullptr);
+    row_gl gl_vc(value_cache, nullptr, nullptr, 1, nullptr);
+    cs_gl  gl_c(cosb,         nullptr, nullptr, 1, nullptr);
+    cs_gl  gl_s(sinb,         nullptr, nullptr, 1, nullptr);
+    cs_gl  gl_w(norm_weight,  nullptr, nullptr, 1, nullptr);   // (D,) split into halves
+
+    using vecH = rv_fl<D2>;
+    vecH k1, k2, w1, w2, cv, sv, o1, o2, tmp, sq;
+    load(k1, gl_k, {0, 0, row, 0}, laneId);
+    load(k2, gl_k, {0, 0, row, 1}, laneId);
+    load(w1, gl_w, {0, 0, 0,   0}, laneId);
+    load(w2, gl_w, {0, 0, 0,   1}, laneId);
+
+    // RMSNorm over the full head dim D.
+    float ss1 = 0.f, ss2 = 0.f;
+    mul(sq, k1, k1); sum(ss1, sq, laneId);
+    mul(sq, k2, k2); sum(ss2, sq, laneId);
+    const float rms = metal::rsqrt((ss1 + ss2) / (float)D + eps);
+    mul(k1, k1, rms); mul(k2, k2, rms);
+    if (gemma) { add(w1, w1, 1.0f); add(w2, w2, 1.0f); }   // gemma uses (1 + weight)
+    mul(k1, k1, w1); mul(k2, k2, w2);
+
+    // RoPE on the normed halves.
+    load(cv, gl_c, {0, 0, pos, 0}, laneId);
+    load(sv, gl_s, {0, 0, pos, 0}, laneId);
+    mul(o1, k1, cv); mul(tmp, k2, sv); sub(o1, o1, tmp);
+    mul(o2, k2, cv); mul(tmp, k1, sv); add(o2, o2, tmp);
+    store(gl_kc, o1, {0, 0, (int)dst_row, 0}, laneId);
+    store(gl_kc, o2, {0, 0, (int)dst_row, 1}, laneId);
+
+    using vecD = rv_fl<D>;
+    vecD vv;
+    load(vv, gl_v, {0, 0, row, 0}, laneId);
+    store(gl_vc, vv, {0, 0, (int)dst_row, 0}, laneId);
+}
+
+#define instantiate_rope_kv_insert_norm(DVAL)                                  \
+  template [[host_name("rope_kv_insert_norm_" #DVAL)]] [[kernel]] void         \
+  rope_kv_insert_norm<DVAL>(device bf16 *k [[buffer(0)]],                       \
+                            device bf16 *v [[buffer(1)]],                       \
+                            device bf16 *cosb [[buffer(2)]],                    \
+                            device bf16 *sinb [[buffer(3)]],                    \
+                            device const int *positions [[buffer(4)]],          \
+                            device const long *slot_mapping [[buffer(5)]],      \
+                            device bf16 *key_cache [[buffer(6)]],               \
+                            device bf16 *value_cache [[buffer(7)]],             \
+                            device bf16 *norm_weight [[buffer(8)]],             \
+                            constant int &num_kv_heads [[buffer(9)]],           \
+                            constant int &block_size [[buffer(10)]],            \
+                            constant float &eps [[buffer(11)]],                 \
+                            constant int &gemma [[buffer(12)]],                 \
+                            uint3 blockIdx [[threadgroup_position_in_grid]],    \
+                            uint laneId [[thread_index_in_simdgroup]]);
+
+instantiate_rope_kv_insert_norm(64);
+instantiate_rope_kv_insert_norm(128);
+
 #define instantiate_rope_kv_insert(DVAL)                                       \
   template [[host_name("rope_kv_insert_" #DVAL)]] [[kernel]] void              \
   rope_kv_insert<DVAL>(device   bf16 *k            [[buffer(0)]],              \

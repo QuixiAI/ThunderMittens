@@ -32,6 +32,40 @@ std::vector<array> rope_kv_insert(
     const array& value_cache,
     StreamOrDevice s = {});
 
+/**
+ *  Same as rope_kv_insert but RMSNorms K over the head dim before RoPE (fused Q/K-norm +
+ *  RoPE + insert). norm_weight is (D,) bf16; gemma=true uses (1+weight). Returns updated caches.
+ **/
+std::vector<array> rope_kv_insert_norm(
+    const array& k, const array& v, const array& cos, const array& sin, const array& positions,
+    const array& slot_mapping, const array& key_cache, const array& value_cache,
+    const array& norm_weight, float eps, bool gemma, StreamOrDevice s = {});
+
+class RopeKvInsertNorm : public Primitive {
+ public:
+  RopeKvInsertNorm(Stream stream, float eps, bool gemma)
+      : Primitive(stream), eps_(eps), gemma_(gemma) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "RopeKvInsertNorm"; }
+  void print(std::ostream& os) override { os << "RopeKvInsertNorm"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const RopeKvInsertNorm&>(other);
+    return eps_ == o.eps_ && gemma_ == o.gemma_;
+  }
+
+ private:
+  float eps_;
+  bool gemma_;
+};
+
 class RopeKvInsert : public Primitive {
  public:
   explicit RopeKvInsert(Stream stream) : Primitive(stream) {}

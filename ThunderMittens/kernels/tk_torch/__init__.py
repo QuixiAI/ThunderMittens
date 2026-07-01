@@ -171,6 +171,13 @@ def rope_kv_insert(k: torch.Tensor, v: torch.Tensor, cos: torch.Tensor, sin: tor
     return _ext.rope_kv_insert(k, v, cos, sin, positions, slot_mapping, key_cache, value_cache)
 
 
+def rope_kv_insert_norm(k, v, cos, sin, positions, slot_mapping, key_cache, value_cache,
+                        norm_weight, eps=1e-5, gemma=False):
+    """Fused K RMSNorm + RoPE + paged-KV insert. gemma=True uses (1+weight). Returns (kc, vc). MPS."""
+    return _ext.rope_kv_insert_norm(k, v, cos, sin, positions, slot_mapping, key_cache,
+                                    value_cache, norm_weight, float(eps), bool(gemma))
+
+
 def gelu(x: torch.Tensor):
     """GELU (tanh approx) over the last axis. bf16 MPS; D in {256,512,768,1024}."""
     return _ext.gelu(x)

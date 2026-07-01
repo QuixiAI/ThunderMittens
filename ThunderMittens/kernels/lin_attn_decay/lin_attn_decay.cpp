@@ -9,6 +9,7 @@
 #include "mlx/utils.h"
 
 #include "lin_attn_decay/lin_attn_decay.h"
+#include "mamba2/mamba2.h"   // ssd_chunked: shared chunked linear-time SSD pipeline
 
 #ifdef ACCELERATE_NEW_LAPACK
 #include <vecLib/cblas_new.h>
@@ -30,7 +31,10 @@ array lin_attn_decay(const array& q, const array& k, const array& v, const array
   const int N = q.shape(2), D = q.shape(3);
   assert(D == 64 && "lin_attn_decay currently supports D=64");
   assert(N % 8 == 0 && "lin_attn_decay: N must be a multiple of 8");
-  (void)N;
+  if (N % 64 == 0 && N >= 128) {
+    // same math as mamba2 with cl = -slope*position: use the chunked linear-time pipeline
+    return ssd_chunked(q, k, v, cl, s);
+  }
   return array(q.shape(), bfloat16,
                std::make_shared<LinAttnDecay>(to_stream(s)), {q, k, v, cl});
 }

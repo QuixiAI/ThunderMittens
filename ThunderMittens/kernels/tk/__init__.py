@@ -831,10 +831,14 @@ def qgemm_direct(wq, x, format="q8_0"):
     return _mlx().qgemm_direct(wq, x, format=format)
 
 
-def attn_q(q, kq, vq, format="q8_0", causal=False, multiwarp=False):
+def attn_q(q, kq, vq, format="q8_0", causal=False, multiwarp="auto"):
     """Quantized-KV flash attention: softmax(QK^T)·V with K,V given as quantized blocks (format).
     q bf16 (B,H,N,D); kq/vq uint8 (B,H,N,D/block_k,block_bytes) -> bf16 (B,H,N,D). D in {64,128}.
+    multiwarp="auto" (default) uses the 4-warp variant whenever legal (non-causal, N%32==0) —
+    it stages 4 KV tiles per barrier pair and measures ~2x faster than single-warp.
     Accepts mlx.array or torch.Tensor (MPS)."""
+    if multiwarp == "auto":
+        multiwarp = (not causal) and q.shape[2] % 32 == 0
     if _is_torch(q):
         return _torch().attn_q(q, kq, vq, format, causal, multiwarp)
     return _mlx().attn_q(q, kq, vq, format=format, causal=causal, multiwarp=multiwarp)

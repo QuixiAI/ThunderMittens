@@ -1072,6 +1072,36 @@ void launch_lin_attn_causal(E& e, typename E::in_t q, typename E::in_t k, typena
   e.dispatch(1, static_cast<int>(H), B, 32, 1, 1);
 }
 
+// ----- chunked-parallel causal linear attention (3 kernels, chunk L=64). Scratch S is
+//        (B,H,C,D,D) fp32, C = N/64. K1 per-chunk KV -> S; K2 exclusive chunk prefix
+//        (Sin -> Sex); K3 per-chunk serial body seeded with Sex. Grids: (C,H,B) / (B*H,1,1)
+//        x 256 / (C,H,B). -----
+template <class E>
+void launch_lin_chunk_kv(E& e, typename E::in_t k, typename E::in_t v, typename E::out_t s,
+                         unsigned N, unsigned H, int B, int C, int D) {
+  e.pipeline("lin_chunk_kv_" + std::to_string(D));
+  e.in(k, 0); e.in(v, 1); e.out(s, 2);
+  e.bytes(N, 3); e.bytes(H, 4);
+  e.dispatch(C, static_cast<int>(H), B, 32, 1, 1);
+}
+template <class E>
+void launch_lin_chunk_scan(E& e, typename E::in_t sin, typename E::out_t sex,
+                           unsigned C, int BH, int D) {
+  e.pipeline("lin_chunk_scan_" + std::to_string(D));
+  e.in(sin, 0); e.out(sex, 1);
+  e.bytes(C, 2);
+  e.dispatch(BH, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_lin_chunk_out(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                          typename E::in_t sex, typename E::out_t o,
+                          unsigned N, unsigned H, int B, int C, int D) {
+  e.pipeline("lin_chunk_out_" + std::to_string(D));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.in(sex, 3); e.out(o, 4);
+  e.bytes(N, 5); e.bytes(H, 6);
+  e.dispatch(C, static_cast<int>(H), B, 32, 1, 1);
+}
+
 // ----- mamba2 (SSD): C@0 B@1 X@2 cumlog@3 -> Y@4 ; N@5(u32) H@6(u32) ;
 //        grid (N/8, H, B) group (32,1,1). C,B,X,Y (B,H,N,D) bf16; cumlog (B,H,N) fp32. -----
 template <class E>
@@ -1081,6 +1111,35 @@ void launch_mamba2(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in
   e.pipeline(mamba2_kernel_name(D));
   e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(cumlog, 3); e.out(Y, 4);
   e.bytes(N, 5); e.bytes(H, 6);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
+// ----- chunked linear-time SSD (3 kernels; shared by mamba2 and lin_attn_decay, chunk L=64).
+//        Scratch S is (B,H,C,D,D) fp32, C = N/64. K1 per-chunk decayed KV; K2 decayed exclusive
+//        chunk prefix; K3 intra(decay tiles) + inter(state) per query tile. -----
+template <class E>
+void launch_ssd_chunk_kv(E& e, typename E::in_t bm, typename E::in_t x, typename E::in_t cl,
+                         typename E::out_t s, unsigned N, unsigned H, int B, int C, int D) {
+  e.pipeline("ssd_chunk_kv_" + std::to_string(D));
+  e.in(bm, 0); e.in(x, 1); e.in(cl, 2); e.out(s, 3);
+  e.bytes(N, 4); e.bytes(H, 5);
+  e.dispatch(C, static_cast<int>(H), B, 32, 1, 1);
+}
+template <class E>
+void launch_ssd_chunk_scan(E& e, typename E::in_t sin, typename E::in_t cl,
+                           typename E::out_t sex, unsigned C, unsigned N, int BH, int D) {
+  e.pipeline("ssd_chunk_scan_" + std::to_string(D));
+  e.in(sin, 0); e.in(cl, 1); e.out(sex, 2);
+  e.bytes(C, 3); e.bytes(N, 4);
+  e.dispatch(BH, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_ssd_chunk_out(E& e, typename E::in_t cq, typename E::in_t bm, typename E::in_t x,
+                          typename E::in_t cl, typename E::in_t sex, typename E::out_t y,
+                          unsigned N, unsigned H, int B, int D) {
+  e.pipeline("ssd_chunk_out_" + std::to_string(D));
+  e.in(cq, 0); e.in(bm, 1); e.in(x, 2); e.in(cl, 3); e.in(sex, 4); e.out(y, 5);
+  e.bytes(N, 6); e.bytes(H, 7);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 

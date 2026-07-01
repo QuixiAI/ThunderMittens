@@ -1532,7 +1532,50 @@ static at::Tensor lin_attn_causal_mps(const at::Tensor& q_in, const at::Tensor& 
   TORCH_CHECK(D == 64, "lin_attn_causal: D must be 64");
   TORCH_CHECK(N % 8 == 0, "lin_attn_causal: N must be a multiple of 8");
   auto out = at::empty_like(q);
-  tk_encode([&](TorchEncoder& e) { tk::launch_lin_attn_causal(e, q, k, v, out, N, H, B, D); });
+  constexpr unsigned L = 64;   // chunk rows (must match LIN_CHUNK_L in the metal)
+  if (N % L != 0 || N < 2 * L) {
+    // small/ragged N: the serial single-simdgroup scan
+    tk_encode([&](TorchEncoder& e) { tk::launch_lin_attn_causal(e, q, k, v, out, N, H, B, D); });
+    return out;
+  }
+  // chunked-parallel: per-chunk KV -> exclusive chunk prefix -> seeded per-chunk scan
+  const int C = static_cast<int>(N / L);
+  auto f32 = q.options().dtype(at::kFloat);
+  auto s_raw = at::empty({B, H, C, D, D}, f32);
+  auto s_ex = at::empty({B, H, C, D, D}, f32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_lin_chunk_kv(e, k, v, s_raw, N, H, B, C, D);
+    tk::launch_lin_chunk_scan(e, s_raw, s_ex, static_cast<unsigned>(C), B * H, D);
+    tk::launch_lin_chunk_out(e, q, k, v, s_ex, out, N, H, B, C, D);
+  });
+  return out;
+}
+
+// Shared SSD dispatch (mamba2 / lin_attn_decay — identical math): the quadratic materialized
+// kernel for small/ragged N, the chunked linear-time 3-kernel pipeline otherwise.
+static at::Tensor ssd_dispatch(const at::Tensor& C, const at::Tensor& B, const at::Tensor& X,
+                               const at::Tensor& cl, int Bsz, int H, unsigned N, int D,
+                               bool decay_kernel_name) {
+  auto out = at::empty_like(C);
+  constexpr unsigned L = 64;   // must match SSD_CHUNK_L in the metal
+  if (N % L != 0 || N < 2 * L) {
+    tk_encode([&](TorchEncoder& e) {
+      if (decay_kernel_name)
+        tk::launch_lin_attn_decay(e, C, B, X, cl, out, N, H, Bsz, D);
+      else
+        tk::launch_mamba2(e, C, B, X, cl, out, N, H, Bsz, D);
+    });
+    return out;
+  }
+  const int Cn = static_cast<int>(N / L);
+  auto f32 = C.options().dtype(at::kFloat);
+  auto s_raw = at::empty({Bsz, H, Cn, D, D}, f32);
+  auto s_ex = at::empty({Bsz, H, Cn, D, D}, f32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_ssd_chunk_kv(e, B, X, cl, s_raw, N, H, Bsz, Cn, D);
+    tk::launch_ssd_chunk_scan(e, s_raw, cl, s_ex, static_cast<unsigned>(Cn), N, Bsz * H, D);
+    tk::launch_ssd_chunk_out(e, C, B, X, cl, s_ex, out, N, H, Bsz, D);
+  });
   return out;
 }
 
@@ -1548,9 +1591,7 @@ static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
   const int D = C.size(3);
   TORCH_CHECK(D == 64, "mamba2: D must be 64");
   TORCH_CHECK(N % 8 == 0, "mamba2: N must be a multiple of 8");
-  auto out = at::empty_like(C);
-  tk_encode([&](TorchEncoder& e) { tk::launch_mamba2(e, C, B, X, cl, out, N, H, Bsz, D); });
-  return out;
+  return ssd_dispatch(C, B, X, cl, Bsz, H, N, D, /*decay_kernel_name=*/false);
 }
 
 static at::Tensor lin_attn_decay_mps(const at::Tensor& q_in, const at::Tensor& k_in,
@@ -1563,9 +1604,7 @@ static at::Tensor lin_attn_decay_mps(const at::Tensor& q_in, const at::Tensor& k
   const unsigned N = static_cast<unsigned>(q.size(2));
   const int D = q.size(3);
   TORCH_CHECK(D == 64 && N % 8 == 0, "lin_attn_decay: D=64, N%8==0");
-  auto out = at::empty_like(q);
-  tk_encode([&](TorchEncoder& e) { tk::launch_lin_attn_decay(e, q, k, v, cl, out, N, H, Bsz, D); });
-  return out;
+  return ssd_dispatch(q, k, v, cl, Bsz, H, N, D, /*decay_kernel_name=*/true);
 }
 
 static at::Tensor based_mps(const at::Tensor& q_in, const at::Tensor& k_in, const at::Tensor& v_in) {

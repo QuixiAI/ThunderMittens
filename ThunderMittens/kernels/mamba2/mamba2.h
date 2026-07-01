@@ -13,6 +13,60 @@ namespace mlx::core {
 array mamba2(const array& C, const array& B, const array& X, const array& cumlog,
              StreamOrDevice s = {});
 
+// Chunked linear-time SSD pipeline primitives (used automatically for N % 64 == 0,
+// N >= 128; shared by mamba2 and lin_attn_decay): SsdChunkKV -> SsdChunkScan -> SsdChunkOut.
+class SsdChunkKV : public Primitive {
+ public:
+  explicit SsdChunkKV(Stream stream) : Primitive(stream) {};
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "SsdChunkKV"; }
+  void print(std::ostream& os) override { os << "SsdChunkKV"; }
+  bool is_equivalent(const Primitive& other) const override;
+};
+
+class SsdChunkScan : public Primitive {
+ public:
+  explicit SsdChunkScan(Stream stream) : Primitive(stream) {};
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "SsdChunkScan"; }
+  void print(std::ostream& os) override { os << "SsdChunkScan"; }
+  bool is_equivalent(const Primitive& other) const override;
+};
+
+class SsdChunkOut : public Primitive {
+ public:
+  explicit SsdChunkOut(Stream stream) : Primitive(stream) {};
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "SsdChunkOut"; }
+  void print(std::ostream& os) override { os << "SsdChunkOut"; }
+  bool is_equivalent(const Primitive& other) const override;
+};
+
+/** Chunked SSD composition used by mamba2 and lin_attn_decay for N%64==0, N>=128. */
+array ssd_chunked(const array& Cq, const array& Bm, const array& X, const array& cl,
+                  StreamOrDevice s);
+
 class Mamba2 : public Primitive {
  public:
   explicit Mamba2(Stream stream) : Primitive(stream) {};

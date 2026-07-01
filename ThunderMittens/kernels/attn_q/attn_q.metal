@@ -39,7 +39,11 @@ kernel void attn_q(device   bf16     *q  [[buffer(0)]],
     device const uchar* Kbh = Kq + (uint)((block * (int)H + head) * (int)N) * bpr * FMT::block_bytes;
     device const uchar* Vbh = Vq + (uint)((block * (int)H + head) * (int)N) * bpr * FMT::block_bytes;
 
-    threadgroup st<half, TNQ, D> sK, sV;
+    // Single-warp keeps STAGE_T=1: with a 32-thread threadgroup, staging more KV tiles grows
+    // threadgroup memory 4x and collapses occupancy (measured q4_0 1.27 -> 6.09 ms at STAGE_T=4).
+    // The multiwarp variant below stages 4 tiles per barrier pair and is the fast route.
+    constexpr int STAGE_T = 1;
+    threadgroup st<half, TNQ, D> sK[STAGE_T], sV[STAGE_T];
     rt_qkv q_reg; rt_k_t k_reg; rt_qkv v_reg; rt_att att_block; rt_o o_reg;
     rv_att max_vec_last, max_vec, norm_vec;
 
@@ -48,23 +52,29 @@ kernel void attn_q(device   bf16     *q  [[buffer(0)]],
     constexpr const bf16 q_mul = ((D == 128) ? 0.08838834764bf : 0.125bf) * 1.44269504089bf;
     mul(q_reg, q_reg, q_mul);
 
-    for (int kv_idx = 0; kv_idx <= kv_last; kv_idx++) {
-        dequant_into_shared<FMT, TNQ, D>(sK, Kbh, (int)N, D, kv_idx, 0, 32, tid);   // K -> shared (half)
-        dequant_into_shared<FMT, TNQ, D>(sV, Vbh, (int)N, D, kv_idx, 0, 32, tid);   // V -> shared (half)
+    for (int kv0 = 0; kv0 <= kv_last; kv0 += STAGE_T) {
+        const int n_sub = metal::min(STAGE_T, kv_last - kv0 + 1);
+        for (int t = 0; t < n_sub; ++t) {
+            dequant_into_shared<FMT, TNQ, D>(sK[t], Kbh, (int)N, D, kv0 + t, 0, 32, tid);
+            dequant_into_shared<FMT, TNQ, D>(sV[t], Vbh, (int)N, D, kv0 + t, 0, 32, tid);
+        }
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-        load(k_reg, sK, laneId);                                                    // shared -> col reg (K^T)
-        zero(att_block);
-        mma_ABt(att_block, q_reg, k_reg, att_block);
-        if (CAUSAL && kv_idx == q_seq) { float nb = -1e30f; make_causal(att_block, att_block, laneId, nb); }
-        copy(max_vec_last, max_vec, laneId);
-        row_max(max_vec, att_block, max_vec, laneId);
-        sub(max_vec_last, max_vec_last, max_vec); exp2(max_vec_last, max_vec_last);
-        sub_row(att_block, att_block, max_vec); exp2(att_block, att_block);
-        mul(norm_vec, norm_vec, max_vec_last);
-        row_sum(norm_vec, att_block, norm_vec, laneId);
-        mul_row(o_reg, o_reg, max_vec_last);
-        load(v_reg, sV, laneId);                                                    // shared -> row reg
-        mma_AB(o_reg, att_block, v_reg, o_reg);
+        for (int t = 0; t < n_sub; ++t) {
+            const int kv_idx = kv0 + t;
+            load(k_reg, sK[t], laneId);                                             // shared -> col reg (K^T)
+            zero(att_block);
+            mma_ABt(att_block, q_reg, k_reg, att_block);
+            if (CAUSAL && kv_idx == q_seq) { float nb = -1e30f; make_causal(att_block, att_block, laneId, nb); }
+            copy(max_vec_last, max_vec, laneId);
+            row_max(max_vec, att_block, max_vec, laneId);
+            sub(max_vec_last, max_vec_last, max_vec); exp2(max_vec_last, max_vec_last);
+            sub_row(att_block, att_block, max_vec); exp2(att_block, att_block);
+            mul(norm_vec, norm_vec, max_vec_last);
+            row_sum(norm_vec, att_block, norm_vec, laneId);
+            mul_row(o_reg, o_reg, max_vec_last);
+            load(v_reg, sV[t], laneId);                                             // shared -> row reg
+            mma_AB(o_reg, att_block, v_reg, o_reg);
+        }
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);                     // before sK/sV reuse
     }
     div_row(o_reg, o_reg, norm_vec);
@@ -124,7 +134,8 @@ kernel void attn_q_mw(device   bf16     *q  [[buffer(0)]],
     device const uchar* Kbh = Kq + (uint)((block * (int)H + head) * (int)N) * bpr * FMT::block_bytes;
     device const uchar* Vbh = Vq + (uint)((block * (int)H + head) * (int)N) * bpr * FMT::block_bytes;
 
-    threadgroup st<half, TNQ, D> sK, sV;
+    constexpr int STAGE_T = 4;   // 8-row KV tiles staged per barrier pair
+    threadgroup st<half, TNQ, D> sK[STAGE_T], sV[STAGE_T];
     rt_qkv q_reg; rt_k_t k_reg; rt_qkv v_reg; rt_att att_block; rt_o o_reg;
     rv_att max_vec_last, max_vec, norm_vec;
 
@@ -133,22 +144,27 @@ kernel void attn_q_mw(device   bf16     *q  [[buffer(0)]],
     constexpr const bf16 q_mul = ((D == 128) ? 0.08838834764bf : 0.125bf) * 1.44269504089bf;
     mul(q_reg, q_reg, q_mul);
 
-    for (int kv_idx = 0; kv_idx < kv_blocks; kv_idx++) {
-        dequant_into_shared<FMT, TNQ, D>(sK, Kbh, (int)N, D, kv_idx, 0, G::GROUP_THREADS, tid);
-        dequant_into_shared<FMT, TNQ, D>(sV, Vbh, (int)N, D, kv_idx, 0, G::GROUP_THREADS, tid);
+    for (int kv0 = 0; kv0 < kv_blocks; kv0 += STAGE_T) {
+        const int n_sub = metal::min(STAGE_T, kv_blocks - kv0);
+        for (int t = 0; t < n_sub; ++t) {
+            dequant_into_shared<FMT, TNQ, D>(sK[t], Kbh, (int)N, D, kv0 + t, 0, G::GROUP_THREADS, tid);
+            dequant_into_shared<FMT, TNQ, D>(sV[t], Vbh, (int)N, D, kv0 + t, 0, G::GROUP_THREADS, tid);
+        }
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-        load(k_reg, sK, laneId);
-        zero(att_block);
-        mma_ABt(att_block, q_reg, k_reg, att_block);
-        copy(max_vec_last, max_vec, laneId);
-        row_max(max_vec, att_block, max_vec, laneId);
-        sub(max_vec_last, max_vec_last, max_vec); exp2(max_vec_last, max_vec_last);
-        sub_row(att_block, att_block, max_vec); exp2(att_block, att_block);
-        mul(norm_vec, norm_vec, max_vec_last);
-        row_sum(norm_vec, att_block, norm_vec, laneId);
-        mul_row(o_reg, o_reg, max_vec_last);
-        load(v_reg, sV, laneId);
-        mma_AB(o_reg, att_block, v_reg, o_reg);
+        for (int t = 0; t < n_sub; ++t) {
+            load(k_reg, sK[t], laneId);
+            zero(att_block);
+            mma_ABt(att_block, q_reg, k_reg, att_block);
+            copy(max_vec_last, max_vec, laneId);
+            row_max(max_vec, att_block, max_vec, laneId);
+            sub(max_vec_last, max_vec_last, max_vec); exp2(max_vec_last, max_vec_last);
+            sub_row(att_block, att_block, max_vec); exp2(att_block, att_block);
+            mul(norm_vec, norm_vec, max_vec_last);
+            row_sum(norm_vec, att_block, norm_vec, laneId);
+            mul_row(o_reg, o_reg, max_vec_last);
+            load(v_reg, sV[t], laneId);
+            mma_AB(o_reg, att_block, v_reg, o_reg);
+        }
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     }
     div_row(o_reg, o_reg, norm_vec);
@@ -165,6 +181,8 @@ kernel void attn_q_mw(device   bf16     *q  [[buffer(0)]],
 
 instantiate_attn_q_mw("attn_q_mw_q8_0_64", q8_0, 64);
 instantiate_attn_q_mw("attn_q_mw_q8_0_128", q8_0, 128);
+instantiate_attn_q_mw("attn_q_mw_q4_0_64", q4_0, 64);
+instantiate_attn_q_mw("attn_q_mw_q4_0_128", q4_0, 128);
 instantiate_attn_q_mw("attn_q_mw_fp8_e4m3_64", fp8_e4m3, 64);
 instantiate_attn_q_mw("attn_q_mw_fp8_e4m3_128", fp8_e4m3, 128);
 

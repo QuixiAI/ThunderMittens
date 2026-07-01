@@ -254,26 +254,35 @@ def _scale_vec_t(scale, num, ref):
     return scale.to(dtype=torch.float32)
 
 
-def kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size, k_scale, v_scale):
-    """Scatter K/V into a uint8 (e4m3) paged cache. Returns (kc, vc). MPS.
+def _fmt_code(fmt):
+    """Map an fp8 format ('e4m3'/'e5m2' or 0/1) to the kernel's integer format code."""
+    return {"e4m3": 0, "e5m2": 1}.get(fmt, fmt) if isinstance(fmt, str) else int(fmt)
+
+
+def kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size, k_scale, v_scale,
+                         fmt="e4m3"):
+    """Scatter K/V into a uint8 paged cache. Returns (kc, vc). MPS.
 
     k_scale/v_scale: plain float (per-tensor) or a (num_heads,) tensor (per-head).
+    fmt: 'e4m3' (default) or 'e5m2'.
     """
     H = key.shape[1]
     return _ext.kv_cache_scatter_fp8(key, value, slot_mapping, int(num_blocks), int(block_size),
-                                     _scale_vec_t(k_scale, H, key), _scale_vec_t(v_scale, H, key))
+                                     _scale_vec_t(k_scale, H, key), _scale_vec_t(v_scale, H, key),
+                                     _fmt_code(fmt))
 
 
 def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
-                        k_scale, v_scale, scale=0.0):
-    """Decode paged attention over fp8 (uint8 e4m3) caches, dequantized on read. GQA aware. MPS.
+                        k_scale, v_scale, scale=0.0, fmt="e4m3"):
+    """Decode paged attention over fp8 (uint8) caches, dequantized on read. GQA aware. MPS.
 
     k_scale/v_scale: plain float (per-tensor) or a (num_kv_heads,) tensor (per-head).
+    fmt: 'e4m3' (default) or 'e5m2' — must match the format the cache was written with.
     """
     H_KV = key_cache.shape[2]
     return _ext.paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
                                     _scale_vec_t(k_scale, H_KV, q), _scale_vec_t(v_scale, H_KV, q),
-                                    float(scale))
+                                    float(scale), _fmt_code(fmt))
 
 
 def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):

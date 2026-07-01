@@ -522,10 +522,11 @@ NB_MODULE(_ext, m) {
       "block_size"_a,
       "k_scale"_a,
       "v_scale"_a,
+      "fmt"_a = 0,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        scatter K/V into a uint8 (e4m3) paged cache with per-head (num_heads,) scales. Returns (kc, vc).
+        scatter K/V into a uint8 paged cache with per-head (num_heads,) scales; fmt 0=e4m3, 1=e5m2. Returns (kc, vc).
       )");
 
     m.def(
@@ -539,10 +540,11 @@ NB_MODULE(_ext, m) {
       "k_scale"_a,
       "v_scale"_a,
       "scale"_a = 0.0f,
+      "fmt"_a = 0,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        decode paged attention over fp8 (uint8 e4m3) caches, dequantized on read. GQA aware.
+        decode paged attention over fp8 (uint8) caches, dequantized on read; fmt 0=e4m3, 1=e5m2. GQA aware.
       )");
 
     m.def(

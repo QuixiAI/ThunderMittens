@@ -15,7 +15,7 @@ from tk import (
     paged_attention,
     paged_attention_fp8,
 )
-from tk.quant import _e4m3_decode_arr
+from tk.quant import _e4m3_decode_arr, _e5m2_decode_arr
 
 
 def _mx_dtype(name):
@@ -303,6 +303,40 @@ def test_fp8_kv_roundtrip_perhead(D, H, H_KV):
 
     kc_deq = _e4m3_decode_arr(np.array(kc)) * k_scale[None, None, :, None]
     vc_deq = _e4m3_decode_arr(np.array(vc)) * v_scale[None, None, :, None]
+    q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
+    ref = _paged_ref_gqa(q_bf, kc_deq, vc_deq, block_table, context_lens, scale)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=2e-3)
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("H,H_KV", [(2, 2), (4, 1)])
+def test_fp8_kv_roundtrip_e5m2(D, H, H_KV):
+    # e5m2 KV format (5-bit exponent, wider dynamic range) — scale uses QMAX=57344.
+    rng = np.random.default_rng(50 + D + H + H_KV)
+    B, num_blocks, block_size = 2, 8, 4
+    total = num_blocks * block_size
+    K = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    V = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    block_table = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    context_lens = np.array([10, 16], dtype=np.int32)
+    E5M2_MAX = 57344.0
+    k_scale = float(np.abs(K).max() / E5M2_MAX)
+    v_scale = float(np.abs(V).max() / E5M2_MAX)
+    scale = 1.0 / math.sqrt(D)
+    slot_mapping = np.arange(total, dtype=np.int64)
+
+    kc, vc = kv_cache_scatter_fp8(
+        mx.array(K).astype(mx.bfloat16), mx.array(V).astype(mx.bfloat16),
+        mx.array(slot_mapping), num_blocks, block_size, k_scale, v_scale, fmt="e5m2")
+    got = paged_attention_fp8(
+        mx.array(q).astype(mx.bfloat16), kc, vc,
+        mx.array(block_table), mx.array(context_lens), k_scale, v_scale, scale=0.0, fmt="e5m2")
+    mx.eval(kc, vc, got)
+
+    # Reference dequantizes the stored e5m2 codes with the same per-tensor scale.
+    kc_deq = _e5m2_decode_arr(np.array(kc)) * k_scale
+    vc_deq = _e5m2_decode_arr(np.array(vc)) * v_scale
     q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
     ref = _paged_ref_gqa(q_bf, kc_deq, vc_deq, block_table, context_lens, scale)
     np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=2e-3)

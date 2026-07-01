@@ -56,6 +56,7 @@ std::vector<array> kv_cache_scatter_fp8(
     int block_size,
     const array& k_scale,
     const array& v_scale,
+    int fmt = 0,   // 0 = e4m3, 1 = e5m2
     StreamOrDevice s = {});
 
 array paged_attention_fp8(
@@ -67,6 +68,7 @@ array paged_attention_fp8(
     const array& k_scale,
     const array& v_scale,
     float scale = 0.0f,
+    int fmt = 0,   // 0 = e4m3, 1 = e5m2
     StreamOrDevice s = {});
 
 class KvCacheScatter : public Primitive {
@@ -179,8 +181,8 @@ class KvCacheScales : public Primitive {
 
 class KvCacheScatterFp8 : public Primitive {
  public:
-  KvCacheScatterFp8(Stream stream, int block_size)
-      : Primitive(stream), block_size_(block_size) {}
+  KvCacheScatterFp8(Stream stream, int block_size, int fmt)
+      : Primitive(stream), block_size_(block_size), fmt_(fmt) {}
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(
@@ -193,16 +195,19 @@ class KvCacheScatterFp8 : public Primitive {
   const char* name() const { return "KvCacheScatterFp8"; }
   void print(std::ostream& os) override { os << "KvCacheScatterFp8"; }
   bool is_equivalent(const Primitive& other) const override {
-    return block_size_ == static_cast<const KvCacheScatterFp8&>(other).block_size_;
+    auto& o = static_cast<const KvCacheScatterFp8&>(other);
+    return block_size_ == o.block_size_ && fmt_ == o.fmt_;
   }
 
  private:
   int block_size_;
+  int fmt_;
 };
 
 class PagedAttentionFp8 : public Primitive {
  public:
-  PagedAttentionFp8(Stream stream, float scale) : Primitive(stream), scale_(scale) {}
+  PagedAttentionFp8(Stream stream, float scale, int fmt)
+      : Primitive(stream), scale_(scale), fmt_(fmt) {}
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(
@@ -215,11 +220,13 @@ class PagedAttentionFp8 : public Primitive {
   const char* name() const { return "PagedAttentionFp8"; }
   void print(std::ostream& os) override { os << "PagedAttentionFp8"; }
   bool is_equivalent(const Primitive& other) const override {
-    return scale_ == static_cast<const PagedAttentionFp8&>(other).scale_;
+    auto& o = static_cast<const PagedAttentionFp8&>(other);
+    return scale_ == o.scale_ && fmt_ == o.fmt_;
   }
 
  private:
   float scale_;
+  int fmt_;
 };
 
 class PagedAttention : public Primitive {

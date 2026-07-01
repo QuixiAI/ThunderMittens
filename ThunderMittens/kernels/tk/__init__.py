@@ -259,35 +259,43 @@ def paged_attention(q, key_cache, value_cache, block_table, context_lens, scale=
     return _mlx().paged_attention(q, key_cache, value_cache, block_table, context_lens, scale)
 
 
-def kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size, k_scale, v_scale):
-    """Scatter K/V into a uint8 (e4m3) paged cache. Returns (kc, vc).
+def _fmt_code(fmt):
+    """Map an fp8 format ('e4m3'/'e5m2' or 0/1) to the kernel's integer format code."""
+    return {"e4m3": 0, "e5m2": 1}.get(fmt, fmt) if isinstance(fmt, str) else int(fmt)
+
+
+def kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size, k_scale, v_scale,
+                         fmt="e4m3"):
+    """Scatter K/V into a uint8 paged cache. Returns (kc, vc).
 
     k_scale/v_scale may be a plain float (per-tensor, broadcast to every head) or a
-    (num_heads,) array (per-head). Accepts mlx.array or torch.Tensor (MPS).
+    (num_heads,) array (per-head). fmt: 'e4m3' (default) or 'e5m2'.
+    Accepts mlx.array or torch.Tensor (MPS).
     """
     H = key.shape[1]
     k_scale, v_scale = _scale_vec(k_scale, H, key), _scale_vec(v_scale, H, key)
     if _is_torch(key):
         return _torch().kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size,
-                                             k_scale, v_scale)
+                                             k_scale, v_scale, fmt)
     return _mlx().kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size,
-                                       k_scale, v_scale)
+                                       k_scale, v_scale, _fmt_code(fmt))
 
 
 def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
-                        k_scale, v_scale, scale=0.0):
-    """Decode paged attention over fp8 (uint8 e4m3) caches, dequantized on read. GQA aware.
+                        k_scale, v_scale, scale=0.0, fmt="e4m3"):
+    """Decode paged attention over fp8 (uint8) caches, dequantized on read. GQA aware.
 
     k_scale/v_scale may be a plain float (per-tensor) or a (num_kv_heads,) array (per-head).
+    fmt: 'e4m3' (default) or 'e5m2' — must match the format the cache was written with.
     Accepts mlx.array or torch.Tensor (MPS).
     """
     H_KV = key_cache.shape[2]
     k_scale, v_scale = _scale_vec(k_scale, H_KV, q), _scale_vec(v_scale, H_KV, q)
     if _is_torch(q):
         return _torch().paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
-                                            k_scale, v_scale, scale)
+                                            k_scale, v_scale, scale, fmt)
     return _mlx().paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
-                                      k_scale, v_scale, scale)
+                                      k_scale, v_scale, scale, _fmt_code(fmt))
 
 
 def paged_attention_v2(q, key_cache, value_cache, block_table, context_lens,

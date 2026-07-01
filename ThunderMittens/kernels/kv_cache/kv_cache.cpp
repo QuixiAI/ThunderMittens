@@ -380,6 +380,7 @@ std::vector<array> kv_cache_scatter_fp8(
     int block_size,
     const array& k_scale,
     const array& v_scale,
+    int fmt,
     StreamOrDevice s) {
   if (key.ndim() != 3 || value.ndim() != 3 || key.shape() != value.shape()) {
     throw std::invalid_argument("kv_cache_scatter_fp8: key/value must be (num_tokens, num_heads, head_size)");
@@ -405,7 +406,7 @@ std::vector<array> kv_cache_scatter_fp8(
   return array::make_arrays(
       {cache_shape, cache_shape},
       {uint8, uint8},
-      std::make_shared<KvCacheScatterFp8>(to_stream(s), block_size),
+      std::make_shared<KvCacheScatterFp8>(to_stream(s), block_size, fmt),
       {key_c, value_c, slot_c, ks_c, vs_c});
 }
 
@@ -418,6 +419,7 @@ array paged_attention_fp8(
     const array& k_scale,
     const array& v_scale,
     float scale,
+    int fmt,
     StreamOrDevice s) {
   if (q.ndim() != 3) {
     throw std::invalid_argument("paged_attention_fp8: q must be (batch, num_heads, head_size)");
@@ -455,7 +457,7 @@ array paged_attention_fp8(
   return array(
       q.shape(),
       q.dtype(),
-      std::make_shared<PagedAttentionFp8>(to_stream(s), scale),
+      std::make_shared<PagedAttentionFp8>(to_stream(s), scale, fmt),
       {q_c, kc, vc, table_c, lens_c, ks_c, vs_c});
 }
 
@@ -484,7 +486,7 @@ void KvCacheScatterFp8::eval_gpu(
   tk::launch_kv_cache_zero_u8(enc, key_cache, value_cache, total);
   tk::launch_kv_cache_scatter_fp8(
       enc, key, value, slot, key_cache, value_cache,
-      key.shape(0), key.shape(1), key.shape(2), block_size_, k_scale, v_scale,
+      key.shape(0), key.shape(1), key.shape(2), block_size_, k_scale, v_scale, fmt_,
       type_to_name(key));
 }
 
@@ -514,7 +516,7 @@ void PagedAttentionFp8::eval_gpu(
   tk::launch_paged_attention_fp8(
       enc, q, key_cache, value_cache, block_table, context_lens, out,
       q.shape(0), q.shape(1), key_cache.shape(2), D, key_cache.shape(1),
-      block_table.shape(1), scale, k_scale, v_scale, type_to_name(q));
+      block_table.shape(1), scale, k_scale, v_scale, fmt_, type_to_name(q));
 }
 
 #define TK_KV_NO_AUTODIFF(CLASS, LABEL)                                      \

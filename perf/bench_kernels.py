@@ -1294,16 +1294,21 @@ def main():
     rows = []
     t_start = time.perf_counter()
     for name in names:
-        print(f"== {name} ==")
-        try:
-            cases = list(KERNEL_BUILDERS[name](be, args.preset, formats))
-        except Exception as e:  # noqa: BLE001
-            rows.append({"schema": SCHEMA_VERSION, "kernel": name, "variant": "-", "shape": {},
-                         "dtype": "-", "format": None, "status": "skip",
-                         "skip_reason": f"builder: {type(e).__name__}: {e}"})
-            print(f"  SKIP family ({type(e).__name__}: {e})")
-            continue
-        for case in cases:
+        print(f"== {name} ==", flush=True)
+        # consume the builder LAZILY: comprehensive quant sweeps hold ~1 GB of host+device
+        # weights per case, and materializing the whole family's case list OOMs the process
+        gen = iter(KERNEL_BUILDERS[name](be, args.preset, formats))
+        while True:
+            try:
+                case = next(gen)
+            except StopIteration:
+                break
+            except Exception as e:  # noqa: BLE001
+                rows.append({"schema": SCHEMA_VERSION, "kernel": name, "variant": "-", "shape": {},
+                             "dtype": "-", "format": None, "status": "skip",
+                             "skip_reason": f"builder: {type(e).__name__}: {e}"})
+                print(f"  SKIP family ({type(e).__name__}: {e})", flush=True)
+                break
             try:
                 row = run_case(case, be, args.warmup, args.iters, check=not args.no_check)
                 rows.append(row)
@@ -1311,13 +1316,17 @@ def main():
                 best = min(bl.values(), key=lambda v: v["ms"])["ms"] if bl else float("nan")
                 print(f"  {case.variant:28s} {_shape_str(case.shape):>22s} "
                       f"tk {row['target_ms']:8.4f} ms   base {best:8.4f} ms   "
-                      f"err {row.get('max_rel_err', float('nan')):.1e}")
+                      f"err {row.get('max_rel_err', float('nan')):.1e}", flush=True)
             except Exception as e:  # noqa: BLE001
                 rows.append({"schema": SCHEMA_VERSION, "kernel": case.kernel,
                              "variant": case.variant, "shape": case.shape, "dtype": case.dtype,
                              "format": case.fmt, "status": "skip",
                              "skip_reason": f"{type(e).__name__}: {e}"})
-                print(f"  {case.variant:28s} SKIP ({type(e).__name__}: {e})")
+                print(f"  {case.variant:28s} SKIP ({type(e).__name__}: {e})", flush=True)
+            del case
+            if be.name == "mlx":
+                be.mx.metal.clear_cache()   # else the buffer cache keeps every case's device
+                                            # weights and comprehensive quant sweeps OOM
     meta["wall_s"] = round(time.perf_counter() - t_start, 1)
 
     day = _dt.date.today().isoformat()

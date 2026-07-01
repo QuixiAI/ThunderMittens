@@ -197,6 +197,95 @@ Results (ms, N=11008 K=4096 M=1; baseline = fp16 `mx.matmul` on the same run):
   under non-pipelined single-call decode (the pipelined harness reverses the
   old conclusion; a real decode loop sits between the two regimes).
 
+## Pass 2 (2026-07-01, commits e00a76d..): structural rewrites
+
+### Chunked linear-time causal linear attention family — LANDED
+The three scan/decay kernels had structurally bad parallelism: lin_attn_causal
+ran ONE simdgroup per (batch,head) (a serial O(N·D²) scan on B·H simdgroups);
+mamba2/lin_attn_decay were parallel but QUADRATIC (every 8-row query tile
+rescanned all earlier keys). New shared 3-kernel chunked pipeline (L=64):
+per-chunk KV states (parallel) → exclusive chunk prefix (decay factors
+telescope exactly through chunk reference points) → per-chunk output
+(intra-chunk bounded to L keys + one state MMA). Both backends; small/ragged
+N (<128 or N%64≠0) keeps the old kernels.
+| kernel | shape | before | after | × |
+|---|---|---:|---:|---:|
+| lin_attn_causal | 2×8×4096×64 | 2.05 | 0.66 ms | 3.1 |
+| mamba2 | 1×8×2048×64 | 0.40 | 0.17 ms | 2.4 |
+| mamba2 | 2×16×4096×64 | ~6.4 (est) | 1.36 ms | ~4.7 |
+| lin_attn_decay | 2×16×8192×64 | — | 1.28 ms | ~10 (est) |
+
+### attn_q — LANDED (multiwarp staging + auto route)
+Multiwarp now stages 4 KV tiles per barrier pair; single-warp keeps 1 tile
+(STAGE_T=4 there collapsed occupancy: 16KB threadgroup memory on a 32-thread
+TG → 6.09 ms, rejected). Added the missing q4_0 multiwarp instantiation;
+tk.attn_q defaults to multiwarp="auto" (4-warp whenever non-causal, N%32==0).
+q8_0 0.98 → **0.447 ms (1.14× of attending pre-dequantized KV — target hit)**;
+fp8 1.61 → 0.50; q4_0 1.23 → 0.61 at (1,8,1024,128).
+
+### mla_decode — LANDED (v2-style partitioned decode, 1.7–6.3×)
+New mla_decode_partition: sequence-partition grid axis (grid (H,B,P), one
+simdgroup per (head,partition)), paged-v2-style partials + the existing reduce
+instantiated at D=512. (8,32,2048): 0.61→0.36; (16,32,4096): 2.27→1.31;
+(8,16,8192): 4.38→**0.69 ms (6.3×)**. REJECTED with measurement: a
+4-heads-per-TG token-staging variant (MQA reuse is num_heads-wide) was 1.5–1.6×
+slower at 32 heads — the cache already serves cross-head reuse and the barriers
+cost more than the reads they save; third confirmation of the anti-staging
+lesson (gemm_staged, gqa_staged, now MLA).
+
+### qgemv_int — LANDED
+w2a8 block-major (8 codes/lane from one 2-byte read, group scale once per
+span): 2× (0.176→0.094 ms at 11008×4096). w8a8 uint4 loads + TWO rows per
+simdgroup: 1.9× at 4096² (0.109→0.056). The same 2-row geometry on the float
+dequant q8_0/q4_0 fast paths measured 1.6–2.8× WORSE (register pressure) —
+tried and reverted. Note: the int path's value remains exactness; the sped-up
+dequant path is still faster at most shapes.
+
+### Serving sweeps — measured
+- partition_size sweep (ctx 2048/4096/8192): 256 ≈ 128 > 512 > 1024 everywhere;
+  **default changed 512 → 256** (worth 2–4%).
+- Single-call decode A/B (one call per sync, models a real decode loop):
+  staged is ~6% SLOWER than v1 (its pipelined 1.8× advantage exists only when
+  independent calls overlap); v2 wins 3.6–4.2× in BOTH regimes. Defaults stand.
+- First-time latencies: paged alibi/block_sparse ≈ v1 base (bias/mask cost ~0);
+  mla_decode_fp8 0.665 ms at (8,16,4096) on the old geometry — the partition
+  upgrade for the fp8/sparse MLA variants is the identified follow-up.
+
+### Comprehensive validation (2026-07-01, runs 192040 + 193424-mlx-comprehensive)
+230 non-quant + 110 quant cases across every family and edge shape: **0 skips,
+0 correctness failures** (all under tolerance). Remaining >18%-behind cases are
+known/accepted: multiwarp variants (non-default), v2_fp8 (1.25× cost for half
+the cache bytes), attn_q residual dequant cost (grows with N), matmul/staged
+small-shape calibration kernels, int-path exactness kernels vs the (now much
+faster) dequant path. Headline quant validation at vocab scale (32000×4096):
+q4_K 0.240 ms (2.5× vs fp16 matmul, 307 W-GB/s), fp8 1.8×, bitnet 2.3×,
+q4_0/q8_0 ≥ parity with MLX's own quantized matmul.
+NEW notes catalogued for a future pass:
+- hadamard D=64 at 65536 rows: 2.4× behind matmul-H (E=2/lane starves the
+  simdgroup — wants 2 rows/simdgroup at D=64).
+- fftconv (8,32,32): 2.2× behind mx.fft (mx scales better with batch).
+- attn fwd (2,16,4096,128): 0.79× of sdpa (largest shape only — sequence-block
+  tuning candidate).
+- q4_K (256-superblock) PREFILL via the fragment path is 2–2.3× behind fp16
+  matmul at all M (2-element gathered dequant of the branchy superblock format;
+  q4_0/q8_0/fp8 prefill are at parity — use those for prefill, or apply a
+  span-decode staged path for k-quants).
+- qgemv float paths at moderate-N BitNet shapes (2560–3840 rows) trail the
+  SLC-fed fp16 matmul; the 2-row fix that worked for w8a8 hurt the float paths
+  (register pressure) — needs a different geometry idea.
+Also fixed in the harness/encoders during validation: the runner now consumes
+case builders lazily and clears the MLX buffer cache between cases (the
+comprehensive quant sweep OOM'd twice); tk/quant.py `_nearest`/`_nearest_index`
+now chunk the nearest-code search (the naive broadcast built an elements×256
+float array — 134 GB for a 32000×4096 pack; results bit-identical, encoder
+tests unchanged).
+
+### torch-MPS dispatch overhead — investigated, NO ISSUE
+Controlled A/B: the per-op cost of the tk_torch encode path (new encoder +
+dispatch_sync per op) is ~1.5 µs over torch's own add (8×8: 0.0105 vs
+0.0091 ms); at 4096×1024 tk.add_rt is 1.2× of torch add. The earlier 0.42×
+harness reading did not reproduce; no fix needed.
+
 ## Decision log
 - 2026-07-01: harness rewritten (schema v1, all families, batched timing);
   perf.md updated to match reality (reference mirrors, device context, timing

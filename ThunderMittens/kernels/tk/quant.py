@@ -232,8 +232,15 @@ _E2M1_VALS = _e2m1_decode_arr(_E2M1_CODES)
 
 
 def _nearest(x, codes, vals):
-    idx = np.abs(x[..., None].astype(np.float32) - vals).argmin(axis=-1)
-    return codes[idx]
+    # chunked: the naive x[..., None] - vals broadcast is elements x len(vals) floats
+    # (134 GB for a 32000x4096 weight against a 256-code table) and OOMs large packs
+    flat = np.ascontiguousarray(x, np.float32).reshape(-1)
+    out = np.empty(flat.shape, dtype=codes.dtype)
+    step = 1 << 20
+    for i in range(0, flat.size, step):
+        seg = flat[i:i + step]
+        out[i:i + step] = codes[np.abs(seg[:, None] - vals).argmin(axis=-1)]
+    return out.reshape(np.shape(x))
 
 
 # ---- fp8_e4m3 : per-group (32) half-scaled fp8. { half scale; uint8 qs[32]; } = 34 bytes. ----
@@ -439,8 +446,15 @@ _IQ4NL_VALUES = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 3
 
 
 def _nearest_index(x, table):
-    """Index of the nearest table entry for each element of x (table 1-D)."""
-    return np.abs(x[..., None] - table).argmin(axis=-1).astype(np.uint8)
+    """Index of the nearest table entry for each element of x (table 1-D). Chunked —
+    the naive broadcast is elements x len(table) floats and OOMs large packs."""
+    flat = np.ascontiguousarray(x, np.float32).reshape(-1)
+    out = np.empty(flat.shape, dtype=np.uint8)
+    step = 1 << 20
+    for i in range(0, flat.size, step):
+        seg = flat[i:i + step]
+        out[i:i + step] = np.abs(seg[:, None] - table).argmin(axis=-1).astype(np.uint8)
+    return out.reshape(np.shape(x))
 
 
 def _iq4_blockscale(Wb):

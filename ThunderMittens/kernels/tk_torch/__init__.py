@@ -209,6 +209,12 @@ def mla_decode_fp8(q, data_cache, scale_cache, block_table, context_lens, scale=
     return _ext.mla_decode_fp8(q, data_cache, scale_cache, block_table, context_lens, float(scale))
 
 
+def mla_decode_fp8_sparse(q, data_cache, scale_cache, block_table, indices, topk_length, scale=0.0):
+    """DeepSeek-V4 sparse latent decode: attend only indices[b, 0:topk_length[b]]. -> o (B,N,512). MPS."""
+    return _ext.mla_decode_fp8_sparse(q, data_cache, scale_cache, block_table, indices, topk_length,
+                                      float(scale))
+
+
 def mla_decode(q, kv_cache, block_table, context_lens, scale=0.0):
     """DeepSeek MLA absorb-path latent flash-decode (MQA). q (B,N,576), cache (nb,bs,576) -> o (B,N,512). MPS."""
     return _ext.mla_decode(q, kv_cache, block_table, context_lens, float(scale))

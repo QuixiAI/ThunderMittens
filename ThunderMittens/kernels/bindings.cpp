@@ -272,6 +272,13 @@ NB_MODULE(_ext, m) {
          (data (…,576) uint8, scale (…,8) uint8) cache, score/value over 512, scale 512^-0.5. -> o (B,N,512).)");
 
     m.def(
+      "mla_decode_fp8_sparse", &mla_decode_fp8_sparse,
+      "q"_a, "data_cache"_a, "scale_cache"_a, "block_table"_a, "indices"_a, "topk_length"_a,
+      "scale"_a = 0.0f, nb::kw_only(), "stream"_a = nb::none(),
+      R"(DeepSeek-V4 sparse latent decode: like mla_decode_fp8 but each query attends only
+         indices[b, 0:topk_length[b]] (the indexer top-k set). -> o (B,N,512).)");
+
+    m.def(
       "mla_kv_insert_fp8", &mla_kv_insert_fp8,
       "kv"_a, "cos"_a, "sin"_a, "positions"_a, "slot_mapping"_a, "data_cache"_a, "scale_cache"_a,
       nb::kw_only(), "stream"_a = nb::none(),

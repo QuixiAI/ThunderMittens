@@ -734,6 +734,35 @@ static at::Tensor mla_decode_fp8_mps(
   return out;
 }
 
+// DeepSeek-V4 sparse latent decode: attend only indices[b, 0:topk_length[b]].
+static at::Tensor mla_decode_fp8_sparse_mps(
+    const at::Tensor& q_in, const at::Tensor& data_in, const at::Tensor& scale_in,
+    const at::Tensor& block_table_in, const at::Tensor& indices_in, const at::Tensor& lens_in,
+    double scale) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.scalar_type() == at::kBFloat16,
+              "mla_decode_fp8_sparse: q must be bf16 MPS");
+  TORCH_CHECK(q_in.dim() == 3 && q_in.size(2) == 512, "mla_decode_fp8_sparse: q must be (B,N,512)");
+  TORCH_CHECK(data_in.dim() == 3 && data_in.size(2) == 576 && data_in.scalar_type() == at::kByte,
+              "mla_decode_fp8_sparse: data_cache (nb,bs,576) uint8");
+  TORCH_CHECK(scale_in.dim() == 3 && scale_in.size(2) == 8 && scale_in.scalar_type() == at::kByte,
+              "mla_decode_fp8_sparse: scale_cache (nb,bs,8) uint8");
+  TORCH_CHECK(indices_in.dim() == 2 && indices_in.size(0) == q_in.size(0),
+              "mla_decode_fp8_sparse: indices (B, max_topk)");
+  const int B = q_in.size(0), N = q_in.size(1), max_topk = indices_in.size(1);
+  auto q = q_in.contiguous();
+  auto data = data_in.contiguous(), sc = scale_in.contiguous();
+  auto bt = block_table_in.contiguous();
+  auto idx = indices_in.to(at::kInt).contiguous(), lens = lens_in.to(at::kInt).contiguous();
+  auto out = at::empty({B, N, 512}, q.options());
+  const float scale_f = scale > 0.0 ? static_cast<float>(scale) : 1.0f / std::sqrt(512.0f);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_mla_decode_fp8_sparse(e, q, data, sc, bt, idx, lens, out, B, N,
+                                     static_cast<int>(data.size(1)), static_cast<int>(bt.size(1)),
+                                     scale_f, max_topk);
+  });
+  return out;
+}
+
 // DeepSeek-V4 packed MLA KV-insert. Returns (data_cache uint8 (…,576), scale_cache uint8 (…,8)).
 static std::tuple<at::Tensor, at::Tensor> mla_kv_insert_fp8_mps(
     const at::Tensor& kv_in, const at::Tensor& cos_in, const at::Tensor& sin_in,
@@ -1834,6 +1863,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mla_kv_insert", &mla_kv_insert_mps, "ThunderMittens DeepSeek MLA classic KV-insert (MPS)");
   m.def("mla_decode", &mla_decode_mps, "ThunderMittens DeepSeek MLA latent flash-decode (MPS)");
   m.def("mla_decode_fp8", &mla_decode_fp8_mps, "ThunderMittens DeepSeek-V4 packed fp8 latent decode (MPS)");
+  m.def("mla_decode_fp8_sparse", &mla_decode_fp8_sparse_mps, "ThunderMittens DeepSeek-V4 sparse latent decode (MPS)");
   m.def("mla_kv_insert_fp8", &mla_kv_insert_fp8_mps, "ThunderMittens DeepSeek-V4 packed fp8 MLA KV-insert (MPS)");
   m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)");
   m.def("paged_attention_v2_fp8", &paged_attention_v2_fp8_mps, "ThunderMittens long-context fp8 paged attention (MPS)");

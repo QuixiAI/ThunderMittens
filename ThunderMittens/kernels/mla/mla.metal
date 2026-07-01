@@ -393,6 +393,76 @@ kernel void mla_decode_fp8(device const bf16 *q            [[buffer(0)]],   // (
     }
 }
 
+// ---------------------------------------------------------------------------
+// P4b: mla_decode_fp8_sparse — DeepSeek-V4 sparse latent decode. Same dequant-on-read V4 math as
+// mla_decode_fp8, but each query attends only the caller-provided token positions
+// indices[batch, 0:topk_length[batch]] (the Lightning Indexer's top-k set) instead of the whole
+// context — a gather-by-index decode. indices entries < 0 are skipped.
+// ---------------------------------------------------------------------------
+kernel void mla_decode_fp8_sparse(device const bf16 *q            [[buffer(0)]],
+                                  device const uchar *data_cache  [[buffer(1)]],
+                                  device const uchar *scale_cache [[buffer(2)]],
+                                  device const int  *block_table  [[buffer(3)]],
+                                  device const int  *indices      [[buffer(4)]],   // (B, max_topk)
+                                  device const int  *topk_length  [[buffer(5)]],   // (B,)
+                                  device bf16       *out          [[buffer(6)]],
+                                  constant int &block_size        [[buffer(7)]],
+                                  constant int &block_table_stride [[buffer(8)]],
+                                  constant float &scale           [[buffer(9)]],
+                                  constant int &num_heads         [[buffer(10)]],
+                                  constant int &max_topk          [[buffer(11)]],
+                                  uint3 tgid [[threadgroup_position_in_grid]],
+                                  uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr int LATENT = 512, NOPE = 448, VPL = LATENT / 32;
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int len = topk_length[batch];
+    const long q_base = ((long)batch * num_heads + head) * LATENT;
+
+    float qv[VPL], acc[VPL];
+    for (int i = 0; i < VPL; ++i) { qv[i] = float(q[q_base + lane + 32 * i]); acc[i] = 0.0f; }
+
+    float m = -3.4028234663852886e38f, l = 0.0f;
+    for (int j = 0; j < len; ++j) {
+        const int t = indices[batch * max_topk + j];
+        if (t < 0) { continue; }
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) { continue; }
+        const long dslot = (long)block * block_size + slot;
+        const long dbase = dslot * 576;
+        const long sbase = dslot * 8;
+        device const bf16 *rope = (device const bf16 *)(data_cache + dbase + NOPE);
+
+        float lat[VPL];
+        float partial = 0.0f;
+        for (int i = 0; i < VPL; ++i) {
+            const int d = lane + 32 * i;
+            if (d < NOPE) {
+                const uchar code = data_cache[dbase + d];
+                const int e = (int)scale_cache[sbase + d / 64];
+                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+            } else {
+                lat[i] = float(rope[d - NOPE]);
+            }
+            partial += qv[i] * lat[i];
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VPL; ++i) { acc[i] = acc[i] * alpha + beta * lat[i]; }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    const long out_base = ((long)batch * num_heads + head) * LATENT;
+    for (int i = 0; i < VPL; ++i) {
+        out[out_base + lane + 32 * i] = l == 0.0f ? bf16(0) : bf16(acc[i] / l);
+    }
+}
+
 // Single-buffer bf16 copy (clone-then-insert prologue for the MLA cache).
 kernel void mla_cache_clone(device const bf16 *src [[buffer(0)]],
                             device bf16       *dst [[buffer(1)]],

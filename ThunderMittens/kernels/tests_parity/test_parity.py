@@ -480,6 +480,36 @@ def test_mla_decode_fp8_parity():
     _assert_parity(om, ot, atol=2e-2)
 
 
+def test_mla_decode_fp8_sparse_parity():
+    B, N, nb, bs = 2, 8, 8, 4
+    total = nb * bs
+    rng = np.random.default_rng(26)
+    inv = 10000.0 ** (-(np.arange(0, 64, 2) / 64))
+    ang = np.arange(64)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    kv = (0.3 * rng.standard_normal((total, 512))).astype(np.float32)
+    positions = np.arange(total, dtype=np.int32)
+    slot = np.arange(total, dtype=np.int64)
+    d0 = np.zeros((nb, bs, 576), np.uint8)
+    s0 = np.zeros((nb, bs, 8), np.uint8)
+    q = (0.3 * rng.standard_normal((B, N, 512))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    idx = np.full((B, 5), -1, np.int32)
+    idx[0, :4] = [0, 2, 5, 9]
+    idx[1, :5] = [1, 3, 6, 10, 15]
+    lens = np.array([4, 5], dtype=np.int32)
+
+    dm, sm_ = tk.mla_kv_insert_fp8(_mk(kv, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"),
+                                   mx.array(positions), mx.array(slot), mx.array(d0), mx.array(s0))
+    om = tk.mla_decode_fp8_sparse(_mk(q, "mlx"), dm, sm_, mx.array(bt), mx.array(idx), mx.array(lens))
+    dt, st = tk.mla_kv_insert_fp8(_mk(kv, "torch"), _mk(cos, "torch"), _mk(sin, "torch"),
+                                  torch.from_numpy(positions).to("mps"), torch.from_numpy(slot).to("mps"),
+                                  torch.from_numpy(d0).to("mps"), torch.from_numpy(s0).to("mps"))
+    ot = tk.mla_decode_fp8_sparse(_mk(q, "torch"), dt, st, torch.from_numpy(bt).to("mps"),
+                                  torch.from_numpy(idx).to("mps"), torch.from_numpy(lens).to("mps"))
+    _assert_parity(om, ot, atol=2e-2)
+
+
 def test_mla_kv_insert_fp8_parity():
     T, nb, bs = 5, 4, 4
     rng = np.random.default_rng(23)

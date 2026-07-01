@@ -108,6 +108,21 @@ array mla_decode_fp8(
     float scale = 0.0f,
     StreamOrDevice s = {});
 
+/**
+ *  DeepSeek-V4 sparse latent decode (P4b). Same as mla_decode_fp8 but each query attends only the
+ *  caller-provided token positions indices[b, 0:topk_length[b]] (the indexer's top-k set).
+ *  indices (batch, max_topk) int32; topk_length (batch,) int32. Returns o (B, N, 512).
+ **/
+array mla_decode_fp8_sparse(
+    const array& q,
+    const array& data_cache,
+    const array& scale_cache,
+    const array& block_table,
+    const array& indices,
+    const array& topk_length,
+    float scale = 0.0f,
+    StreamOrDevice s = {});
+
 class MlaQNormRope : public Primitive {
  public:
   MlaQNormRope(Stream stream, int num_heads, int nope_dim, int rope_dim, int norm_mode, float eps)
@@ -205,6 +220,28 @@ class MlaDecodeFp8 : public Primitive {
   void print(std::ostream& os) override { os << "MlaDecodeFp8"; }
   bool is_equivalent(const Primitive& other) const override {
     return scale_ == static_cast<const MlaDecodeFp8&>(other).scale_;
+  }
+
+ private:
+  float scale_;
+};
+
+class MlaDecodeFp8Sparse : public Primitive {
+ public:
+  MlaDecodeFp8Sparse(Stream stream, float scale) : Primitive(stream), scale_(scale) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MlaDecodeFp8Sparse"; }
+  void print(std::ostream& os) override { os << "MlaDecodeFp8Sparse"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return scale_ == static_cast<const MlaDecodeFp8Sparse&>(other).scale_;
   }
 
  private:

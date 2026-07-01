@@ -206,6 +206,18 @@ def mla_decode_fp8(q, data_cache, scale_cache, block_table, context_lens, scale=
     return _mlx().mla_decode_fp8(q, data_cache, scale_cache, block_table, context_lens, scale)
 
 
+def mla_decode_fp8_sparse(q, data_cache, scale_cache, block_table, indices, topk_length, scale=0.0):
+    """DeepSeek-V4 sparse latent decode over the UE8M0-packed cache: like mla_decode_fp8 but each
+    query attends only the token positions indices[b, 0:topk_length[b]] (the Lightning Indexer's
+    top-k set). indices (B, max_topk) int; topk_length (B,) int. Returns o (B,N,512). MPS/MLX.
+    """
+    if _is_torch(q):
+        return _torch().mla_decode_fp8_sparse(q, data_cache, scale_cache, block_table, indices,
+                                              topk_length, scale)
+    return _mlx().mla_decode_fp8_sparse(q, data_cache, scale_cache, block_table, indices,
+                                        topk_length, scale)
+
+
 def mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache):
     """DeepSeek-V4 packed MLA KV-insert: kv (…, 512) = [448 NoPE | 64 RoPE]; NoPE is quantized to
     e4m3 fp8 with per-64-block UE8M0 (power-of-2) scales, RoPE gets interleaved RoPE bf16. Writes

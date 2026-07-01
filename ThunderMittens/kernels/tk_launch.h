@@ -608,6 +608,22 @@ void launch_mla_decode_fp8(E& e, typename E::in_t q, typename E::in_t data_cache
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 
+// ----- MLA V4 sparse fp8 decode: q@0 data@1 scale@2 block_table@3 indices@4 topk_length@5 ->
+//        out@6 ; block_size@7 stride@8 scale@9 num_heads@10 max_topk@11 ; grid (N,B) 32 thr. -----
+template <class E>
+void launch_mla_decode_fp8_sparse(E& e, typename E::in_t q, typename E::in_t data_cache,
+                                  typename E::in_t scale_cache, typename E::in_t block_table,
+                                  typename E::in_t indices, typename E::in_t topk_length,
+                                  typename E::out_t out, int batch, int num_heads, int block_size,
+                                  int block_table_stride, float scale, int max_topk) {
+  e.pipeline("mla_decode_fp8_sparse");
+  e.in(q, 0); e.in(data_cache, 1); e.in(scale_cache, 2); e.in(block_table, 3);
+  e.in(indices, 4); e.in(topk_length, 5); e.out(out, 6);
+  e.bytes(block_size, 7); e.bytes(block_table_stride, 8); e.bytes(scale, 9);
+  e.bytes(num_heads, 10); e.bytes(max_topk, 11);
+  e.dispatch(num_heads, batch, 1, 32, 1, 1);
+}
+
 // ----- gelu (elementwise, last axis): x@0 -> o@1 ; M@2(u32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
 void launch_gelu(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, int D) {

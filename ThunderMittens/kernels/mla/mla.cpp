@@ -285,6 +285,71 @@ void MlaDecodeFp8::eval_gpu(const std::vector<array>& inputs, std::vector<array>
                             q.shape(0), q.shape(1), data_cache.shape(1), block_table.shape(1), scale);
 }
 
+array mla_decode_fp8_sparse(
+    const array& q,
+    const array& data_cache,
+    const array& scale_cache,
+    const array& block_table,
+    const array& indices,
+    const array& topk_length,
+    float scale,
+    StreamOrDevice s) {
+  if (q.ndim() != 3 || q.shape(2) != 512) {
+    throw std::invalid_argument("mla_decode_fp8_sparse: q must be (batch, num_heads, 512)");
+  }
+  if (data_cache.ndim() != 3 || data_cache.shape(2) != 576) {
+    throw std::invalid_argument("mla_decode_fp8_sparse: data_cache must be (nb, bs, 576) uint8");
+  }
+  if (scale_cache.ndim() != 3 || scale_cache.shape(2) != 8) {
+    throw std::invalid_argument("mla_decode_fp8_sparse: scale_cache must be (nb, bs, 8) uint8");
+  }
+  if (block_table.ndim() != 2 || block_table.shape(0) != q.shape(0)) {
+    throw std::invalid_argument("mla_decode_fp8_sparse: block_table must be (batch, max_blocks)");
+  }
+  if (indices.ndim() != 2 || indices.shape(0) != q.shape(0)) {
+    throw std::invalid_argument("mla_decode_fp8_sparse: indices must be (batch, max_topk)");
+  }
+  if (topk_length.ndim() != 1 || topk_length.shape(0) != q.shape(0)) {
+    throw std::invalid_argument("mla_decode_fp8_sparse: topk_length must be (batch,)");
+  }
+  auto q_c = mla_contig_bf16(q, s);
+  auto data_c = contiguous(astype(data_cache, uint8, s), false, s);
+  auto scale_c = contiguous(astype(scale_cache, uint8, s), false, s);
+  auto table_c = contiguous(astype(block_table, int32, s), false, s);
+  auto idx_c = contiguous(astype(indices, int32, s), false, s);
+  auto len_c = contiguous(astype(topk_length, int32, s), false, s);
+  return array(
+      {q.shape(0), q.shape(1), 512},
+      bfloat16,
+      std::make_shared<MlaDecodeFp8Sparse>(to_stream(s), scale),
+      {q_c, data_c, scale_c, table_c, idx_c, len_c});
+}
+
+void MlaDecodeFp8Sparse::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MlaDecodeFp8Sparse has no CPU implementation.");
+}
+
+void MlaDecodeFp8Sparse::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& q = inputs[0];
+  auto& data_cache = inputs[1];
+  auto& scale_cache = inputs[2];
+  auto& block_table = inputs[3];
+  auto& indices = inputs[4];
+  auto& topk_length = inputs[5];
+  auto& out = outputs[0];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+
+  const float scale = scale_ > 0.0f ? scale_ : 1.0f / std::sqrt(512.0f);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_mla_decode_fp8_sparse(enc, q, data_cache, scale_cache, block_table, indices,
+                                   topk_length, out, q.shape(0), q.shape(1), data_cache.shape(1),
+                                   block_table.shape(1), scale, indices.shape(1));
+}
+
 std::vector<array> mla_kv_insert_fp8(
     const array& kv,
     const array& cos,
@@ -373,6 +438,7 @@ TK_MLA_NO_AUTODIFF(MlaQNormRope, "MlaQNormRope")
 TK_MLA_NO_AUTODIFF(MlaKvInsert, "MlaKvInsert")
 TK_MLA_NO_AUTODIFF(MlaDecode, "MlaDecode")
 TK_MLA_NO_AUTODIFF(MlaDecodeFp8, "MlaDecodeFp8")
+TK_MLA_NO_AUTODIFF(MlaDecodeFp8Sparse, "MlaDecodeFp8Sparse")
 TK_MLA_NO_AUTODIFF(MlaKvInsertFp8, "MlaKvInsertFp8")
 
 } // namespace mlx::core

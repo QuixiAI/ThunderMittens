@@ -13,7 +13,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import mla_q_norm_rope, mla_kv_insert, mla_kv_insert_fp8, mla_decode, mla_decode_fp8
+from tk import (mla_q_norm_rope, mla_kv_insert, mla_kv_insert_fp8, mla_decode, mla_decode_fp8,
+                mla_decode_fp8_sparse)
 from tk.quant import _e4m3_decode_arr
 
 
@@ -244,6 +245,63 @@ def test_mla_decode_fp8(N):
             sc, vs = [], []
             for t in range(int(cl[b])):
                 lat = deq_latent(bt[b, t // bs] * bs + (t % bs))
+                sc.append(np.dot(qb[b, h], lat) * scl)
+                vs.append(lat)
+            p = np.exp(np.array(sc) - np.max(sc))
+            p /= p.sum()
+            ref[b, h] = np.sum(p[:, None] * np.stack(vs), axis=0)
+    assert np.max(np.abs(got - ref)) < 1e-2
+
+
+def _build_v4_cache(total, nb, bs, seed):
+    rng = np.random.default_rng(seed)
+    kv = (0.3 * rng.standard_normal((total, 512))).astype(np.float32)
+    cos, sin = make_cos_sin(64, 64)
+    positions = np.arange(total, dtype=np.int32)
+    slot = np.arange(total, dtype=np.int64)
+    data, scale = mla_kv_insert_fp8(mx.array(kv).astype(mx.bfloat16), mx.array(cos).astype(mx.bfloat16),
+                                    mx.array(sin).astype(mx.bfloat16), mx.array(positions),
+                                    mx.array(slot), mx.array(np.zeros((nb, bs, 576), np.uint8)),
+                                    mx.array(np.zeros((nb, bs, 8), np.uint8)))
+    mx.eval(data, scale)
+    return np.array(data), np.array(scale)
+
+
+def _v4_deq_latent(data, scale, tok, bs):
+    blk, off = tok // bs, tok % bs
+    lat = np.zeros(512, np.float32)
+    codes = data[blk, off, :448]
+    for b in range(7):
+        e = int(scale[blk, off, b])
+        lat[b * 64:(b + 1) * 64] = _e4m3_decode_arr(codes[b * 64:(b + 1) * 64]) * (2.0 ** (e - 127))
+    rb = np.frombuffer(data[blk, off, 448:576].tobytes(), np.uint16)
+    lat[448:] = (rb.astype(np.uint32) << 16).view(np.float32)
+    return lat
+
+
+def test_mla_decode_fp8_sparse():
+    B, N, nb, bs = 2, 4, 8, 4
+    data, scale = _build_v4_cache(nb * bs, nb, bs, 7)
+    rng = np.random.default_rng(1)
+    q = (0.3 * rng.standard_normal((B, N, 512))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    idx = np.full((B, 5), -1, np.int32)
+    idx[0, :4] = [0, 2, 5, 9]
+    idx[1, :5] = [1, 3, 6, 10, 15]
+    lens = np.array([4, 5], dtype=np.int32)
+    scl = 1.0 / math.sqrt(512.0)
+
+    got = np.array(mla_decode_fp8_sparse(mx.array(q).astype(mx.bfloat16), mx.array(data),
+                                         mx.array(scale), mx.array(bt), mx.array(idx),
+                                         mx.array(lens)).astype(mx.float32))
+    qb = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
+    ref = np.zeros((B, N, 512), np.float32)
+    for b in range(B):
+        sel = idx[b, :int(lens[b])]
+        for h in range(N):
+            sc, vs = [], []
+            for t in sel:
+                lat = _v4_deq_latent(data, scale, bt[b, t // bs] * bs + (t % bs), bs)
                 sc.append(np.dot(qb[b, h], lat) * scl)
                 vs.append(lat)
             p = np.exp(np.array(sc) - np.max(sc))

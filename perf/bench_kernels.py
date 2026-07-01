@@ -147,7 +147,24 @@ def moe_cases(be, shp):
     yield ("moe_grouped_gemm", lambda: tk.moe_grouped_gemm(x_d, W_d, eot_d))
 
 
-CASE_GROUPS = [paged_decode_cases, norm_cases, quant_cases, moe_cases]
+def mla_cases(be, shp):
+    """DeepSeek MLA absorb-path latent decode (MQA, 576-QK / 512-AV)."""
+    tk = be.tk()
+    rng = np.random.default_rng(4)
+    B, N = shp["B"], shp["H"]          # batch, num heads
+    ctx, block_size = shp["ctx"], 16
+    num_blocks = (ctx + block_size - 1) // block_size
+    max_blocks = num_blocks
+    q = (0.1 * rng.standard_normal((B, N, 576))).astype(np.float32)
+    cache = (0.1 * rng.standard_normal((num_blocks, block_size, 576))).astype(np.float32)
+    bt = np.arange(B * max_blocks, dtype=np.int32).reshape(B, max_blocks) % num_blocks
+    cl = np.full((B,), ctx, dtype=np.int32)
+    q_d, c_d = be.array(q, "bf16"), be.array(cache, "bf16")
+    bt_d, cl_d = be.int_array(bt), be.int_array(cl)
+    yield ("mla_decode", lambda: tk.mla_decode(q_d, c_d, bt_d, cl_d))
+
+
+CASE_GROUPS = [paged_decode_cases, norm_cases, quant_cases, moe_cases, mla_cases]
 
 # Note: the layernorm kernel is instantiated for D in {256,512,768,1024}, so Dm is pinned to
 # 1024 (its max). MLX hard-aborts on an unsupported kernel load, so shapes must stay in range.

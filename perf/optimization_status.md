@@ -19,6 +19,7 @@ latency (ms), Apple Silicon, one warm GPU. Regenerate with:
 | quantize_per_tensor_fp8 | 0.45 | 0.45 |
 | quantize_per_token_fp8 | 0.22 | 0.21 |
 | moe_grouped_gemm (E=8, H=2048, 2048 rows) | 1.32 | 1.33 |
+| mla_decode (DeepSeek MLA, 576-QK/512-AV MQA) | 1.17 | — |
 
 ## Tuning conclusions
 

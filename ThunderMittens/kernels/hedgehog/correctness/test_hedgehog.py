@@ -17,14 +17,15 @@ def _phi(x):
     return mx.exp(xf - mx.max(xf, axis=-1, keepdims=True))
 
 
+@pytest.mark.parametrize("use_kernel", [True, False], ids=["kernel", "routed"])
 @pytest.mark.parametrize("shape", SHAPES)
-def test_hedgehog(shape):
+def test_hedgehog(shape, use_kernel):
     B, H, N, D = shape
     mx.random.seed(0)
     q = mx.random.normal((B, H, N, D)).astype(mx.bfloat16)
     k = mx.random.normal((B, H, N, D)).astype(mx.bfloat16)
     v = mx.random.normal((B, H, N, D)).astype(mx.bfloat16)
-    got = hedgehog(q, k, v)
+    got = hedgehog(q, k, v, use_kernel=use_kernel)
     kv = mx.matmul(mx.swapaxes(_phi(k), -1, -2), v.astype(mx.float32))
     exp = mx.matmul(_phi(q), kv)
     mx.eval(got, exp)

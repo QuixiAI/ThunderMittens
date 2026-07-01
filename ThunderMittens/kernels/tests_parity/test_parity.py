@@ -890,8 +890,8 @@ def test_hedgehog_parity(shape):
     q = rng.standard_normal(shape).astype(np.float32)
     k = rng.standard_normal(shape).astype(np.float32)
     v = rng.standard_normal(shape).astype(np.float32)
-    om = tk.hedgehog(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"))
-    ot = tk.hedgehog(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"))
+    om = tk.hedgehog(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"), use_kernel=True)
+    ot = tk.hedgehog(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"), use_kernel=True)
     _assert_parity(om, ot, atol=1.0)
 
 
@@ -902,8 +902,8 @@ def test_linear_attn_parity(shape):
     q = rng.standard_normal(shape).astype(np.float32)
     k = rng.standard_normal(shape).astype(np.float32)
     v = rng.standard_normal(shape).astype(np.float32)
-    om = tk.linear_attn(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"))
-    ot = tk.linear_attn(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"))
+    om = tk.linear_attn(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"), use_kernel=True)
+    ot = tk.linear_attn(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"), use_kernel=True)
     _assert_parity(om, ot, atol=1.0)  # values are O(N*D); same-kernel parity is ~exact
 
 

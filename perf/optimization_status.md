@@ -123,34 +123,96 @@ Results (ms, N=11008 K=4096 M=1; baseline = fp16 `mx.matmul` on the same run):
   span-decode (tk_dequant8) inside dequant_into_register/shared, shared with
   the attn_q work.
 
-### Elementwise/row family — status: baselining done
-- layernorm/rms_norm/softmax/gelu/add_norm all beat MLX fast ops — record and
-  keep; re-run after any substrate change.
-- glu/add_rt/rotary/hadamard need vectorization/geometry passes (queue #5/7/8/9).
+### Elementwise/row family — status: LANDED (2026-07-01)
+- layernorm/rms_norm/softmax/gelu/add_norm already beat MLX fast ops (1.5–2.6×)
+  — untouched.
+- **rotary**: one-simdgroup-per-row + scalar substrate loads → flat one thread
+  per 4 rotation pairs (bf16_4 vectors, fp32 math; ABI +M at buffer 5).
+  0.187→0.078 ms at (1,32,2048,128); 0.44× → ~0.95× of mx.fast.rope (the
+  remaining few % is the cos/sin table reads mx avoids by computing trig
+  in-kernel — judged not worth matching).
+- **glu** (6 modes): scalar → vec4 + scalar tail. 3.93→1.11 ms at 16384×4096
+  (362 GB/s); 0.60× → 2.3× vs composed silu·gate.
+- **add_rt**: 8×8-register-tile demo layout → flat 8 elems/thread (16-byte
+  transactions). 0.34× → ~1.05× of mx add (bf16), parity f32. The rt smoke-test
+  role moved to the Xcode primitive tests.
+- **hadamard**: D-thread threadgroup with log2(D) barriers → one simdgroup/row,
+  in-register + simd_shuffle_xor butterflies, zero barriers, zero threadgroup
+  memory. D=128: 0.150→0.037 ms (1.4× vs matmul-H); D=512: 0.298→0.061 ms
+  (554 GB/s ≈ roofline, 10× vs matmul-H).
+- **quantize_per_tensor_fp8** (quant_rt): absmax pass now 16 elems/thread
+  (16× fewer contended atomics) + vec4 encode. 1.53→0.35 ms at 16384×1024
+  (4.3×); per_token 0.27→0.21 (vec4 main loops). Encoder function untouched —
+  codes stay bit-identical across backends.
+- torch-MPS note: the same kernels win on MPS too (glu 1.38× vs torch silu·mul,
+  hadamard D=512 10×), but SMALL kernels carry ~0.05–0.1 ms extra per-call
+  overhead from the tk_torch dispatch glue (add_rt bf16 0.42× of torch's add
+  there despite parity on MLX) — host-glue follow-up, not a kernel issue.
 
-### Attention — status: baselining done
-- fwd D=128 & causal & bwd all ahead; fwd D=64 slightly behind (queue #12);
-  multiwarp confirmed ≈0.93× of single-warp fwd (unchanged conclusion).
-- attn_q needs its dequant restructured (queue #3) — likely shares the fix with
-  the qgemv generic template.
+### Attention — status: measured & recorded (2026-07-01)
+- With clean (clock-warmed) timing: fwd D=128 **1.24× ahead** of sdpa, causal
+  **3.8–5.8× ahead**, bwd 2.1–2.5× ahead of the mx.vjp naive. fwd D=64 is 0.91×
+  (the earlier 0.77× was first-timed-thunk bias); remaining hypothesis —
+  D=64-specific sequence-block tuning — deferred as ≤10%.
+- multiwarp stays ≈0.8–0.93× of single-warp fwd → keep non-default (standing
+  conclusion re-confirmed).
+- **attn_q**: V now staged through shared memory like K (span dequant), K/V
+  staging uses the span-decoding dequant_into_shared. fp8 single-warp 1.61→1.11
+  ms, multiwarp 0.98→0.82–0.94 at (1,8,1024,128). Structural finding: the
+  remaining ~2.5× gap vs attend-on-dequantized-KV is the 8-row-KV-tile shared
+  round-trip (tiny tiles, 2 barriers per 8 rows), NOT dequant ALU. Options
+  deferred: 32-row KV tiles (rectangular causal masking complexity) or an
+  op-level dequant-to-scratch route (~0.45 ms estimated, at 2× memory).
+  Recommendation recorded: prefer multiwarp=True for attn_q today.
 
-### Linear-attention family — status: baselining done
-- Causal/scan kernels (lin_attn_causal, mamba2, based, lin_attn_decay) healthy.
-- Non-causal linear_attn and hedgehog lose massively to 2 composed matmuls
-  (queue #4): consider routing non-causal shapes to composition (φ in-kernel or
-  via mx ops), or a sequence-parallel two-phase kernel.
-- lin_attn_decay public wrapper rebuilds the decay ramp in numpy per call —
-  move to device ops (host-overhead fix independent of the kernel).
+### Linear-attention family — status: LANDED (routing) (2026-07-01)
+- Causal/scan kernels (lin_attn_causal, mamba2, based, lin_attn_decay) healthy;
+  lin_attn_causal beats the masked-naive baseline 5–6×.
+- **Non-causal linear_attn and hedgehog now ROUTE to framework composition by
+  default** (`use_kernel=True` keeps the ported kernels; parity tests pin it).
+  Rationale: the kernels run one simdgroup per (batch,head) — 16 simdgroups
+  total at (2,8,·,·) — while the composition uses the whole GPU per GEMM.
+  linear_attn 2.20→0.142 ms (15.5×), hedgehog 0.64→0.25 ms (2.5×). A
+  sequence-parallel split-KV kernel was considered and rejected: it cannot beat
+  two mx.matmul calls and needs cross-threadgroup reduction scratch.
+- lin_attn_decay wrapper now builds the decay ramp on-device (was numpy per
+  call); neutral in pipelined benchmarks, removes the host stall in real use.
 
-### Complex — status: healthy
-- cmplx_matmul ≥ 4-matmul composition; fftconv ≈ mx.fft path. Low priority.
+### Complex — status: healthy (no action)
+- cmplx_matmul ≥ 4-matmul composition (1.0–1.22×); fftconv ≈ mx.fft path.
 
-### Serving — status: re-baselined (see table above)
-- v2_fp8 dequant-on-read (queue #6) and quantize_per_tensor_fp8 (queue #13) are
-  the actionable items; also re-examine staged-vs-v1 defaults under non-pipelined
-  decode conditions.
+### GEMM (matmul_custom / gemm_staged / flux) — status: recorded (no action)
+- With clean timing, flux gelu/gate beat the composed baseline at ALL measured
+  shapes (1.08–1.16×) — the earlier 0.65× at 1024³ was first-thunk bias.
+- matmul_custom @1024³ is 0.58× of mx.matmul while gemm_staged @1024³ is at
+  parity (0.177 vs 0.176 ms); both ≈ parity at ≥2048³. Finding recorded:
+  2-simdgroup staged wins at the smaller size. Not routed — these are TK-parity
+  /calibration kernels; mx.matmul is the practical dense GEMM.
+
+### Serving — status: LANDED items (2026-07-01)
+- v2_fp8 dequant-on-read: fixed by the branchless decoders — 0.859→0.487 ms
+  (penalty vs bf16 cache 2.3× → 1.25×, with half the cache bytes).
+- quantize_per_tensor_fp8: 4.3× (see elementwise section).
+- Still open: partition_size sweep per context; staged-vs-v1 default re-check
+  under non-pipelined single-call decode (the pipelined harness reverses the
+  old conclusion; a real decode loop sits between the two regimes).
 
 ## Decision log
 - 2026-07-01: harness rewritten (schema v1, all families, batched timing);
   perf.md updated to match reality (reference mirrors, device context, timing
   methodology, serving section).
+- 2026-07-01: TWO timing-bias fixes (1 s clock pre-ramp; ≥50 ms time-based
+  per-thunk warmup). Queue items #1 (qgemm M=512 "routing bug"), most of #12
+  (attn D=64) and #14 (flux gelu small) were artifacts of the biased harness —
+  always re-verify a gap on the fixed harness before optimizing.
+- 2026-07-01: qgemv E1/E2/E3 landed (branchless decoders + block-major walk +
+  span dequant) — every quant format now beats the fp16 GEMV; commit a38e8a8.
+- 2026-07-01: rotary/glu/add_rt/hadamard flat-vectorized geometry; attn_q V
+  staging; commit f16b9d5.
+- 2026-07-01: linear_attn/hedgehog routed to framework composition
+  (use_kernel escape hatch); quant_rt vectorized + atomic-thinning; lin_attn_decay
+  device-side ramp.
+- Rejected this pass: multi-row qgemv geometry (≤10–30% left, formats at
+  245–466 W-GB/s), attn_q 32-row KV tiles (complexity vs niche kernel),
+  matmul_custom small-shape routing (calibration kernel), fp16 LUT decoders
+  (bit-tricks already exact + cheap).

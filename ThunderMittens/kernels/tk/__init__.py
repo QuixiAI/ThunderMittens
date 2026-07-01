@@ -693,18 +693,42 @@ def attn_multiwarp(q, k, v):
     return _mlx().attn_multiwarp(q, k, v)
 
 
-def linear_attn(q, k, v):
-    """Non-causal linear attention Q@(K^T@V). Accepts mlx.array or torch.Tensor (MPS)."""
+def linear_attn(q, k, v, use_kernel=False):
+    """Non-causal linear attention Q@(K^T@V). Accepts mlx.array or torch.Tensor (MPS).
+
+    Default routes to two framework matmuls: the non-causal form has no scan, and the
+    composition uses the whole GPU per GEMM — measured ~15x faster than the
+    one-simdgroup-per-(batch,head) TK kernel at (2,8,4096,64). use_kernel=True runs the
+    ported TK kernel (parity/porting path)."""
+    if use_kernel:
+        if _is_torch(q):
+            return _torch().linear_attn(q, k, v)
+        return _mlx().linear_attn(q, k, v)
     if _is_torch(q):
-        return _torch().linear_attn(q, k, v)
-    return _mlx().linear_attn(q, k, v)
+        return q @ (k.transpose(-1, -2) @ v)
+    import mlx.core as mx
+    return mx.matmul(q, mx.matmul(k.swapaxes(-1, -2), v))
 
 
-def hedgehog(q, k, v):
-    """Hedgehog feature-map linear attention. Accepts mlx.array or torch.Tensor (MPS)."""
+def hedgehog(q, k, v, use_kernel=False):
+    """Hedgehog feature-map linear attention: out = phi(Q) @ (phi(K)^T @ V) with
+    phi(x) = exp(x - rowmax(x)). Accepts mlx.array or torch.Tensor (MPS).
+
+    Default routes to framework ops (feature map + two matmuls), measured ~3x faster than
+    the one-simdgroup-per-(batch,head) TK kernel; use_kernel=True runs the ported kernel."""
+    if use_kernel:
+        if _is_torch(q):
+            return _torch().hedgehog(q, k, v)
+        return _mlx().hedgehog(q, k, v)
     if _is_torch(q):
-        return _torch().hedgehog(q, k, v)
-    return _mlx().hedgehog(q, k, v)
+        fq = (q.float() - q.float().amax(-1, keepdim=True)).exp()
+        fk = (k.float() - k.float().amax(-1, keepdim=True)).exp()
+        return (fq @ (fk.transpose(-1, -2) @ v.float())).to(q.dtype)
+    import mlx.core as mx
+    fq = mx.exp(q.astype(mx.float32) - mx.max(q.astype(mx.float32), axis=-1, keepdims=True))
+    fk = mx.exp(k.astype(mx.float32) - mx.max(k.astype(mx.float32), axis=-1, keepdims=True))
+    out = mx.matmul(fq, mx.matmul(fk.swapaxes(-1, -2), v.astype(mx.float32)))
+    return out.astype(q.dtype)
 
 
 def lin_attn_causal(q, k, v):
@@ -724,19 +748,23 @@ def mamba2(C, B, X, cumlog):
 def lin_attn_decay(q, k, v, slopes):
     """Decay / retention linear attention (RetNet / Lightning-Attention-2):
     out_i = sum_{j<=i} exp(-slope_h*(i-j)) * (q_i.k_j) * v_j. q,k,v (B,H,N,D) bf16, D=64; `slopes`
-    is the per-head decay rate (H,). Builds the decay-log ramp cl=-slope*position internally and runs
-    the retention kernel. Accepts mlx.array or torch.Tensor (MPS)."""
+    is the per-head decay rate (H,). Builds the decay-log ramp cl=-slope*position on-device (the
+    former numpy build ran on the host per call) and runs the retention kernel.
+    Accepts mlx.array or torch.Tensor (MPS)."""
     import numpy as np
     B, H, N, _ = q.shape
-    pos = np.arange(int(N), dtype=np.float32)
-    sl = np.asarray(slopes, np.float32).reshape(int(H))
-    cl = np.ascontiguousarray(
-        np.broadcast_to(-(sl[:, None] * pos[None, :])[None], (int(B), int(H), int(N))), np.float32)
     if _is_torch(q):
         import torch
-        return _torch().lin_attn_decay(q, k, v, torch.from_numpy(cl).to(q.device))
+        sl = torch.as_tensor(np.asarray(slopes), dtype=torch.float32, device=q.device).reshape(int(H))
+        pos = torch.arange(int(N), dtype=torch.float32, device=q.device)
+        cl = (-(sl[:, None] * pos[None, :])).unsqueeze(0).expand(int(B), int(H), int(N)).contiguous()
+        return _torch().lin_attn_decay(q, k, v, cl)
     import mlx.core as mx
-    return _mlx().lin_attn_decay(q, k, v, mx.array(cl))
+    sl = mx.array(np.asarray(slopes, np.float32)).reshape((int(H),))
+    pos = mx.arange(int(N)).astype(mx.float32)
+    # + zeros materializes the broadcast (the kernel needs a contiguous (B,H,N) buffer)
+    cl = (-(sl[:, None] * pos[None, :]))[None] + mx.zeros((int(B), int(H), int(N)), dtype=mx.float32)
+    return _mlx().lin_attn_decay(q, k, v, cl)
 
 
 def based(q, k, v):

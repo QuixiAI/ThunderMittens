@@ -25,15 +25,26 @@ kernel void quantize_per_token_fp8(device const T *x     [[buffer(0)]],
                                    constant int   &D     [[buffer(3)]],
                                    uint row  [[threadgroup_position_in_grid]],
                                    uint lane [[thread_index_in_simdgroup]]) {
+    using T4 = vec<T, 4>;
     const long base = (long)row * D;
+    const int nchunks = (D % 4 == 0) ? D / 4 : 0;   // vec4 path only for aligned D
     float amax = 0.0f;
-    for (int i = (int)lane; i < D; i += 32) {
+    for (int c = (int)lane; c < nchunks; c += 32) {
+        const float4 v = float4(((device const T4*)(x + base))[c]);
+        amax = max(amax, max(max(fabs(v.x), fabs(v.y)), max(fabs(v.z), fabs(v.w))));
+    }
+    for (int i = nchunks * 4 + (int)lane; i < D; i += 32) {
         amax = max(amax, fabs(float(x[base + i])));
     }
     amax = simd_max(amax);
     const float s = amax / 448.0f;
     const float inv = s > 0.0f ? 1.0f / s : 0.0f;
-    for (int i = (int)lane; i < D; i += 32) {
+    for (int c = (int)lane; c < nchunks; c += 32) {
+        const float4 v = float4(((device const T4*)(x + base))[c]) * inv;
+        ((device uchar4*)(codes + base))[c] =
+            uchar4(tk_e4m3_encode(v.x), tk_e4m3_encode(v.y), tk_e4m3_encode(v.z), tk_e4m3_encode(v.w));
+    }
+    for (int i = nchunks * 4 + (int)lane; i < D; i += 32) {
         codes[base + i] = tk_e4m3_encode(float(x[base + i]) * inv);
     }
     if (lane == 0) {
@@ -48,15 +59,26 @@ kernel void quantize_per_token_int8(device const T *x     [[buffer(0)]],
                                     constant int   &D     [[buffer(3)]],
                                     uint row  [[threadgroup_position_in_grid]],
                                     uint lane [[thread_index_in_simdgroup]]) {
+    using T4 = vec<T, 4>;
     const long base = (long)row * D;
+    const int nchunks = (D % 4 == 0) ? D / 4 : 0;
     float amax = 0.0f;
-    for (int i = (int)lane; i < D; i += 32) {
+    for (int c = (int)lane; c < nchunks; c += 32) {
+        const float4 v = float4(((device const T4*)(x + base))[c]);
+        amax = max(amax, max(max(fabs(v.x), fabs(v.y)), max(fabs(v.z), fabs(v.w))));
+    }
+    for (int i = nchunks * 4 + (int)lane; i < D; i += 32) {
         amax = max(amax, fabs(float(x[base + i])));
     }
     amax = simd_max(amax);
     const float s = amax / 127.0f;
     const float inv = s > 0.0f ? 1.0f / s : 0.0f;
-    for (int i = (int)lane; i < D; i += 32) {
+    for (int c = (int)lane; c < nchunks; c += 32) {
+        const float4 v = float4(((device const T4*)(x + base))[c]) * inv;
+        ((device char4*)(codes + base))[c] =
+            char4(tk_int8_encode(v.x), tk_int8_encode(v.y), tk_int8_encode(v.z), tk_int8_encode(v.w));
+    }
+    for (int i = nchunks * 4 + (int)lane; i < D; i += 32) {
         codes[base + i] = tk_int8_encode(float(x[base + i]) * inv);
     }
     if (lane == 0) {
@@ -76,10 +98,22 @@ kernel void quant_tensor_absmax(device const T *x         [[buffer(0)]],
                                 constant int  &n          [[buffer(2)]],
                                 uint tid  [[thread_position_in_grid]],
                                 uint lane [[thread_index_in_simdgroup]]) {
+    // 16 elements per thread (vec4 x4) -> 16x fewer contended atomics than the old
+    // one-element-per-thread version, and vectorized loads.
+    using T4 = vec<T, 4>;
+    const long base = (long)tid * 16;
     float amax = 0.0f;
-    if ((int)tid < n) { amax = fabs(float(x[tid])); }
+    if (base + 16 <= (long)n) {
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) {
+            const float4 v = float4(((device const T4*)(x + base))[j]);
+            amax = max(amax, max(max(fabs(v.x), fabs(v.y)), max(fabs(v.z), fabs(v.w))));
+        }
+    } else {
+        for (long i = base; i < (long)n; ++i) amax = max(amax, fabs(float(x[i])));
+    }
     amax = simd_max(amax);
-    if (lane == 0) { atomic_max_float(scale_u, amax); }   // P3
+    if (lane == 0 && amax > 0.0f) { atomic_max_float(scale_u, amax); }   // P3
 }
 
 template <typename T>
@@ -89,10 +123,18 @@ kernel void quant_tensor_encode_fp8(device const T   *x         [[buffer(0)]],
                                     device float     *scale_out [[buffer(3)]],
                                     constant int     &n         [[buffer(4)]],
                                     uint tid [[thread_position_in_grid]]) {
+    using T4 = vec<T, 4>;
     const float s = orderable_uint_to_float(scale_u[0]) / 448.0f;
     const float inv = s > 0.0f ? 1.0f / s : 0.0f;
     if (tid == 0) { scale_out[0] = s; }
-    if ((int)tid < n) { codes[tid] = tk_e4m3_encode(float(x[tid]) * inv); }
+    const long base = (long)tid * 4;
+    if (base + 4 <= (long)n) {
+        const float4 v = float4(((device const T4*)(x + base))[0]) * inv;
+        ((device uchar4*)(codes + base))[0] =
+            uchar4(tk_e4m3_encode(v.x), tk_e4m3_encode(v.y), tk_e4m3_encode(v.z), tk_e4m3_encode(v.w));
+    } else {
+        for (long i = base; i < (long)n; ++i) codes[i] = tk_e4m3_encode(float(x[i]) * inv);
+    }
 }
 
 template <typename T>
@@ -102,10 +144,18 @@ kernel void quant_tensor_encode_int8(device const T   *x         [[buffer(0)]],
                                      device float     *scale_out [[buffer(3)]],
                                      constant int     &n         [[buffer(4)]],
                                      uint tid [[thread_position_in_grid]]) {
+    using T4 = vec<T, 4>;
     const float s = orderable_uint_to_float(scale_u[0]) / 127.0f;
     const float inv = s > 0.0f ? 1.0f / s : 0.0f;
     if (tid == 0) { scale_out[0] = s; }
-    if ((int)tid < n) { codes[tid] = tk_int8_encode(float(x[tid]) * inv); }
+    const long base = (long)tid * 4;
+    if (base + 4 <= (long)n) {
+        const float4 v = float4(((device const T4*)(x + base))[0]) * inv;
+        ((device char4*)(codes + base))[0] =
+            char4(tk_int8_encode(v.x), tk_int8_encode(v.y), tk_int8_encode(v.z), tk_int8_encode(v.w));
+    } else {
+        for (long i = base; i < (long)n; ++i) codes[i] = tk_int8_encode(float(x[i]) * inv);
+    }
 }
 
 #define instantiate_quant_tensor(type_name, T)                                 \

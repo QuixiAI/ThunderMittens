@@ -431,7 +431,8 @@ void launch_quant_tensor_absmax(E& e, typename E::in_t x, typename E::out_t scal
                                 const std::string& type_name) {
   e.pipeline(quant_tensor_absmax_kernel_name(type_name));
   e.in(x, 0); e.out(scale_u, 1); e.bytes(n, 2);
-  e.dispatch((n + 255) / 256, 1, 1, 256, 1, 1);
+  const int t16 = (n + 15) / 16;                       // 16 elements per thread
+  e.dispatch((t16 + 255) / 256, 1, 1, 256, 1, 1);
 }
 template <class E>
 void launch_quant_tensor_encode(E& e, typename E::in_t x, typename E::in_t scale_u,
@@ -440,7 +441,8 @@ void launch_quant_tensor_encode(E& e, typename E::in_t x, typename E::in_t scale
   e.pipeline(is_int8 ? quant_tensor_encode_int8_kernel_name(type_name)
                      : quant_tensor_encode_fp8_kernel_name(type_name));
   e.in(x, 0); e.in(scale_u, 1); e.out(codes, 2); e.out(scale_out, 3); e.bytes(n, 4);
-  e.dispatch((n + 255) / 256, 1, 1, 256, 1, 1);
+  const int t4 = (n + 3) / 4;                          // 4 elements per thread
+  e.dispatch((t4 + 255) / 256, 1, 1, 256, 1, 1);
 }
 
 // ----- quantize_per_token_fp8: x@0 -> codes@1(uint8) scale@2(f32) ; D@3(i32) ; grid (rows,1,1).

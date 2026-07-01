@@ -9,6 +9,7 @@
 #include "mlx/utils.h"
 
 #include "mla/mla.h"
+#include "paged_attn_v2/paged_attn_v2.h"   // PagedAttentionV2Reduce (combines P4v2 partials)
 
 #ifdef _METAL_
 #include "mlx/backend/metal/device.h"
@@ -194,11 +195,68 @@ array mla_decode(
   auto cache_c = mla_contig_bf16(kv_cache, s);
   auto table_c = contiguous(astype(block_table, int32, s), false, s);
   auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
-  return array(
-      {q.shape(0), q.shape(1), latent},
-      bfloat16,
-      std::make_shared<MlaDecode>(to_stream(s), scale),
+  // P4v2 route: partitioned multi-head decode + paged-v2 reduce (see mla.metal for rationale).
+  const int B = q.shape(0);
+  const int N = q.shape(1);
+  const int block_size = kv_cache.shape(1);
+  const int max_ctx = block_table.shape(1) * block_size;
+  int psize = 512;
+  psize = ((psize + block_size - 1) / block_size) * block_size;   // multiple of block_size
+  const int P = std::max(1, (max_ctx + psize - 1) / psize);
+  auto parts = array::make_arrays(
+      {{B, N, P, latent}, {B, N, P}, {B, N, P}},
+      {float32, float32, float32},
+      std::make_shared<MlaDecodePartition>(to_stream(s), scale, P, psize),
       {q_c, cache_c, table_c, lens_c});
+  return array(
+      {B, N, latent},
+      bfloat16,
+      std::make_shared<PagedAttentionV2Reduce>(to_stream(s)),
+      {parts[0], parts[1], parts[2]});
+}
+
+void MlaDecodePartition::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MlaDecodePartition has no CPU implementation.");
+}
+
+void MlaDecodePartition::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& q = inputs[0];
+  auto& kv_cache = inputs[1];
+  auto& block_table = inputs[2];
+  auto& context_lens = inputs[3];
+  auto& tmp_out = outputs[0];
+  auto& max_logits = outputs[1];
+  auto& exp_sums = outputs[2];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  tmp_out.set_data(allocator::malloc_or_wait(tmp_out.nbytes()));
+  max_logits.set_data(allocator::malloc_or_wait(max_logits.nbytes()));
+  exp_sums.set_data(allocator::malloc_or_wait(exp_sums.nbytes()));
+
+  const int qk = q.shape(2);
+  const int rope = 64;
+  const int latent = qk - rope;
+  const float scale = scale_ > 0.0f ? scale_ : 1.0f / std::sqrt(static_cast<float>(qk));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_mla_decode_partition(enc, q, kv_cache, block_table, context_lens,
+                                  tmp_out, max_logits, exp_sums, q.shape(0), q.shape(1),
+                                  kv_cache.shape(1), block_table.shape(1), scale, latent, rope,
+                                  num_partitions_, partition_size_);
+}
+
+std::vector<array> MlaDecodePartition::jvp(const std::vector<array>&, const std::vector<array>&,
+                                           const std::vector<int>&) {
+  throw std::runtime_error("MlaDecodePartition has no jvp implementation.");
+}
+std::vector<array> MlaDecodePartition::vjp(const std::vector<array>&, const std::vector<array>&,
+                                           const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("MlaDecodePartition has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> MlaDecodePartition::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("MlaDecodePartition has no vmap implementation.");
 }
 
 void MlaDecode::eval_cpu(const std::vector<array>&, std::vector<array>&) {

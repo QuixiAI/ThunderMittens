@@ -302,6 +302,19 @@ instantiate_paged_v2(float16, half, 64)
 instantiate_paged_v2(float16, half, 128)
 instantiate_paged_v2(bfloat16, bf16, 64)
 instantiate_paged_v2(bfloat16, bf16, 128)
+
+// reduce-only instantiation at D=512: consumed by mla_decode_partition (MLA latent decode
+// emits paged-v2-style partials over the 512-wide latent).
+template [[host_name("paged_attention_reduce_bfloat16_512")]]
+[[kernel]] void paged_attention_reduce<bf16, 512>(
+    device const float *tmp_out [[buffer(0)]],
+    device const float *max_logits [[buffer(1)]],
+    device const float *exp_sums [[buffer(2)]],
+    device bf16 *out [[buffer(3)]],
+    constant int &num_heads [[buffer(4)]],
+    constant int &num_partitions [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]);
 instantiate_paged_v2_fp8(float32, float, 64)
 instantiate_paged_v2_fp8(float32, float, 128)
 instantiate_paged_v2_fp8(float16, half, 64)

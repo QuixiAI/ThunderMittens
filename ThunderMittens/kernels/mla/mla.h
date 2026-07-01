@@ -204,6 +204,37 @@ class MlaDecode : public Primitive {
   float scale_;
 };
 
+// Partitioned multi-head MLA decode (P4v2): emits paged-v2-style partials
+// (tmp_out, max_logits, exp_sums); combined by PagedAttentionV2Reduce.
+class MlaDecodePartition : public Primitive {
+ public:
+  MlaDecodePartition(Stream stream, float scale, int num_partitions, int partition_size)
+      : Primitive(stream), scale_(scale), num_partitions_(num_partitions),
+        partition_size_(partition_size) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MlaDecodePartition"; }
+  void print(std::ostream& os) override { os << "MlaDecodePartition"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const MlaDecodePartition&>(other);
+    return scale_ == o.scale_ && num_partitions_ == o.num_partitions_ &&
+           partition_size_ == o.partition_size_;
+  }
+
+ private:
+  float scale_;
+  int num_partitions_;
+  int partition_size_;
+};
+
 class MlaDecodeFp8 : public Primitive {
  public:
   MlaDecodeFp8(Stream stream, float scale) : Primitive(stream), scale_(scale) {}

@@ -19,13 +19,32 @@ kernel void qgemv_w8a8(
     const constant int &K [[buffer(6)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]]) {
-    const int row = tgid.x;
-    device const uint* wrow = (device const uint*)(Wq + (uint)row * K);  // 4 int8 / uint
-    device const uint* xv   = (device const uint*)Xq;
-    int acc = 0;
-    for (int u = (int)lane; u < K / 4; u += 32) acc += idot4(wrow[u], xv[u]);  // dp4a
-    acc = metal::simd_sum(acc);                                                // int32 reduce
-    if (lane == 0) D[row] = half(float(acc) * float(w_scale[row]) * float(a_scale[0]));
+    // Two rows per simdgroup: X is loaded once (uint4 = 16 int8) and dotted against both weight
+    // rows — halves the X register loads and doubles per-threadgroup work at half the grid.
+    const int row0 = tgid.x * 2;
+    const bool two = row0 + 1 < N;
+    device const uint4* w0 = (device const uint4*)(Wq + (uint)row0 * K);
+    device const uint4* w1 = (device const uint4*)(Wq + (uint)(row0 + (two ? 1 : 0)) * K);
+    device const uint4* xv = (device const uint4*)Xq;
+    int acc0 = 0, acc1 = 0;
+    for (int u = (int)lane; u < K / 16; u += 32) {                         // 16-byte loads, 4x dp4a
+        const uint4 x = xv[u];
+        const uint4 a = w0[u];
+        acc0 += idot4(a.x, x.x) + idot4(a.y, x.y) + idot4(a.z, x.z) + idot4(a.w, x.w);
+        const uint4 b = w1[u];
+        acc1 += idot4(b.x, x.x) + idot4(b.y, x.y) + idot4(b.z, x.z) + idot4(b.w, x.w);
+    }
+    for (int k = (K & ~15) + (int)lane * 4; k + 4 <= K; k += 128) {        // K%16 tail (K%4==0)
+        const uint x = ((device const uint*)Xq)[k / 4];
+        acc0 += idot4(((device const uint*)Wq)[((uint)row0 * K + k) / 4], x);
+        acc1 += idot4(((device const uint*)Wq)[((uint)(row0 + (two ? 1 : 0)) * K + k) / 4], x);
+    }
+    acc0 = metal::simd_sum(acc0);                                          // int32 reduce
+    acc1 = metal::simd_sum(acc1);
+    if (lane == 0) {
+        D[row0] = half(float(acc0) * float(w_scale[row0]) * float(a_scale[0]));
+        if (two) D[row0 + 1] = half(float(acc1) * float(w_scale[row0 + 1]) * float(a_scale[0]));
+    }
 }
 
 // ---- BitNet W2A8: ternary 2-bit weights (per-group absmean scale) x int8 activations.
@@ -42,12 +61,29 @@ kernel void qgemv_w2a8(
     const int row = tgid.x;
     const int bpr = K / bitnet::block_k;
     device const uchar* row_base = Wq + (uint)(row * bpr) * bitnet::block_bytes;
+    // Block-major walk (same shape as the dequant qgemv): each lane owns 8 contiguous codes of a
+    // block (one 2-byte read), 8 blocks in flight per simdgroup iteration; the group scale is
+    // applied ONCE per 8-code span to the integer subtotal. The old one-block-per-iteration walk
+    // did a float multiply per element.
+    constexpr int CPL = 8;                              // codes per lane
+    constexpr int LPB = bitnet::block_k / CPL;          // 4 lanes per block
+    constexpr int BPI = 32 / LPB;                       // 8 blocks per iteration
+    const int b_off = (int)lane / LPB;
+    const int col0  = ((int)lane % LPB) * CPL;
     float lane_acc = 0.0f;
-    for (int g = 0; g < bpr; g++) {
+    for (int g = b_off; g < bpr; g += BPI) {
         device const uchar* base = row_base + (uint)g * bitnet::block_bytes;
-        const int k = (int)lane;
-        const int prod = bitnet::code(base, k) * (int)Xq[g * bitnet::block_k + k];
-        lane_acc += float(prod) * float(bitnet::gscale(base));
+        const ushort codes = *(device const ushort*)(base + 2 + (col0 >> 2));  // 8 x 2-bit codes
+        device const char* x = Xq + g * bitnet::block_k + col0;
+        int isum = 0;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+            isum += (int)((codes >> (2 * i)) & 3) * (int)x[i];   // code in {0,1,2}
+        }
+        int ixsum = 0;                                            // subtract the -1 bias: code-1
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) ixsum += (int)x[i];
+        lane_acc += float(isum - ixsum) * float(bitnet::gscale(base));
     }
     const float facc = metal::simd_sum(lane_acc);
     if (lane == 0) D[row] = half(facc * float(a_scale[0]));

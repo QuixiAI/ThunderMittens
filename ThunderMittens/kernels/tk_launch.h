@@ -602,6 +602,25 @@ void launch_mla_decode(E& e, typename E::in_t q, typename E::in_t kv_cache,
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 
+// ----- MLA latent decode, partitioned (P4v2): emits paged-v2-style partials
+//        tmp_out@4 (B,N,P,LATENT) max_logits@5 exp_sums@6 (both B,N,P) f32; combine with
+//        launch_paged_attention_reduce(type "bfloat16", head_size=LATENT). Grid (H, B, P),
+//        one simdgroup per (head, partition). -----
+template <class E>
+void launch_mla_decode_partition(E& e, typename E::in_t q, typename E::in_t kv_cache,
+                                 typename E::in_t block_table, typename E::in_t context_lens,
+                                 typename E::out_t tmp_out, typename E::out_t max_logits,
+                                 typename E::out_t exp_sums, int batch, int num_heads,
+                                 int block_size, int block_table_stride, float scale,
+                                 int latent, int rope, int num_partitions, int partition_size) {
+  e.pipeline("mla_decode_partition_" + std::to_string(latent) + "_" + std::to_string(rope));
+  e.in(q, 0); e.in(kv_cache, 1); e.in(block_table, 2); e.in(context_lens, 3);
+  e.out(tmp_out, 4); e.out(max_logits, 5); e.out(exp_sums, 6);
+  e.bytes(block_size, 7); e.bytes(block_table_stride, 8); e.bytes(scale, 9);
+  e.bytes(num_heads, 10); e.bytes(num_partitions, 11); e.bytes(partition_size, 12);
+  e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
+}
+
 // ----- MLA V4 dense fp8 decode: q@0(B,N,512) data@1(u8,576) scale@2(u8,8) block_table@3
 //        context_lens@4 -> out@5(B,N,512) ; block_size@6 stride@7 scale@8 num_heads@9 ; grid (N,B) 32 thr. -----
 template <class E>
@@ -1296,7 +1315,10 @@ void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq, typename E::in
   e.pipeline(use_small ? qgemv_kernel_name(fmt) + "_small" : qgemv_kernel_name(fmt));
   e.out(d, 0); e.in(wq, 1); e.in(x, 2);
   e.bytes(N, 3); e.bytes(K, 4);
-  e.dispatch(N, 1, 1, 32, 1, 1);  // one simdgroup per output row
+  // one simdgroup per output row. (Two rows per simdgroup was measured: 1.9x BETTER for the
+  // integer w8a8 path but 1.6-2.8x WORSE here — the float dequant streams double the register
+  // pressure; see optimization_status.md.)
+  e.dispatch(N, 1, 1, 32, 1, 1);
 }
 
 // ----- qgemv_w8a8 (W8A8 int8xint8 decode): D@0 Wq@1(int8) Xq@2(int8) w_scale@3 a_scale@4 ;
@@ -1307,7 +1329,7 @@ void launch_qgemv_w8a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.pipeline("mittens::qgemv_w8a8");  // non-template kernel keeps its namespaced symbol
   e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(wscale, 3); e.in(ascale, 4);
   e.bytes(N, 5); e.bytes(K, 6);
-  e.dispatch(N, 1, 1, 32, 1, 1);
+  e.dispatch((N + 1) / 2, 1, 1, 32, 1, 1);   // two rows per simdgroup
 }
 
 // ----- qgemv_w2a8 (BitNet W2A8 int2xint8 decode): D@0 Wq@1(bitnet blocks) Xq@2(int8) a_scale@3 ;

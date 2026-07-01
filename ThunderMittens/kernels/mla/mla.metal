@@ -326,6 +326,101 @@ kernel void mla_decode(device const bf16 *q            [[buffer(0)]],   // (B, N
 instantiate_mla_decode(512, 64);
 
 // ---------------------------------------------------------------------------
+// P4v2: mla_decode_partition — the P4 decode with a v2-style sequence-partition grid axis
+// (grid (H, B, P), one simdgroup per (head, partition)), emitting paged_attention_v2-style
+// partials (per-partition normalized acc, max logit, exp sum) combined by the existing
+// paged_attention_reduce<bf16, LATENT> kernel. Occupancy at long context, like v2's 2-5x
+// over v1. A multi-head threadgroup-staged variant (4 heads sharing each staged token block)
+// was tried and REJECTED: 1.5-1.6x slower at 32 heads — the cache already serves the
+// cross-head reuse, and the per-8-token barriers cost more than the reads they save (the
+// same lesson as paged_attention_gqa_staged and gemm_staged).
+// ---------------------------------------------------------------------------
+template <int LATENT, int ROPE>
+kernel void mla_decode_partition(
+    device const bf16 *q            [[buffer(0)]],   // (B, N, QK)
+    device const bf16 *kv_cache     [[buffer(1)]],   // (nb, bs, QK)
+    device const int  *block_table  [[buffer(2)]],
+    device const int  *context_lens [[buffer(3)]],
+    device float      *tmp_out      [[buffer(4)]],   // (B, N, P, LATENT)
+    device float      *max_logits   [[buffer(5)]],   // (B, N, P)
+    device float      *exp_sums     [[buffer(6)]],   // (B, N, P)
+    constant int &block_size        [[buffer(7)]],
+    constant int &block_table_stride [[buffer(8)]],
+    constant float &scale           [[buffer(9)]],
+    constant int &num_heads         [[buffer(10)]],
+    constant int &num_partitions    [[buffer(11)]],
+    constant int &partition_size    [[buffer(12)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr int QK = LATENT + ROPE;
+    constexpr int VPL_QK = QK / 32;        // query values per lane (dot width)
+    constexpr int VPL_AV = LATENT / 32;    // latent values per lane (accumulate width)
+    constexpr float MLA_NEG_INF = -3.4028234663852886e38f;   // must match paged_attention_reduce
+    const int head  = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int part  = (int)tgid.z;
+    const int context_len = context_lens[batch];
+    const int t_beg = part * partition_size;
+    const int t_end = metal::min(context_len, t_beg + partition_size);
+
+    float qv[VPL_QK], acc[VPL_AV];
+    const long q_base = ((long)batch * num_heads + head) * QK;
+    for (int i = 0; i < VPL_QK; ++i) qv[i] = float(q[q_base + lane + 32 * i]);
+    for (int i = 0; i < VPL_AV; ++i) acc[i] = 0.0f;
+    float m = MLA_NEG_INF, l = 0.0f;
+
+    for (int t = t_beg; t < t_end; ++t) {
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) { continue; }
+        const long cache_base = ((long)block * block_size + slot) * QK;   // MQA: no head axis
+
+        float partial = 0.0f;
+        for (int i = 0; i < VPL_QK; ++i)
+            partial += qv[i] * float(kv_cache[cache_base + lane + 32 * i]);
+        const float score = metal::simd_sum(partial) * scale;
+        const float new_m = metal::max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : metal::exp(m - new_m);
+        const float beta = metal::exp(score - new_m);
+        for (int i = 0; i < VPL_AV; ++i)      // value = the latent part only
+            acc[i] = acc[i] * alpha + beta * float(kv_cache[cache_base + lane + 32 * i]);
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    const long stat = ((long)batch * num_heads + head) * num_partitions + part;
+    const long ob = stat * LATENT;
+    for (int i = 0; i < VPL_AV; ++i)
+        tmp_out[ob + lane + 32 * i] = l == 0.0f ? 0.0f : acc[i] / l;
+    if (lane == 0) {
+        max_logits[stat] = l == 0.0f ? MLA_NEG_INF : m;
+        exp_sums[stat] = l;
+    }
+}
+
+#define instantiate_mla_decode_partition(LVAL, RVAL)                            \
+  template [[host_name("mla_decode_partition_" #LVAL "_" #RVAL)]] [[kernel]]     \
+  void mla_decode_partition<LVAL, RVAL>(                                         \
+      device const bf16 *q [[buffer(0)]],                                       \
+      device const bf16 *kv_cache [[buffer(1)]],                                \
+      device const int  *block_table [[buffer(2)]],                             \
+      device const int  *context_lens [[buffer(3)]],                            \
+      device float      *tmp_out [[buffer(4)]],                                 \
+      device float      *max_logits [[buffer(5)]],                              \
+      device float      *exp_sums [[buffer(6)]],                                \
+      constant int &block_size [[buffer(7)]],                                   \
+      constant int &block_table_stride [[buffer(8)]],                           \
+      constant float &scale [[buffer(9)]],                                      \
+      constant int &num_heads [[buffer(10)]],                                   \
+      constant int &num_partitions [[buffer(11)]],                              \
+      constant int &partition_size [[buffer(12)]],                              \
+      uint3 tgid [[threadgroup_position_in_grid]],                              \
+      uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_mla_decode_partition(512, 64);
+
+// ---------------------------------------------------------------------------
 // P4a: mla_decode_fp8 — DeepSeek-V4 dense latent decode over the UE8M0-packed cache (P3). The V4
 // latent is 512 = [448 NoPE | 64 RoPE], and (unlike classic MLA) BOTH the score and the value are
 // over the full 512 (rope included), scale = 512^-0.5. Per cached token this dequantizes the 448

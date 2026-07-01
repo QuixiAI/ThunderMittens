@@ -456,7 +456,7 @@ def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
 
 
 def paged_attention_v2(q, key_cache, value_cache, block_table, context_lens,
-                       scale=0.0, partition_size=512):
+                       scale=0.0, partition_size=256):
     """Long-context paged decode attention (partition/reduce). GQA/MQA aware.
 
     q/out (B,H,D); caches (num_blocks, block_size, num_kv_heads, D). Accepts
@@ -471,7 +471,7 @@ def paged_attention_v2(q, key_cache, value_cache, block_table, context_lens,
 
 
 def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
-                           k_scale, v_scale, scale=0.0, partition_size=512, fmt="e4m3"):
+                           k_scale, v_scale, scale=0.0, partition_size=256, fmt="e4m3"):
     """Long-context paged decode over an fp8 (uint8) cache, dequantized on read. GQA/MQA aware.
 
     k_scale/v_scale: plain float (per-tensor) or a (num_kv_heads,) array (per-head).

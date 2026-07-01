@@ -701,9 +701,21 @@ static at::Tensor mla_decode_mps(
   auto bt = block_table_in.contiguous(), cl = context_lens_in.contiguous();
   auto out = at::empty({B, N, latent}, q.options());
   const float scale_f = scale > 0.0 ? static_cast<float>(scale) : 1.0f / std::sqrt(576.0f);
+  // P4v2 route: partitioned multi-head decode + paged-v2 reduce (see mla.metal for rationale)
+  const int block_size = static_cast<int>(cache.size(1));
+  const int max_ctx = static_cast<int>(bt.size(1)) * block_size;
+  int psize = ((512 + block_size - 1) / block_size) * block_size;
+  const int P = std::max(1, (max_ctx + psize - 1) / psize);
+  auto f32 = q.options().dtype(at::kFloat);
+  auto tmp_out = at::empty({B, N, P, latent}, f32);
+  auto max_logits = at::empty({B, N, P}, f32);
+  auto exp_sums = at::empty({B, N, P}, f32);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_mla_decode(e, q, cache, bt, cl, out, B, N, static_cast<int>(cache.size(1)),
-                          static_cast<int>(bt.size(1)), scale_f, latent, 64);
+    tk::launch_mla_decode_partition(e, q, cache, bt, cl, tmp_out, max_logits, exp_sums, B, N,
+                                    block_size, static_cast<int>(bt.size(1)), scale_f, latent,
+                                    64, P, psize);
+    tk::launch_paged_attention_reduce(e, tmp_out, max_logits, exp_sums, out, B, N, latent, P,
+                                      "bfloat16");
   });
   return out;
 }

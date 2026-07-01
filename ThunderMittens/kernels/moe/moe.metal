@@ -226,6 +226,117 @@ kernel void moe_grouped_gemm(device T *out                       [[buffer(0)]],
 instantiate_moe_grouped_gemm(float32, float)
 instantiate_moe_grouped_gemm(bfloat16, bf16)
 
+// ---------------------------------------------------------------------------
+// Rectangular grouped GEMM: out(total_rows, N_out) = A(total_rows, K_dim) @ W[e](K_dim, N_out).
+// Same segmented single-expert-per-tile structure, but the contraction (K_dim) and output width
+// (N_out) are decoupled (the square moe_grouped_gemm is the K_dim==N_out==H case). Serves the MoE
+// MLP's GEMM2 (inter -> H) directly. W is (E, K_dim, N_out); grid (N_out/32, total_rows/32).
+// ---------------------------------------------------------------------------
+template <typename T, unsigned N_BLOCK, unsigned K_BLOCK, unsigned M_BLOCK>
+kernel void moe_grouped_gemm_rect(device T *out                    [[buffer(0)]],
+                                  device T *A                      [[buffer(1)]],
+                                  device T *W                      [[buffer(2)]],
+                                  device const int *expert_of_tile [[buffer(3)]],
+                                  constant int &total_rows         [[buffer(4)]],
+                                  constant int &K_dim              [[buffer(5)]],
+                                  constant int &N_out              [[buffer(6)]],
+                                  uint3 threadgroup_id [[threadgroup_position_in_grid]],
+                                  uint  simd_lane_id   [[thread_index_in_simdgroup]]) {
+    const int OY = (int)threadgroup_id.y;    // row-tile
+    const int OX = (int)threadgroup_id.x;    // output column-tile (in N_out)
+    const int e = expert_of_tile[OY];
+
+    using global_layout = gl<T, 1, 1, -1, -1>;
+    global_layout gl_a(A, nullptr, nullptr, total_rows, K_dim);
+    global_layout gl_w(W + (long)e * K_dim * N_out, nullptr, nullptr, K_dim, N_out);
+    global_layout gl_d(out, nullptr, nullptr, total_rows, N_out);
+
+    constexpr const int N_BE = N_BLOCK * TILE_DIM, M_BE = M_BLOCK * TILE_DIM, K_BE = K_BLOCK * TILE_DIM;
+    rt<T, N_BE, K_BE> a_reg;
+    rt<T, K_BE, M_BE> b_reg;
+    rt<float, N_BE, M_BE> d_reg;
+    zero(d_reg);
+    for (int k = 0; k < K_dim / K_BE; k++) {
+        load(a_reg, gl_a, {0, 0, OY, k}, simd_lane_id);
+        load(b_reg, gl_w, {0, 0, k, OX}, simd_lane_id);
+        mma_AB(d_reg, a_reg, b_reg, d_reg);
+    }
+    store(gl_d, d_reg, {0, 0, OY, OX}, simd_lane_id);
+}
+
+// ---------------------------------------------------------------------------
+// Fused SiLU-GLU GEMM1: out(total_rows, inter) = silu(A @ W1_gate) * (A @ W1_up), where W1[e] is
+// (H, 2*inter) laid out [gate(inter) | up(inter)]. Each inter output tile accumulates the gate and
+// up 32-col tiles then applies register-tile silu + tile*tile mul — one pass, intermediate traffic
+// is inter (not 2*inter). grid (inter/32, total_rows/32).
+// ---------------------------------------------------------------------------
+template <typename T, unsigned N_BLOCK, unsigned K_BLOCK, unsigned M_BLOCK>
+kernel void moe_grouped_gemm_swiglu(device T *out                    [[buffer(0)]],
+                                    device T *A                      [[buffer(1)]],
+                                    device T *W1                     [[buffer(2)]],
+                                    device const int *expert_of_tile [[buffer(3)]],
+                                    constant int &total_rows         [[buffer(4)]],
+                                    constant int &H                  [[buffer(5)]],
+                                    constant int &inter              [[buffer(6)]],
+                                    uint3 threadgroup_id [[threadgroup_position_in_grid]],
+                                    uint  simd_lane_id   [[thread_index_in_simdgroup]]) {
+    const int OY = (int)threadgroup_id.y;
+    const int OX = (int)threadgroup_id.x;    // output column-tile in inter
+    const int e = expert_of_tile[OY];
+
+    constexpr const int N_BE = N_BLOCK * TILE_DIM, M_BE = M_BLOCK * TILE_DIM, K_BE = K_BLOCK * TILE_DIM;
+    using global_layout = gl<T, 1, 1, -1, -1>;
+    global_layout gl_a(A, nullptr, nullptr, total_rows, H);
+    global_layout gl_w(W1 + (long)e * H * (2 * inter), nullptr, nullptr, H, 2 * inter);
+    global_layout gl_d(out, nullptr, nullptr, total_rows, inter);
+    const int up_tile = inter / M_BE + OX;   // up-half column-tile
+
+    rt<T, N_BE, K_BE> a_reg;
+    rt<T, K_BE, M_BE> bg_reg, bu_reg;
+    rt<float, N_BE, M_BE> gate, up;
+    zero(gate);
+    zero(up);
+    for (int k = 0; k < H / K_BE; k++) {
+        load(a_reg, gl_a, {0, 0, OY, k}, simd_lane_id);
+        load(bg_reg, gl_w, {0, 0, k, OX}, simd_lane_id);
+        load(bu_reg, gl_w, {0, 0, k, up_tile}, simd_lane_id);
+        mma_AB(gate, a_reg, bg_reg, gate);
+        mma_AB(up, a_reg, bu_reg, up);
+    }
+    silu(gate, gate);          // silu(gate)
+    mul(gate, gate, up);       // * up
+    store(gl_d, gate, {0, 0, OY, OX}, simd_lane_id);
+}
+
+#define instantiate_moe_grouped_gemm_rect(type_name, T)                        \
+  template [[host_name("moe_grouped_gemm_rect_" #type_name)]] [[kernel]] void   \
+  moe_grouped_gemm_rect<T, 4, 2, 4>(device T *out [[buffer(0)]],               \
+                                    device T *A [[buffer(1)]],                 \
+                                    device T *W [[buffer(2)]],                 \
+                                    device const int *expert_of_tile [[buffer(3)]], \
+                                    constant int &total_rows [[buffer(4)]],    \
+                                    constant int &K_dim [[buffer(5)]],         \
+                                    constant int &N_out [[buffer(6)]],         \
+                                    uint3 threadgroup_id [[threadgroup_position_in_grid]], \
+                                    uint simd_lane_id [[thread_index_in_simdgroup]]);
+
+#define instantiate_moe_grouped_gemm_swiglu(type_name, T)                      \
+  template [[host_name("moe_grouped_gemm_swiglu_" #type_name)]] [[kernel]] void \
+  moe_grouped_gemm_swiglu<T, 4, 2, 4>(device T *out [[buffer(0)]],            \
+                                      device T *A [[buffer(1)]],              \
+                                      device T *W1 [[buffer(2)]],             \
+                                      device const int *expert_of_tile [[buffer(3)]], \
+                                      constant int &total_rows [[buffer(4)]],  \
+                                      constant int &H [[buffer(5)]],           \
+                                      constant int &inter [[buffer(6)]],       \
+                                      uint3 threadgroup_id [[threadgroup_position_in_grid]], \
+                                      uint simd_lane_id [[thread_index_in_simdgroup]]);
+
+instantiate_moe_grouped_gemm_rect(float32, float)
+instantiate_moe_grouped_gemm_rect(bfloat16, bf16)
+instantiate_moe_grouped_gemm_swiglu(float32, float)
+instantiate_moe_grouped_gemm_swiglu(bfloat16, bf16)
+
 #define instantiate_moe_finalize(type_name, T)                                 \
   template [[host_name("moe_finalize_" #type_name)]] [[kernel]] void           \
   moe_finalize<T>(device const T *expert_out [[buffer(0)]],                    \

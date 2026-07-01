@@ -478,6 +478,22 @@ def moe_grouped_gemm(permuted_input, W, expert_of_tile):
     return _mlx().moe_grouped_gemm(permuted_input, W, expert_of_tile)
 
 
+def moe_grouped_gemm_rect(A, W, expert_of_tile):
+    """Rectangular grouped expert GEMM: out(rows,N_out) = A(rows,K_dim) @ W[e](K_dim,N_out).
+    W (E,K_dim,N_out); K_dim%16, N_out%32, rows%32. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(A):
+        return _torch().moe_grouped_gemm_rect(A, W, expert_of_tile)
+    return _mlx().moe_grouped_gemm_rect(A, W, expert_of_tile)
+
+
+def moe_grouped_gemm_swiglu(A, W1, expert_of_tile):
+    """Fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate) * (A@W1_up). W1[e] (H, 2*inter),
+    laid out [gate | up]. H%16, inter%32, rows%32. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(A):
+        return _torch().moe_grouped_gemm_swiglu(A, W1, expert_of_tile)
+    return _mlx().moe_grouped_gemm_swiglu(A, W1, expert_of_tile)
+
+
 def moe_finalize(expert_out, inv_idx, topk_weights, k):
     """out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim).
 

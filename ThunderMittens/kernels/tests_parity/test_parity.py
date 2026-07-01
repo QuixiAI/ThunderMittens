@@ -150,6 +150,41 @@ def test_moe_grouped_gemm_parity(H):
     _assert_parity(om, ot, atol=6e-2)
 
 
+def _moe_padded_eot(counts):
+    padded = [((c + 31) // 32) * 32 for c in counts]
+    off_pad = np.concatenate([[0], np.cumsum(padded)]).astype(np.int64)
+    total = int(off_pad[-1])
+    tb = off_pad // 32
+    eot = np.zeros(total // 32, np.int32)
+    for e in range(len(counts)):
+        eot[tb[e]:tb[e + 1]] = e
+    return total, eot
+
+
+@pytest.mark.parametrize("K_dim,N_out", [(64, 96), (128, 64)])
+def test_moe_grouped_gemm_rect_parity(K_dim, N_out):
+    rng = np.random.default_rng(51)
+    E = 4
+    total, eot = _moe_padded_eot([40, 5, 70, 20])
+    A = (0.1 * rng.standard_normal((total, K_dim))).astype(np.float32)
+    W = (0.1 * rng.standard_normal((E, K_dim, N_out))).astype(np.float32)
+    om = tk.moe_grouped_gemm_rect(_mk(A, "mlx"), _mk(W, "mlx"), mx.array(eot))
+    ot = tk.moe_grouped_gemm_rect(_mk(A, "torch"), _mk(W, "torch"), torch.from_numpy(eot).to("mps"))
+    _assert_parity(om, ot, atol=6e-2)
+
+
+@pytest.mark.parametrize("H,inter", [(64, 32), (128, 64)])
+def test_moe_grouped_gemm_swiglu_parity(H, inter):
+    rng = np.random.default_rng(52)
+    E = 4
+    total, eot = _moe_padded_eot([40, 5, 70, 20])
+    A = (0.1 * rng.standard_normal((total, H))).astype(np.float32)
+    W1 = (0.1 * rng.standard_normal((E, H, 2 * inter))).astype(np.float32)
+    om = tk.moe_grouped_gemm_swiglu(_mk(A, "mlx"), _mk(W1, "mlx"), mx.array(eot))
+    ot = tk.moe_grouped_gemm_swiglu(_mk(A, "torch"), _mk(W1, "torch"), torch.from_numpy(eot).to("mps"))
+    _assert_parity(om, ot, atol=6e-2)
+
+
 @pytest.mark.parametrize("E,K", [(8, 2), (64, 4)])
 def test_moe_route_topk_parity(E, K):
     rng = np.random.default_rng(0)

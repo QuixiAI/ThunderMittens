@@ -1108,6 +1108,42 @@ static at::Tensor moe_grouped_gemm_mps(const at::Tensor& pi_in, const at::Tensor
   return out;
 }
 
+static at::Tensor moe_grouped_gemm_rect_mps(const at::Tensor& A_in, const at::Tensor& W_in,
+                                            const at::Tensor& eot_in) {
+  TORCH_CHECK(A_in.device().is_mps() && tk_is_float_dtype(A_in), "moe_grouped_gemm_rect: A float MPS");
+  TORCH_CHECK(A_in.dim() == 2 && W_in.dim() == 3, "moe_grouped_gemm_rect: A (rows,K), W (E,K,N)");
+  const int total_rows = A_in.size(0), K_dim = A_in.size(1), N_out = W_in.size(2);
+  TORCH_CHECK(total_rows % 32 == 0 && K_dim % 16 == 0 && N_out % 32 == 0,
+              "moe_grouped_gemm_rect: rows%32, K%16, N%32");
+  TORCH_CHECK(W_in.size(1) == K_dim, "moe_grouped_gemm_rect: W must be (E,K_dim,N_out)");
+  auto A = A_in.contiguous(), W = W_in.contiguous();
+  auto eot = eot_in.to(at::kInt).contiguous();
+  auto out = at::empty({total_rows, N_out}, A.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_grouped_gemm_rect(e, out, A, W, eot, total_rows, K_dim, N_out, tk_type_name(A));
+  });
+  return out;
+}
+
+static at::Tensor moe_grouped_gemm_swiglu_mps(const at::Tensor& A_in, const at::Tensor& W1_in,
+                                              const at::Tensor& eot_in) {
+  TORCH_CHECK(A_in.device().is_mps() && tk_is_float_dtype(A_in), "moe_grouped_gemm_swiglu: A float MPS");
+  TORCH_CHECK(A_in.dim() == 2 && W1_in.dim() == 3, "moe_grouped_gemm_swiglu: A (rows,H), W1 (E,H,2*inter)");
+  const int total_rows = A_in.size(0), H = A_in.size(1);
+  TORCH_CHECK(W1_in.size(2) % 2 == 0, "moe_grouped_gemm_swiglu: W1 last dim must be 2*inter");
+  const int inter = W1_in.size(2) / 2;
+  TORCH_CHECK(total_rows % 32 == 0 && H % 16 == 0 && inter % 32 == 0,
+              "moe_grouped_gemm_swiglu: rows%32, H%16, inter%32");
+  TORCH_CHECK(W1_in.size(1) == H, "moe_grouped_gemm_swiglu: W1 must be (E,H,2*inter)");
+  auto A = A_in.contiguous(), W1 = W1_in.contiguous();
+  auto eot = eot_in.to(at::kInt).contiguous();
+  auto out = at::empty({total_rows, inter}, A.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_grouped_gemm_swiglu(e, out, A, W1, eot, total_rows, H, inter, tk_type_name(A));
+  });
+  return out;
+}
+
 // MoE finalize: out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim).
 static at::Tensor moe_finalize_mps(const at::Tensor& expert_out_in, const at::Tensor& inv_in,
                                    const at::Tensor& w_in, int64_t k) {
@@ -1769,6 +1805,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_route_topk", &moe_route_topk_mps, "ThunderMittens MoE top-k routing (MPS)");
   m.def("moe_permute", &moe_permute_mps, "ThunderMittens MoE permute (MPS)");
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
+  m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
+  m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
   m.def("moe_finalize", &moe_finalize_mps, "ThunderMittens MoE finalize reduce (MPS)");
   m.def("argmax_sample", &argmax_sample_mps, "ThunderMittens greedy argmax sampling (MPS)");
   m.def("sample_categorical", &sample_categorical_mps, "ThunderMittens Gumbel-max sampling (MPS)");

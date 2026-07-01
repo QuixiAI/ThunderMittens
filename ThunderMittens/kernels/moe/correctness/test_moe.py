@@ -10,7 +10,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import moe_route_topk, moe_permute, moe_finalize, moe_grouped_gemm
+from tk import (moe_route_topk, moe_permute, moe_finalize, moe_grouped_gemm,
+                moe_grouped_gemm_rect, moe_grouped_gemm_swiglu)
 
 _MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 
@@ -195,6 +196,101 @@ def test_moe_forward_grouped_gemm(E, K):
     for t in range(T):
         for j in range(K):
             ref[t] += w_np[t, j] * (x[t] @ W[ids_np[t, j]])
+    np.testing.assert_allclose(y, ref, atol=1e-2, rtol=1e-2)
+
+
+def _silu(x):
+    return x / (1.0 + np.exp(-x))
+
+
+@pytest.mark.parametrize("dtype,atol", [("float32", 3e-4), ("bfloat16", 8e-2)])
+@pytest.mark.parametrize("K_dim,N_out", [(64, 96), (128, 64)])
+def test_moe_grouped_gemm_rect(dtype, atol, K_dim, N_out):
+    rng = np.random.default_rng(9)
+    E = 4
+    counts = [40, 5, 70, 20]
+    off_pad, total, eot = _padded_schedule(counts)
+    A = (0.1 * rng.standard_normal((total, K_dim))).astype(np.float32)
+    W = (0.1 * rng.standard_normal((E, K_dim, N_out))).astype(np.float32)
+    md = {"float32": mx.float32, "bfloat16": mx.bfloat16}[dtype]
+    out = moe_grouped_gemm_rect(mx.array(A).astype(md), mx.array(W).astype(md), mx.array(eot))
+    mx.eval(out)
+    ref = np.zeros((total, N_out), np.float32)
+    Ar = np.array(mx.array(A).astype(md).astype(mx.float32))
+    Wr = np.array(mx.array(W).astype(md).astype(mx.float32))
+    for e in range(E):
+        s, en = int(off_pad[e]), int(off_pad[e + 1])
+        ref[s:en] = Ar[s:en] @ Wr[e]
+    np.testing.assert_allclose(np.array(out.astype(mx.float32)), ref, atol=atol, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype,atol", [("float32", 3e-4), ("bfloat16", 8e-2)])
+@pytest.mark.parametrize("H,inter", [(64, 32), (128, 64)])
+def test_moe_grouped_gemm_swiglu(dtype, atol, H, inter):
+    rng = np.random.default_rng(10)
+    E = 4
+    counts = [40, 5, 70, 20]
+    off_pad, total, eot = _padded_schedule(counts)
+    A = (0.1 * rng.standard_normal((total, H))).astype(np.float32)
+    W1 = (0.1 * rng.standard_normal((E, H, 2 * inter))).astype(np.float32)
+    md = {"float32": mx.float32, "bfloat16": mx.bfloat16}[dtype]
+    out = moe_grouped_gemm_swiglu(mx.array(A).astype(md), mx.array(W1).astype(md), mx.array(eot))
+    mx.eval(out)
+    Ar = np.array(mx.array(A).astype(md).astype(mx.float32))
+    Wr = np.array(mx.array(W1).astype(md).astype(mx.float32))
+    ref = np.zeros((total, inter), np.float32)
+    for e in range(E):
+        s, en = int(off_pad[e]), int(off_pad[e + 1])
+        g = Ar[s:en] @ Wr[e, :, :inter]
+        u = Ar[s:en] @ Wr[e, :, inter:]
+        ref[s:en] = _silu(g) * u
+    np.testing.assert_allclose(np.array(out.astype(mx.float32)), ref, atol=atol, rtol=2e-2)
+
+
+@pytest.mark.parametrize("E,K", [(8, 2), (16, 4)])
+def test_moe_mlp_swiglu_forward(E, K):
+    # Full SwiGLU MoE MLP: route -> permute -> GEMM1(+silu-glu) -> GEMM2 -> finalize, vs a dense ref.
+    rng = np.random.default_rng(11)
+    T, H, inter = 40, 64, 128
+    x = (0.1 * rng.standard_normal((T, H))).astype(np.float32)
+    rl = rng.standard_normal((T, E)).astype(np.float32)
+    W1 = (0.1 * rng.standard_normal((E, H, 2 * inter))).astype(np.float32)
+    W2 = (0.1 * rng.standard_normal((E, inter, H))).astype(np.float32)
+    xm = mx.array(x)
+
+    ids, weights = moe_route_topk(mx.array(rl), K)
+    sidx, offsets, inv = moe_permute(ids, E)
+    mx.eval(ids, weights, sidx, offsets, inv)
+    ids_np, w_np = np.array(ids), np.array(weights)
+    off, sidx_np, inv_np = np.array(offsets), np.array(sidx), np.array(inv)
+
+    counts = np.diff(off)
+    off_pad = np.concatenate([[0], np.cumsum(((counts + 31) // 32) * 32)]).astype(np.int64)
+    total_pad = int(off_pad[-1])
+    tb = off_pad // 32
+    eot = np.zeros(total_pad // 32, np.int32)
+    for e in range(E):
+        eot[tb[e]:tb[e + 1]] = e
+    padpos = np.zeros(len(sidx_np), np.int64)
+    for e in range(E):
+        s, en = int(off[e]), int(off[e + 1])
+        padpos[s:en] = off_pad[e] + np.arange(en - s)
+    gather_idx = np.zeros(total_pad, np.int64)
+    gather_idx[padpos] = sidx_np // K
+
+    px = xm[mx.array(gather_idx)]
+    h = moe_grouped_gemm_swiglu(px, mx.array(W1), mx.array(eot))     # (total_pad, inter)
+    op = moe_grouped_gemm_rect(h, mx.array(W2), mx.array(eot))       # (total_pad, H)
+    inv_pad = mx.array(padpos[inv_np].astype(np.int32))
+    y = np.array(moe_finalize(op, inv_pad, mx.array(w_np), K))
+
+    ref = np.zeros((T, H), np.float32)
+    for t in range(T):
+        for j in range(K):
+            e = ids_np[t, j]
+            g = x[t] @ W1[e, :, :inter]
+            u = x[t] @ W1[e, :, inter:]
+            ref[t] += w_np[t, j] * ((_silu(g) * u) @ W2[e])
     np.testing.assert_allclose(y, ref, atol=1e-2, rtol=1e-2)
 
 

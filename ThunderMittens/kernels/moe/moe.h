@@ -42,6 +42,16 @@ array moe_finalize(
 array moe_grouped_gemm(
     const array& permuted_input, const array& W, const array& expert_of_tile, StreamOrDevice s = {});
 
+/** Rectangular grouped GEMM: out (total_rows, N_out) = A (total_rows, K_dim) @ W[e] (K_dim, N_out).
+ *  W is (E, K_dim, N_out); K_dim % 16 == 0, N_out % 32 == 0, total_rows % 32 == 0. **/
+array moe_grouped_gemm_rect(
+    const array& A, const array& W, const array& expert_of_tile, StreamOrDevice s = {});
+
+/** Fused SiLU-GLU GEMM1: out (total_rows, inter) = silu(A @ W1_gate) * (A @ W1_up).
+ *  A (total_rows, H); W1 (E, H, 2*inter) laid out [gate | up]. H % 16 == 0, inter % 32 == 0. **/
+array moe_grouped_gemm_swiglu(
+    const array& A, const array& W1, const array& expert_of_tile, StreamOrDevice s = {});
+
 class MoeRouteTopk : public Primitive {
  public:
   MoeRouteTopk(Stream stream, int k) : Primitive(stream), k_(k) {}
@@ -100,6 +110,40 @@ class MoeGroupedGemm : public Primitive {
       const std::vector<array>&, const std::vector<int>&) override;
   const char* name() const { return "MoeGroupedGemm"; }
   void print(std::ostream& os) override { os << "MoeGroupedGemm"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class MoeGroupedGemmRect : public Primitive {
+ public:
+  explicit MoeGroupedGemmRect(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeGroupedGemmRect"; }
+  void print(std::ostream& os) override { os << "MoeGroupedGemmRect"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class MoeGroupedGemmSwiglu : public Primitive {
+ public:
+  explicit MoeGroupedGemmSwiglu(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeGroupedGemmSwiglu"; }
+  void print(std::ostream& os) override { os << "MoeGroupedGemmSwiglu"; }
   bool is_equivalent(const Primitive&) const override { return true; }
 };
 

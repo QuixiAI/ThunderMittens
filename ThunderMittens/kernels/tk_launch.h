@@ -41,6 +41,8 @@ inline std::string argmax_kernel_name(const std::string& t) { return "argmax_" +
 inline std::string moe_route_topk_kernel_name(const std::string& t) { return "moe_route_topk_" + t; }
 inline std::string moe_finalize_kernel_name(const std::string& t) { return "moe_finalize_" + t; }
 inline std::string moe_grouped_gemm_kernel_name(const std::string& t) { return "moe_grouped_gemm_" + t; }
+inline std::string moe_grouped_gemm_rect_kernel_name(const std::string& t) { return "moe_grouped_gemm_rect_" + t; }
+inline std::string moe_grouped_gemm_swiglu_kernel_name(const std::string& t) { return "moe_grouped_gemm_swiglu_" + t; }
 inline std::string sample_categorical_kernel_name(const std::string& t) { return "sample_categorical_" + t; }
 inline std::string top_k_sample_kernel_name(const std::string& t) { return "top_k_sample_" + t; }
 inline std::string top_p_sample_kernel_name(const std::string& t) { return "top_p_sample_" + t; }
@@ -289,6 +291,28 @@ void launch_moe_grouped_gemm(Enc& e, typename Enc::out_t out, typename Enc::in_t
   e.out(out, 0); e.in(A, 1); e.in(W, 2); e.in(expert_of_tile, 3);
   e.bytes(total_rows, 4); e.bytes(H, 5);
   e.dispatch(H / 32, total_rows / 32, 1, 32, 1, 1);
+}
+
+// Rectangular grouped GEMM: out(total_rows,N_out)=A(total_rows,K_dim)@W[e](K_dim,N_out). grid (N_out/32, rows/32).
+template <class Enc>
+void launch_moe_grouped_gemm_rect(Enc& e, typename Enc::out_t out, typename Enc::in_t A,
+                                  typename Enc::in_t W, typename Enc::in_t expert_of_tile,
+                                  int total_rows, int K_dim, int N_out, const std::string& type_name) {
+  e.pipeline(moe_grouped_gemm_rect_kernel_name(type_name));
+  e.out(out, 0); e.in(A, 1); e.in(W, 2); e.in(expert_of_tile, 3);
+  e.bytes(total_rows, 4); e.bytes(K_dim, 5); e.bytes(N_out, 6);
+  e.dispatch(N_out / 32, total_rows / 32, 1, 32, 1, 1);
+}
+
+// Fused SiLU-GLU GEMM1: out(total_rows,inter)=silu(A@W1_gate)*(A@W1_up), W1[e] (H,2*inter). grid (inter/32, rows/32).
+template <class Enc>
+void launch_moe_grouped_gemm_swiglu(Enc& e, typename Enc::out_t out, typename Enc::in_t A,
+                                    typename Enc::in_t W1, typename Enc::in_t expert_of_tile,
+                                    int total_rows, int H, int inter, const std::string& type_name) {
+  e.pipeline(moe_grouped_gemm_swiglu_kernel_name(type_name));
+  e.out(out, 0); e.in(A, 1); e.in(W1, 2); e.in(expert_of_tile, 3);
+  e.bytes(total_rows, 4); e.bytes(H, 5); e.bytes(inter, 6);
+  e.dispatch(inter / 32, total_rows / 32, 1, 32, 1, 1);
 }
 
 // ----- moe_finalize: expert_out@0 inv_idx@1(i32) topk_weights@2(f32) -> out@3 ; K@4 Hdim@5 ;

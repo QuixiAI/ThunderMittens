@@ -47,7 +47,6 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "hedgehog", "hedgehog.metal"),
     os.path.join(_KERNELS, "lin_attn_causal", "lin_attn_causal.metal"),
     os.path.join(_KERNELS, "mamba2", "mamba2.metal"),
-    os.path.join(_KERNELS, "mamba2_bwd", "mamba2_bwd.metal"),
     os.path.join(_KERNELS, "lin_attn_decay", "lin_attn_decay.metal"),
     os.path.join(_KERNELS, "based", "based.metal"),
     os.path.join(_KERNELS, "attn_bwd", "attn_bwd.metal"),
@@ -379,6 +378,16 @@ def moe_permute(topk_ids: torch.Tensor, num_experts: int):
 def moe_grouped_gemm(permuted_input, W, expert_of_tile):
     """Fused grouped expert GEMM: out = permuted_input @ W[expert]. Returns (total_rows, H). MPS."""
     return _ext.moe_grouped_gemm(permuted_input, W, expert_of_tile)
+
+
+def moe_grouped_gemm_rect(A, W, expert_of_tile):
+    """Rectangular grouped GEMM: out(rows,N_out) = A(rows,K_dim) @ W[e](K_dim,N_out). MPS."""
+    return _ext.moe_grouped_gemm_rect(A, W, expert_of_tile)
+
+
+def moe_grouped_gemm_swiglu(A, W1, expert_of_tile):
+    """Fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] (H,2*inter). MPS."""
+    return _ext.moe_grouped_gemm_swiglu(A, W1, expert_of_tile)
 
 
 def moe_finalize(expert_out: torch.Tensor, inv_idx: torch.Tensor, topk_weights: torch.Tensor, k: int):

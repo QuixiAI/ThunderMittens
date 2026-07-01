@@ -330,6 +330,16 @@ NB_MODULE(_ext, m) {
       R"(fused grouped expert GEMM: out = permuted_input @ W[expert]. Returns (total_rows, H).)");
 
     m.def(
+      "moe_grouped_gemm_rect", &moe_grouped_gemm_rect,
+      "A"_a, "W"_a, "expert_of_tile"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(rectangular grouped expert GEMM: out(rows,N_out) = A(rows,K_dim) @ W[e](K_dim,N_out).)");
+
+    m.def(
+      "moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu,
+      "A"_a, "W1"_a, "expert_of_tile"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
+
+    m.def(
       "moe_finalize",
       &moe_finalize,
       "expert_out"_a,

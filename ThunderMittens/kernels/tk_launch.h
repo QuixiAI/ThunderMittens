@@ -109,8 +109,6 @@ inline std::string linear_attn_kernel_name(int D) { return "linear_attn_" + std:
 inline std::string hedgehog_kernel_name(int D) { return "hedgehog_" + std::to_string(D); }
 inline std::string lin_attn_causal_kernel_name(int D) { return "lin_attn_causal_" + std::to_string(D); }
 inline std::string mamba2_kernel_name(int D) { return "mamba2_" + std::to_string(D); }
-inline std::string mamba2_bwd_i_kernel_name(int D) { return "mamba2_bwd_i_" + std::to_string(D); }
-inline std::string mamba2_bwd_j_kernel_name(int D) { return "mamba2_bwd_j_" + std::to_string(D); }
 inline std::string lin_attn_decay_kernel_name(int D) { return "lin_attn_decay_" + std::to_string(D); }
 inline std::string based_kernel_name(int DQK, int DVO) {
   return "based_" + std::to_string(DQK) + "_" + std::to_string(DVO);
@@ -401,10 +399,10 @@ void launch_top_p_sample(E& e, typename E::in_t logits, typename E::out_t out_id
 //        counts[(row,tok)] += 1 for each valid history token. Zero counts first. -----
 template <class E>
 void launch_penalty_histogram(E& e, typename E::in_t prev_tokens, typename E::out_t counts,
-                              int V, int L, int TL) {
+                              int V, int L, int TL, typename E::in_t parent_ids) {
   e.pipeline("penalty_histogram");
   e.in(prev_tokens, 0); e.out(counts, 1);
-  e.bytes(V, 2); e.bytes(L, 3); e.bytes(TL, 4);
+  e.bytes(V, 2); e.bytes(L, 3); e.bytes(TL, 4); e.in(parent_ids, 5);
   e.dispatch((TL + 255) / 256, 1, 1, 256, 1, 1);
 }
 
@@ -1042,26 +1040,6 @@ void launch_mamba2(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in
   e.pipeline(mamba2_kernel_name(D));
   e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(cumlog, 3); e.out(Y, 4);
   e.bytes(N, 5); e.bytes(H, 6);
-  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
-}
-
-// ----- mamba2 backward. C@0 Bm@1 X@2 dY@3 cumlog@4 -> dC@5 (bwd_i) / dB@5 dX@6 (bwd_j). -----
-template <class E>
-void launch_mamba2_bwd_i(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in_t X,
-                         typename E::in_t dY, typename E::in_t cumlog, typename E::out_t dC,
-                         unsigned N, unsigned H, int B, int D) {
-  e.pipeline(mamba2_bwd_i_kernel_name(D));
-  e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(dY, 3); e.in(cumlog, 4); e.out(dC, 5);
-  e.bytes(N, 6); e.bytes(H, 7);
-  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
-}
-template <class E>
-void launch_mamba2_bwd_j(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in_t X,
-                         typename E::in_t dY, typename E::in_t cumlog, typename E::out_t dB,
-                         typename E::out_t dX, unsigned N, unsigned H, int B, int D) {
-  e.pipeline(mamba2_bwd_j_kernel_name(D));
-  e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(dY, 3); e.in(cumlog, 4); e.out(dB, 5); e.out(dX, 6);
-  e.bytes(N, 7); e.bytes(H, 8);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 

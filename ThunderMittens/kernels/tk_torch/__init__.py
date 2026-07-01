@@ -490,15 +490,8 @@ def lin_attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 
 
 def mamba2(C: torch.Tensor, B: torch.Tensor, X: torch.Tensor, cumlog: torch.Tensor):
-    """Mamba-2 / SSD forward. C,B,X bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS; D in {64,128}, N%8."""
+    """Mamba-2 / SSD forward. C,B,X bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS; D=64, N%8."""
     return _ext.mamba2(C, B, X, cumlog)
-
-
-def mamba2_bwd(C: torch.Tensor, B: torch.Tensor, X: torch.Tensor, cumlog: torch.Tensor,
-               dY: torch.Tensor):
-    """Mamba-2 / SSD backward -> (dC, dB, dX). C,B,X,dY bf16 (B,H,N,D); cumlog fp32 (B,H,N).
-    MPS; D in {64,128}, N%8. dcumlog is <dY,Y>-<dX,X> on the host (not returned here)."""
-    return _ext.mamba2_bwd(C, B, X, cumlog, dY)
 
 
 def lin_attn_decay(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cl: torch.Tensor):

@@ -14,6 +14,7 @@ from tk import (
     kv_cache_scatter_fp8,
     paged_attention,
     paged_attention_alibi,
+    paged_attention_block_sparse,
     paged_attention_fp8,
     paged_attention_staged,
 )
@@ -293,6 +294,52 @@ def test_paged_attention_alibi(dtype, atol, D, H, H_KV):
         _np(qm).astype(np.float32), _np(km).astype(np.float32), _np(vm).astype(np.float32),
         block_table, context_lens, scale, slopes)
     np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=2e-3)
+
+
+@pytest.mark.parametrize("dtype,atol", [("float32", 3e-5), ("bfloat16", 2e-2)])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("H,H_KV", [(2, 2), (4, 1)])
+def test_paged_attention_block_sparse(dtype, atol, D, H, H_KV):
+    rng = np.random.default_rng(85 + D + H + H_KV)
+    B, num_blocks, block_size = 2, 8, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    key_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    value_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    block_table = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    context_lens = np.array([10, 16], dtype=np.int32)
+    block_mask = np.zeros((B, 4), dtype=np.int32)
+    block_mask[:, ::2] = 1          # attend only to even logical blocks
+    block_mask[:, 0] = 1            # always keep block 0 so every row has >=1 key
+    scale = 1.0 / math.sqrt(D)
+
+    qm = mx.array(q).astype(_mx_dtype(dtype))
+    km = mx.array(key_cache).astype(_mx_dtype(dtype))
+    vm = mx.array(value_cache).astype(_mx_dtype(dtype))
+    got = paged_attention_block_sparse(qm, km, vm, mx.array(block_table), mx.array(context_lens),
+                                       mx.array(block_mask), scale=0.0)
+    mx.eval(got)
+
+    # Oracle: same GQA softmax but skipping tokens in masked-out logical blocks.
+    B_, H_, D_ = q.shape
+    group = H_ // H_KV
+    out = np.zeros_like(q, np.float32)
+    for b in range(B_):
+        for h in range(H_):
+            kvh = h // group
+            sc, vs = [], []
+            for t in range(int(context_lens[b])):
+                bc = t // block_size
+                if block_mask[b, bc] == 0:
+                    continue
+                blk = block_table[b, bc]
+                slot = t % block_size
+                sc.append(float(np.dot(_np(qm)[b, h].astype(np.float32),
+                                       _np(km)[blk, slot, kvh].astype(np.float32)) * scale))
+                vs.append(_np(vm)[blk, slot, kvh].astype(np.float32))
+            s = np.array(sc, np.float32)
+            p = np.exp(s - s.max()); p /= p.sum()
+            out[b, h] = np.sum(p[:, None] * np.stack(vs), axis=0)
+    np.testing.assert_allclose(_np(got).astype(np.float32), out, atol=atol, rtol=2e-3)
 
 
 @pytest.mark.parametrize("dtype,atol", [("float32", 3e-5), ("bfloat16", 2e-2)])

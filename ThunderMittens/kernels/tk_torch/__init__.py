@@ -254,6 +254,13 @@ def paged_attention_alibi(q, key_cache, value_cache, block_table, context_lens, 
                                       alibi_slopes, float(scale))
 
 
+def paged_attention_block_sparse(q, key_cache, value_cache, block_table, context_lens, block_mask,
+                                 scale=0.0):
+    """Block-sparse paged decode; block_mask (batch, max_blocks) int (1=attend, 0=skip). MPS."""
+    return _ext.paged_attention_block_sparse(q, key_cache, value_cache, block_table, context_lens,
+                                             block_mask, float(scale))
+
+
 def paged_attention_staged(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
     """GQA KV-reuse staged decode; bit-equivalent to paged_attention. MPS."""
     return _ext.paged_attention_staged(q, key_cache, value_cache, block_table, context_lens,

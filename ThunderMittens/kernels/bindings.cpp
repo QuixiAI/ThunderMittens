@@ -548,6 +548,22 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "paged_attention_block_sparse",
+      &paged_attention_block_sparse,
+      "q"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      "block_mask"_a,
+      "scale"_a = 0.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        block-sparse paged decode; block_mask (batch, max_blocks) int32 (1=attend, 0=skip) per KV block.
+      )");
+
+    m.def(
       "paged_attention_staged",
       &paged_attention_staged,
       "q"_a,

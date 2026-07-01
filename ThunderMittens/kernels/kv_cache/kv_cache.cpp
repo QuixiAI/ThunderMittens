@@ -196,12 +196,13 @@ array paged_attention(
   auto table_c = contiguous(astype(block_table, int32, s), false, s);
   auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
   auto no_alibi = zeros({1}, float32, s);   // buffer 11 placeholder; use_alibi=0 ignores it
+  auto no_mask = zeros({1}, int32, s);      // buffer 13 placeholder; use_mask=0 ignores it
 
   return array(
       q.shape(),
       dtype,
-      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/false),
-      {q_c, key_c, value_c, table_c, lens_c, no_alibi});
+      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/false, /*use_mask=*/false),
+      {q_c, key_c, value_c, table_c, lens_c, no_alibi, no_mask});
 }
 
 array paged_attention_alibi(
@@ -243,11 +244,62 @@ array paged_attention_alibi(
   auto table_c = contiguous(astype(block_table, int32, s), false, s);
   auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
   auto slopes_c = contiguous(astype(alibi_slopes, float32, s), false, s);
+  auto no_mask = zeros({1}, int32, s);
   return array(
       q.shape(),
       dtype,
-      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/true),
-      {q_c, key_c, value_c, table_c, lens_c, slopes_c});
+      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/true, /*use_mask=*/false),
+      {q_c, key_c, value_c, table_c, lens_c, slopes_c, no_mask});
+}
+
+array paged_attention_block_sparse(
+    const array& q,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    const array& block_mask,
+    float scale,
+    StreamOrDevice s) {
+  if (q.ndim() != 3) {
+    throw std::invalid_argument("paged_attention_block_sparse: q must have shape (batch, num_heads, head_size)");
+  }
+  if (key_cache.ndim() != 4 || value_cache.ndim() != 4 || key_cache.shape() != value_cache.shape()) {
+    throw std::invalid_argument("paged_attention_block_sparse: caches must have shape (num_blocks, block_size, num_kv_heads, head_size)");
+  }
+  if (key_cache.shape(3) != q.shape(2)) {
+    throw std::invalid_argument("paged_attention_block_sparse: q head_size must match cache head_size");
+  }
+  if (key_cache.shape(2) <= 0 || q.shape(1) % key_cache.shape(2) != 0) {
+    throw std::invalid_argument("paged_attention_block_sparse: num_q_heads must be a positive multiple of num_kv_heads (GQA/MQA)");
+  }
+  if (block_table.ndim() != 2 || block_table.shape(0) != q.shape(0)) {
+    throw std::invalid_argument("paged_attention_block_sparse: block_table must have shape (batch, max_blocks)");
+  }
+  if (block_mask.shape() != block_table.shape()) {
+    throw std::invalid_argument("paged_attention_block_sparse: block_mask must match block_table shape (batch, max_blocks)");
+  }
+  const int D = q.shape(2);
+  if (!(D == 64 || D == 128)) {
+    throw std::invalid_argument("paged_attention_block_sparse: head_size must be 64 or 128");
+  }
+  auto dtype = promote_types(q.dtype(), key_cache.dtype());
+  dtype = promote_types(dtype, value_cache.dtype());
+  if (!is_supported_float(dtype)) {
+    throw std::invalid_argument("paged_attention_block_sparse: dtype must be float32, float16, or bfloat16");
+  }
+  auto q_c = contiguous_cast(q, dtype, s);
+  auto key_c = contiguous_cast(key_cache, dtype, s);
+  auto value_c = contiguous_cast(value_cache, dtype, s);
+  auto table_c = contiguous(astype(block_table, int32, s), false, s);
+  auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
+  auto no_alibi = zeros({1}, float32, s);
+  auto mask_c = contiguous(astype(block_mask, int32, s), false, s);
+  return array(
+      q.shape(),
+      dtype,
+      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/false, /*use_mask=*/true),
+      {q_c, key_c, value_c, table_c, lens_c, no_alibi, mask_c});
 }
 
 array paged_attention_staged(
@@ -438,6 +490,7 @@ void PagedAttention::eval_gpu(
   auto& block_table = inputs[3];
   auto& context_lens = inputs[4];
   auto& alibi_slopes = inputs[5];
+  auto& block_mask = inputs[6];
   auto& out = outputs[0];
 
   auto& s = stream();
@@ -465,6 +518,8 @@ void PagedAttention::eval_gpu(
       scale,
       alibi_slopes,
       use_alibi_ ? 1 : 0,
+      block_mask,
+      use_mask_ ? 1 : 0,
       type_to_name(q));
 }
 

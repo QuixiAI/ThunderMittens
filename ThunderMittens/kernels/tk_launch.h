@@ -661,6 +661,8 @@ void launch_paged_attention(
     float scale,
     typename E::in_t alibi_slopes,
     int use_alibi,
+    typename E::in_t block_mask,
+    int use_mask,
     const std::string& type_name) {
   e.pipeline(paged_attention_kernel_name(type_name, head_size));
   e.in(q, 0);
@@ -676,6 +678,8 @@ void launch_paged_attention(
   e.bytes(num_kv_heads, 10);
   e.in(alibi_slopes, 11);
   e.bytes(use_alibi, 12);
+  e.in(block_mask, 13);
+  e.bytes(use_mask, 14);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 

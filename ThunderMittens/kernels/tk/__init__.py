@@ -270,6 +270,18 @@ def paged_attention_alibi(q, key_cache, value_cache, block_table, context_lens, 
                                         alibi_slopes, scale)
 
 
+def paged_attention_block_sparse(q, key_cache, value_cache, block_table, context_lens, block_mask,
+                                 scale=0.0):
+    """Block-sparse paged decode: a query skips entire KV blocks it doesn't attend to.
+    block_mask is (batch, max_blocks) int (1=attend, 0=skip), sharing block_table's layout.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().paged_attention_block_sparse(q, key_cache, value_cache, block_table,
+                                                     context_lens, block_mask, scale)
+    return _mlx().paged_attention_block_sparse(q, key_cache, value_cache, block_table,
+                                               context_lens, block_mask, scale)
+
+
 def paged_attention_staged(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
     """GQA KV-reuse staged decode: bit-equivalent to paged_attention, but stages each KV vector
     once into threadgroup memory and reuses it across the query heads sharing that kv_head

@@ -57,6 +57,18 @@ array paged_attention_alibi(
     float scale = 0.0f,
     StreamOrDevice s = {});
 
+// Block-sparse paged decode: a query skips entire KV blocks it doesn't attend to. block_mask is
+// (batch, max_blocks) int32 (1 = attend, 0 = skip), sharing the block_table's layout.
+array paged_attention_block_sparse(
+    const array& q,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    const array& block_mask,
+    float scale = 0.0f,
+    StreamOrDevice s = {});
+
 // GQA KV-reuse staged decode: bit-equivalent to paged_attention but stages each KV vector
 // once into threadgroup memory and reuses it across the query heads sharing that kv_head.
 array paged_attention_staged(
@@ -254,8 +266,8 @@ class PagedAttentionFp8 : public Primitive {
 
 class PagedAttention : public Primitive {
  public:
-  PagedAttention(Stream stream, float scale, bool use_alibi = false)
-      : Primitive(stream), scale_(scale), use_alibi_(use_alibi) {}
+  PagedAttention(Stream stream, float scale, bool use_alibi = false, bool use_mask = false)
+      : Primitive(stream), scale_(scale), use_alibi_(use_alibi), use_mask_(use_mask) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
@@ -276,12 +288,13 @@ class PagedAttention : public Primitive {
   void print(std::ostream& os) override { os << "PagedAttention"; }
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const PagedAttention&>(other);
-    return scale_ == o.scale_ && use_alibi_ == o.use_alibi_;
+    return scale_ == o.scale_ && use_alibi_ == o.use_alibi_ && use_mask_ == o.use_mask_;
   }
 
  private:
   float scale_;
   bool use_alibi_;
+  bool use_mask_;
 };
 
 class PagedAttentionStaged : public Primitive {

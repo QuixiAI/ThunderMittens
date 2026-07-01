@@ -75,6 +75,24 @@ std::vector<array> mla_kv_insert_fp8(
     const array& scale_cache,
     StreamOrDevice s = {});
 
+/**
+ *  DeepSeek MLA absorb-path latent flash-decode (P4). The absorbed query q = [ql_nope ‖ q_pe]
+ *  (LATENT+rope wide; ql_nope = q_nope @ W_UK_T applied by the caller) attends against the shared
+ *  paged latent cache kv_cache[nb, bs, LATENT+rope] (MQA): score over the full width, value
+ *  accumulate over the LATENT part only. Returns o (batch, num_heads, LATENT); the caller then
+ *  up-projects with W_UV. Algebraically equal to the MHA (up-projected) attention.
+ *
+ *  q : (batch, num_heads, LATENT+rope) bf16.  kv_cache : (num_blocks, block_size, LATENT+rope) bf16.
+ *  block_table : (batch, max_blocks) int32.  context_lens : (batch,) int32.
+ **/
+array mla_decode(
+    const array& q,
+    const array& kv_cache,
+    const array& block_table,
+    const array& context_lens,
+    float scale = 0.0f,
+    StreamOrDevice s = {});
+
 class MlaQNormRope : public Primitive {
  public:
   MlaQNormRope(Stream stream, int num_heads, int nope_dim, int rope_dim, int norm_mode, float eps)
@@ -131,6 +149,29 @@ class MlaKvInsert : public Primitive {
  private:
   int rope_dim_, norm_mode_;
   float eps_;
+};
+
+class MlaDecode : public Primitive {
+ public:
+  MlaDecode(Stream stream, float scale) : Primitive(stream), scale_(scale) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MlaDecode"; }
+  void print(std::ostream& os) override { os << "MlaDecode"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return scale_ == static_cast<const MlaDecode&>(other).scale_;
+  }
+
+ private:
+  float scale_;
 };
 
 class MlaKvInsertFp8 : public Primitive {

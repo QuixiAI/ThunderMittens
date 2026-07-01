@@ -7,11 +7,13 @@ RoPE on the last rope_dim dims. Oracle mirrors vLLM's rmsnorm_no_weight + apply_
 Run from kernels/:  python -m pytest mla/correctness/test_mla.py -v
 """
 
+import math
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import mla_q_norm_rope, mla_kv_insert, mla_kv_insert_fp8
+from tk import mla_q_norm_rope, mla_kv_insert, mla_kv_insert_fp8, mla_decode
 from tk.quant import _e4m3_decode_arr
 
 
@@ -155,6 +157,48 @@ def test_mla_kv_insert_fp8():
         rope_f = (rope_bf.astype(np.uint32) << 16).view(np.float32)
         ref = _rope_interleaved_row(rope, cos[positions[t]], sin[positions[t]])
         assert np.max(np.abs(rope_f - ref)) < 3e-2
+
+
+@pytest.mark.parametrize("N", [8, 16])
+def test_mla_decode_end_to_end(N):
+    # Full absorb pipeline (absorb W_UK -> mla_decode -> up-proj W_UV) must equal the
+    # algebraically-equal MHA path (up-project the latent, then SDPA over head-dim 192/128).
+    Lkv, P, R, Vh = 512, 128, 64, 128
+    B, nb, bs = 2, 8, 4
+    rng = np.random.default_rng(N)
+    W_UK = (0.02 * rng.standard_normal((Lkv, N, P))).astype(np.float32)
+    W_UV = (0.02 * rng.standard_normal((Lkv, N, Vh))).astype(np.float32)
+    q_nope = (0.3 * rng.standard_normal((B, N, P))).astype(np.float32)
+    q_pe = (0.3 * rng.standard_normal((B, N, R))).astype(np.float32)
+    total = nb * bs
+    latent = (0.3 * rng.standard_normal((total, Lkv))).astype(np.float32)
+    k_pe = (0.3 * rng.standard_normal((total, R))).astype(np.float32)
+    block_table = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    context_lens = np.array([10, 16], dtype=np.int32)
+    scale = 1.0 / math.sqrt(P + R)
+
+    # absorb: ql_nope = q_nope @ W_UK_T ; query = [ql_nope | q_pe] (576)
+    ql = np.einsum('bnp,npl->bnl', q_nope, np.transpose(W_UK, (1, 2, 0)))
+    q576 = np.concatenate([ql, q_pe], axis=-1)
+    cache = np.concatenate([latent, k_pe], axis=-1).reshape(nb, bs, 576)
+
+    o = np.array(mla_decode(mx.array(q576).astype(mx.bfloat16), mx.array(cache).astype(mx.bfloat16),
+                            mx.array(block_table), mx.array(context_lens), scale=0.0).astype(mx.float32))
+    v_kernel = np.einsum('bnl,nlv->bnv', o, np.transpose(W_UV, (1, 0, 2)))
+
+    out = np.zeros((B, N, Vh), np.float32)
+    for b in range(B):
+        for h in range(N):
+            sc, vs = [], []
+            for t in range(int(context_lens[b])):
+                tok = block_table[b, t // bs] * bs + (t % bs)
+                s = (q_nope[b, h] @ (latent[tok] @ W_UK[:, h, :]) + q_pe[b, h] @ k_pe[tok]) * scale
+                sc.append(s)
+                vs.append(latent[tok] @ W_UV[:, h, :])
+            p = np.exp(np.array(sc) - np.max(sc))
+            p /= p.sum()
+            out[b, h] = np.sum(p[:, None] * np.stack(vs), axis=0)
+    assert np.max(np.abs(v_kernel - out)) < 2e-2
 
 
 if __name__ == "__main__":

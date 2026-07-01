@@ -246,6 +246,85 @@ kernel void mla_kv_insert_fp8(device const bf16 *kv          [[buffer(0)]],   //
     if (laneId == 0) { scale_cache[dst_scale + 7] = 0; }   // pad byte
 }
 
+// ---------------------------------------------------------------------------
+// P4: mla_decode — MLA absorb-path latent flash-decode (MQA). The query is the absorbed
+// [ql_nope(LATENT) ‖ q_pe(rope)] = QK-wide vector (ql_nope = q_nope @ W_UK_T, done by the caller);
+// the paged cache kv_cache[nb, bs, QK] stores one shared latent per token = [latent(LATENT) ‖
+// k_pe(rope)]. Score is the full QK-wide dot (latent + rope), but the value accumulate is over the
+// LATENT part only (rope carries no value) — an asymmetric dot(QK)/accumulate(LATENT) decode. Output
+// o (…, LATENT) is then W_UV-up-projected by the caller. One simdgroup per (head, batch); the striped
+// lane map (d = lane + 32*i) puts the latent in i<LATENT/32 and the rope in the tail, so the AV loop
+// is just the first LATENT/32 iterations. Absorb-path == MHA path algebraically.
+// ---------------------------------------------------------------------------
+template <int LATENT, int ROPE>
+kernel void mla_decode(device const bf16 *q            [[buffer(0)]],   // (B, N, LATENT+ROPE)
+                       device const bf16 *kv_cache     [[buffer(1)]],   // (nb, bs, LATENT+ROPE)
+                       device const int  *block_table  [[buffer(2)]],
+                       device const int  *context_lens [[buffer(3)]],
+                       device bf16       *out          [[buffer(4)]],   // (B, N, LATENT)
+                       constant int &block_size        [[buffer(5)]],
+                       constant int &block_table_stride [[buffer(6)]],
+                       constant float &scale           [[buffer(7)]],
+                       constant int &num_heads         [[buffer(8)]],
+                       uint3 tgid [[threadgroup_position_in_grid]],
+                       uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr int QK = LATENT + ROPE;
+    constexpr int VPL_QK = QK / 32;        // query values per lane (dot width)
+    constexpr int VPL_AV = LATENT / 32;    // latent values per lane (accumulate width)
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int context_len = context_lens[batch];
+    const long q_base = ((long)batch * num_heads + head) * QK;
+
+    float qv[VPL_QK], acc[VPL_AV];
+    for (int i = 0; i < VPL_QK; ++i) { qv[i] = float(q[q_base + lane + 32 * i]); }
+    for (int i = 0; i < VPL_AV; ++i) { acc[i] = 0.0f; }
+
+    float m = -3.4028234663852886e38f, l = 0.0f;
+    for (int t = 0; t < context_len; ++t) {
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) { continue; }
+        const long cache_base = ((long)block * block_size + slot) * QK;   // MQA: no head axis
+
+        float partial = 0.0f;
+        for (int i = 0; i < VPL_QK; ++i) {
+            partial += qv[i] * float(kv_cache[cache_base + lane + 32 * i]);
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VPL_AV; ++i) {      // value = the latent part only
+            acc[i] = acc[i] * alpha + beta * float(kv_cache[cache_base + lane + 32 * i]);
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    const long out_base = ((long)batch * num_heads + head) * LATENT;
+    for (int i = 0; i < VPL_AV; ++i) {
+        out[out_base + lane + 32 * i] = l == 0.0f ? bf16(0) : bf16(acc[i] / l);
+    }
+}
+
+#define instantiate_mla_decode(LVAL, RVAL)                                     \
+  template [[host_name("mla_decode_" #LVAL "_" #RVAL)]] [[kernel]] void         \
+  mla_decode<LVAL, RVAL>(device const bf16 *q [[buffer(0)]],                    \
+                         device const bf16 *kv_cache [[buffer(1)]],             \
+                         device const int  *block_table [[buffer(2)]],          \
+                         device const int  *context_lens [[buffer(3)]],         \
+                         device bf16       *out [[buffer(4)]],                   \
+                         constant int &block_size [[buffer(5)]],                \
+                         constant int &block_table_stride [[buffer(6)]],        \
+                         constant float &scale [[buffer(7)]],                   \
+                         constant int &num_heads [[buffer(8)]],                 \
+                         uint3 tgid [[threadgroup_position_in_grid]],           \
+                         uint  lane [[thread_index_in_simdgroup]]);
+
+instantiate_mla_decode(512, 64);
+
 // Single-buffer bf16 copy (clone-then-insert prologue for the MLA cache).
 kernel void mla_cache_clone(device const bf16 *src [[buffer(0)]],
                             device bf16       *dst [[buffer(1)]],

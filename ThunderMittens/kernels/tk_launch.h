@@ -55,6 +55,9 @@ inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string
 inline std::string rotary_interleaved_kernel_name(int D) { return "rotary_interleaved_" + std::to_string(D); }
 inline std::string mla_q_norm_rope_kernel_name(int D) { return "mla_q_norm_rope_" + std::to_string(D); }
 inline std::string mla_kv_insert_kernel_name(int L) { return "mla_kv_insert_" + std::to_string(L); }
+inline std::string mla_decode_kernel_name(int L, int R) {
+  return "mla_decode_" + std::to_string(L) + "_" + std::to_string(R);
+}
 inline std::string gelu_kernel_name(int D) { return "gelu_" + std::to_string(D); }
 inline std::string glu_kernel_name(const std::string& mode, const std::string& t) { return "glu_" + mode + "_" + t; }
 inline std::string hadamard_kernel_name(const std::string& t, int D) {
@@ -97,6 +100,8 @@ inline std::string linear_attn_kernel_name(int D) { return "linear_attn_" + std:
 inline std::string hedgehog_kernel_name(int D) { return "hedgehog_" + std::to_string(D); }
 inline std::string lin_attn_causal_kernel_name(int D) { return "lin_attn_causal_" + std::to_string(D); }
 inline std::string mamba2_kernel_name(int D) { return "mamba2_" + std::to_string(D); }
+inline std::string mamba2_bwd_i_kernel_name(int D) { return "mamba2_bwd_i_" + std::to_string(D); }
+inline std::string mamba2_bwd_j_kernel_name(int D) { return "mamba2_bwd_j_" + std::to_string(D); }
 inline std::string lin_attn_decay_kernel_name(int D) { return "lin_attn_decay_" + std::to_string(D); }
 inline std::string based_kernel_name(int DQK, int DVO) {
   return "based_" + std::to_string(DQK) + "_" + std::to_string(DVO);
@@ -529,6 +534,19 @@ void launch_mla_kv_insert(E& e, typename E::in_t kv_c, typename E::in_t k_pe, ty
   e.bytes(block_size, 7); e.bytes(rope_dim, 8); e.bytes(norm_mode, 9); e.bytes(eps, 10);
   e.in(norm_weight, 11);
   e.dispatch(num_tokens, 1, 1, 32, 1, 1);
+}
+
+// ----- MLA latent decode (MQA): q@0(B,N,QK) kv_cache@1(nb,bs,QK) block_table@2 context_lens@3 ->
+//        out@4(B,N,LATENT) ; block_size@5 stride@6 scale@7 num_heads@8 ; grid (num_heads,B) 32 thr. -----
+template <class E>
+void launch_mla_decode(E& e, typename E::in_t q, typename E::in_t kv_cache,
+                       typename E::in_t block_table, typename E::in_t context_lens,
+                       typename E::out_t out, int batch, int num_heads, int block_size,
+                       int block_table_stride, float scale, int latent, int rope) {
+  e.pipeline(mla_decode_kernel_name(latent, rope));
+  e.in(q, 0); e.in(kv_cache, 1); e.in(block_table, 2); e.in(context_lens, 3); e.out(out, 4);
+  e.bytes(block_size, 5); e.bytes(block_table_stride, 6); e.bytes(scale, 7); e.bytes(num_heads, 8);
+  e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 
 // ----- gelu (elementwise, last axis): x@0 -> o@1 ; M@2(u32) ; grid (M,1,1) group (32,1,1) -----
@@ -977,6 +995,26 @@ void launch_mamba2(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in
   e.pipeline(mamba2_kernel_name(D));
   e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(cumlog, 3); e.out(Y, 4);
   e.bytes(N, 5); e.bytes(H, 6);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
+// ----- mamba2 backward. C@0 Bm@1 X@2 dY@3 cumlog@4 -> dC@5 (bwd_i) / dB@5 dX@6 (bwd_j). -----
+template <class E>
+void launch_mamba2_bwd_i(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in_t X,
+                         typename E::in_t dY, typename E::in_t cumlog, typename E::out_t dC,
+                         unsigned N, unsigned H, int B, int D) {
+  e.pipeline(mamba2_bwd_i_kernel_name(D));
+  e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(dY, 3); e.in(cumlog, 4); e.out(dC, 5);
+  e.bytes(N, 6); e.bytes(H, 7);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+template <class E>
+void launch_mamba2_bwd_j(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in_t X,
+                         typename E::in_t dY, typename E::in_t cumlog, typename E::out_t dB,
+                         typename E::out_t dX, unsigned N, unsigned H, int B, int D) {
+  e.pipeline(mamba2_bwd_j_kernel_name(D));
+  e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(dY, 3); e.in(cumlog, 4); e.out(dB, 5); e.out(dX, 6);
+  e.bytes(N, 7); e.bytes(H, 8);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 

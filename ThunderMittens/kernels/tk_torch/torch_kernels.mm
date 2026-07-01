@@ -660,6 +660,30 @@ static at::Tensor mla_kv_insert_mps(
   return out;
 }
 
+// DeepSeek MLA absorb-path latent decode (MQA). q (B,N,576), cache (nb,bs,576) -> o (B,N,512).
+static at::Tensor mla_decode_mps(
+    const at::Tensor& q_in, const at::Tensor& cache_in, const at::Tensor& block_table_in,
+    const at::Tensor& context_lens_in, double scale) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.scalar_type() == at::kBFloat16,
+              "mla_decode: q must be bf16 MPS");
+  TORCH_CHECK(q_in.dim() == 3 && q_in.size(2) == 576, "mla_decode: q must be (B, N, 576)");
+  TORCH_CHECK(cache_in.dim() == 3 && cache_in.size(2) == 576, "mla_decode: cache must be (nb, bs, 576)");
+  TORCH_CHECK(block_table_in.scalar_type() == at::kInt && context_lens_in.scalar_type() == at::kInt,
+              "mla_decode: block_table and context_lens must be int32");
+  const int B = q_in.size(0), N = q_in.size(1);
+  const int latent = 512;
+  auto q = q_in.contiguous();
+  auto cache = cache_in.contiguous();
+  auto bt = block_table_in.contiguous(), cl = context_lens_in.contiguous();
+  auto out = at::empty({B, N, latent}, q.options());
+  const float scale_f = scale > 0.0 ? static_cast<float>(scale) : 1.0f / std::sqrt(576.0f);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_mla_decode(e, q, cache, bt, cl, out, B, N, static_cast<int>(cache.size(1)),
+                          static_cast<int>(bt.size(1)), scale_f, latent, 64);
+  });
+  return out;
+}
+
 // DeepSeek-V4 packed MLA KV-insert. Returns (data_cache uint8 (…,576), scale_cache uint8 (…,8)).
 static std::tuple<at::Tensor, at::Tensor> mla_kv_insert_fp8_mps(
     const at::Tensor& kv_in, const at::Tensor& cos_in, const at::Tensor& sin_in,
@@ -1411,6 +1435,26 @@ static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
   return out;
 }
 
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
+    const at::Tensor& C_in, const at::Tensor& B_in, const at::Tensor& X_in,
+    const at::Tensor& cl_in, const at::Tensor& dY_in) {
+  TORCH_CHECK(C_in.device().is_mps(), "mamba2_bwd: tensors must be MPS");
+  TORCH_CHECK(C_in.scalar_type() == at::kBFloat16 && dY_in.scalar_type() == at::kBFloat16,
+              "mamba2_bwd: C,B,X,dY must be bfloat16");
+  TORCH_CHECK(cl_in.scalar_type() == at::kFloat, "mamba2_bwd: cumlog must be float32");
+  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous(),
+       cl = cl_in.contiguous(), dY = dY_in.contiguous();
+  const int Bsz = C.size(0), H = C.size(1);
+  const unsigned N = static_cast<unsigned>(C.size(2));
+  const int D = C.size(3);
+  TORCH_CHECK(D == 64 || D == 128, "mamba2_bwd: D must be 64 or 128");
+  TORCH_CHECK(N % 8 == 0, "mamba2_bwd: N must be a multiple of 8");
+  auto dC = at::empty_like(C), dB = at::empty_like(C), dX = at::empty_like(C);
+  tk_encode([&](TorchEncoder& e) { tk::launch_mamba2_bwd_i(e, C, B, X, dY, cl, dC, N, H, Bsz, D); });
+  tk_encode([&](TorchEncoder& e) { tk::launch_mamba2_bwd_j(e, C, B, X, dY, cl, dB, dX, N, H, Bsz, D); });
+  return {dC, dB, dX};
+}
+
 static at::Tensor lin_attn_decay_mps(const at::Tensor& q_in, const at::Tensor& k_in,
                                      const at::Tensor& v_in, const at::Tensor& cl_in) {
   TORCH_CHECK(q_in.device().is_mps() && q_in.scalar_type() == at::kBFloat16, "lin_attn_decay: q,k,v bf16 MPS");
@@ -1718,6 +1762,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rope_kv_insert_norm", &rope_kv_insert_norm_mps, "ThunderMittens fused K-norm + RoPE + KV insert (MPS)");
   m.def("mla_q_norm_rope", &mla_q_norm_rope_mps, "ThunderMittens DeepSeek MLA Q-path norm+interleaved-rope (MPS)");
   m.def("mla_kv_insert", &mla_kv_insert_mps, "ThunderMittens DeepSeek MLA classic KV-insert (MPS)");
+  m.def("mla_decode", &mla_decode_mps, "ThunderMittens DeepSeek MLA latent flash-decode (MPS)");
   m.def("mla_kv_insert_fp8", &mla_kv_insert_fp8_mps, "ThunderMittens DeepSeek-V4 packed fp8 MLA KV-insert (MPS)");
   m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)");
   m.def("paged_attention_v2_fp8", &paged_attention_v2_fp8_mps, "ThunderMittens long-context fp8 paged attention (MPS)");
@@ -1743,6 +1788,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("hedgehog", &hedgehog_mps, "ThunderMittens hedgehog linear attention (MPS)");
   m.def("lin_attn_causal", &lin_attn_causal_mps, "ThunderMittens causal linear attention (MPS)");
   m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
+  m.def("mamba2_bwd", &mamba2_bwd_mps, "ThunderMittens Mamba-2 / SSD backward dC,dB,dX (MPS)");
   m.def("lin_attn_decay", &lin_attn_decay_mps, "ThunderMittens decay/retention linear attention (MPS)");
   m.def("based", &based_mps, "ThunderMittens Based Taylor-map linear attention (MPS)");
   m.def("attn_fwd_l", &attn_fwd_l_mps, "ThunderMittens flash-attn forward + L (MPS)");

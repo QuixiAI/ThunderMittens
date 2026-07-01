@@ -390,6 +390,20 @@ def test_mla_kv_insert_parity(norm_mode):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("N", [8, 16])
+def test_mla_decode_parity(N):
+    B, nb, bs = 2, 8, 4
+    rng = np.random.default_rng(24)
+    q = (0.3 * rng.standard_normal((B, N, 576))).astype(np.float32)
+    cache = (0.3 * rng.standard_normal((nb, bs, 576))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    om = tk.mla_decode(_mk(q, "mlx"), _mk(cache, "mlx"), mx.array(bt), mx.array(cl))
+    ot = tk.mla_decode(_mk(q, "torch"), _mk(cache, "torch"),
+                       torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"))
+    _assert_parity(om, ot, atol=2e-2)
+
+
 def test_mla_kv_insert_fp8_parity():
     T, nb, bs = 5, 4, 4
     rng = np.random.default_rng(23)

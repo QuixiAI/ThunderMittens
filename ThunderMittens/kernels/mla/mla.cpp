@@ -165,6 +165,67 @@ void MlaKvInsert::eval_gpu(const std::vector<array>& inputs, std::vector<array>&
                            num_tokens, block_size, rope_dim_, norm_mode_, eps_, latent);
 }
 
+array mla_decode(
+    const array& q,
+    const array& kv_cache,
+    const array& block_table,
+    const array& context_lens,
+    float scale,
+    StreamOrDevice s) {
+  constexpr int ROPE = 64;
+  if (q.ndim() != 3) {
+    throw std::invalid_argument("mla_decode: q must be (batch, num_heads, LATENT+rope)");
+  }
+  if (kv_cache.ndim() != 3 || kv_cache.shape(2) != q.shape(2)) {
+    throw std::invalid_argument("mla_decode: kv_cache must be (num_blocks, block_size, LATENT+rope)");
+  }
+  const int qk = q.shape(2);
+  const int latent = qk - ROPE;
+  if (latent != 512) {
+    throw std::invalid_argument("mla_decode: only LATENT=512, rope=64 (QK=576) is instantiated");
+  }
+  if (block_table.ndim() != 2 || block_table.shape(0) != q.shape(0)) {
+    throw std::invalid_argument("mla_decode: block_table must be (batch, max_blocks)");
+  }
+  if (context_lens.ndim() != 1 || context_lens.shape(0) != q.shape(0)) {
+    throw std::invalid_argument("mla_decode: context_lens must be (batch,)");
+  }
+  auto q_c = mla_contig_bf16(q, s);
+  auto cache_c = mla_contig_bf16(kv_cache, s);
+  auto table_c = contiguous(astype(block_table, int32, s), false, s);
+  auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
+  return array(
+      {q.shape(0), q.shape(1), latent},
+      bfloat16,
+      std::make_shared<MlaDecode>(to_stream(s), scale),
+      {q_c, cache_c, table_c, lens_c});
+}
+
+void MlaDecode::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MlaDecode has no CPU implementation.");
+}
+
+void MlaDecode::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& q = inputs[0];
+  auto& kv_cache = inputs[1];
+  auto& block_table = inputs[2];
+  auto& context_lens = inputs[3];
+  auto& out = outputs[0];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+
+  const int qk = q.shape(2);
+  const int rope = 64;
+  const int latent = qk - rope;
+  const float scale = scale_ > 0.0f ? scale_ : 1.0f / std::sqrt(static_cast<float>(qk));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_mla_decode(enc, q, kv_cache, block_table, context_lens, out, q.shape(0), q.shape(1),
+                        kv_cache.shape(1), block_table.shape(1), scale, latent, rope);
+}
+
 std::vector<array> mla_kv_insert_fp8(
     const array& kv,
     const array& cos,
@@ -251,6 +312,7 @@ void MlaKvInsertFp8::eval_gpu(const std::vector<array>& inputs, std::vector<arra
 
 TK_MLA_NO_AUTODIFF(MlaQNormRope, "MlaQNormRope")
 TK_MLA_NO_AUTODIFF(MlaKvInsert, "MlaKvInsert")
+TK_MLA_NO_AUTODIFF(MlaDecode, "MlaDecode")
 TK_MLA_NO_AUTODIFF(MlaKvInsertFp8, "MlaKvInsertFp8")
 
 } // namespace mlx::core

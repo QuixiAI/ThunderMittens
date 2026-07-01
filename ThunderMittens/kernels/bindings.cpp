@@ -251,6 +251,13 @@ NB_MODULE(_ext, m) {
          a paged bf16 cache (nb, bs, LATENT+rope_dim). Returns the updated kv_cache.)");
 
     m.def(
+      "mla_decode", &mla_decode,
+      "q"_a, "kv_cache"_a, "block_table"_a, "context_lens"_a, "scale"_a = 0.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(DeepSeek MLA absorb-path latent decode (MQA). q (B,N,576)=[ql_nope(512)|q_pe(64)] attends
+         a shared latent cache (nb,bs,576); value over the 512 latent only. Returns o (B,N,512).)");
+
+    m.def(
       "mla_kv_insert_fp8", &mla_kv_insert_fp8,
       "kv"_a, "cos"_a, "sin"_a, "positions"_a, "slot_mapping"_a, "data_cache"_a, "scale_cache"_a,
       nb::kw_only(), "stream"_a = nb::none(),

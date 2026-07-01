@@ -47,6 +47,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "hedgehog", "hedgehog.metal"),
     os.path.join(_KERNELS, "lin_attn_causal", "lin_attn_causal.metal"),
     os.path.join(_KERNELS, "mamba2", "mamba2.metal"),
+    os.path.join(_KERNELS, "mamba2_bwd", "mamba2_bwd.metal"),
     os.path.join(_KERNELS, "lin_attn_decay", "lin_attn_decay.metal"),
     os.path.join(_KERNELS, "based", "based.metal"),
     os.path.join(_KERNELS, "attn_bwd", "attn_bwd.metal"),
@@ -197,6 +198,11 @@ def mla_kv_insert(kv_c, k_pe, cos, sin, positions, slot_mapping, kv_cache, norm_
 def mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache):
     """DeepSeek-V4 packed fp8 MLA KV-insert. Returns (data_cache u8 (…,576), scale_cache u8 (…,8)). MPS."""
     return _ext.mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache)
+
+
+def mla_decode(q, kv_cache, block_table, context_lens, scale=0.0):
+    """DeepSeek MLA absorb-path latent flash-decode (MQA). q (B,N,576), cache (nb,bs,576) -> o (B,N,512). MPS."""
+    return _ext.mla_decode(q, kv_cache, block_table, context_lens, float(scale))
 
 
 def gelu(x: torch.Tensor):
@@ -470,8 +476,15 @@ def lin_attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 
 
 def mamba2(C: torch.Tensor, B: torch.Tensor, X: torch.Tensor, cumlog: torch.Tensor):
-    """Mamba-2 / SSD forward. C,B,X bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS; D=64, N%8."""
+    """Mamba-2 / SSD forward. C,B,X bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS; D in {64,128}, N%8."""
     return _ext.mamba2(C, B, X, cumlog)
+
+
+def mamba2_bwd(C: torch.Tensor, B: torch.Tensor, X: torch.Tensor, cumlog: torch.Tensor,
+               dY: torch.Tensor):
+    """Mamba-2 / SSD backward -> (dC, dB, dX). C,B,X,dY bf16 (B,H,N,D); cumlog fp32 (B,H,N).
+    MPS; D in {64,128}, N%8. dcumlog is <dY,Y>-<dX,X> on the host (not returned here)."""
+    return _ext.mamba2_bwd(C, B, X, cumlog, dY)
 
 
 def lin_attn_decay(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cl: torch.Tensor):

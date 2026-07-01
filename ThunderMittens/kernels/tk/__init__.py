@@ -165,6 +165,17 @@ def mla_kv_insert(kv_c, k_pe, cos, sin, positions, slot_mapping, kv_cache,
                                 norm_weight, rope_dim, norm_mode, eps)
 
 
+def mla_decode(q, kv_cache, block_table, context_lens, scale=0.0):
+    """DeepSeek MLA absorb-path latent flash-decode (MQA). q (B,N,576)=[ql_nope(512)|q_pe(64)]
+    (ql_nope = q_nope @ W_UK_T, applied by the caller) attends the shared latent cache
+    (num_blocks, block_size, 576); the value accumulate is over the 512 latent only. Returns
+    o (B,N,512); the caller then up-projects with W_UV. Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(q):
+        return _torch().mla_decode(q, kv_cache, block_table, context_lens, scale)
+    return _mlx().mla_decode(q, kv_cache, block_table, context_lens, scale)
+
+
 def mla_kv_insert_fp8(kv, cos, sin, positions, slot_mapping, data_cache, scale_cache):
     """DeepSeek-V4 packed MLA KV-insert: kv (…, 512) = [448 NoPE | 64 RoPE]; NoPE is quantized to
     e4m3 fp8 with per-64-block UE8M0 (power-of-2) scales, RoPE gets interleaved RoPE bf16. Writes

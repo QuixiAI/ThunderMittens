@@ -800,6 +800,29 @@ def test_attn_varlen_prefill(D, H, H_KV):
     assert np.abs(on - ref).max() / (np.abs(ref).max() + 1e-6) < 0.03
 
 
+@pytest.mark.parametrize("mode,k", [("argmax", 0), ("categorical", 0), ("topk", 8)])
+def test_lm_head_sample(mode, k):
+    import numpy as np
+    import tk
+    rng = np.random.default_rng(5)
+    T, V, K = 4, 8000, 512
+    h = (0.5 * rng.standard_normal((T, K))).astype(np.float32)
+    W = (0.5 * rng.standard_normal((V, K))).astype(np.float32)
+    hm = torch.from_numpy(h).to(torch.bfloat16).to("mps")
+    Wm = torch.from_numpy(W).to(torch.bfloat16).to("mps")
+    tok = tk.lm_head_sample(hm, Wm, mode=mode, k=k, temperature=0.8, seed=11).cpu().numpy()
+    L = (h.astype(np.float64)) @ (W.astype(np.float64)).T
+    assert tok.shape == (T,)
+    if mode == "topk":
+        for t in range(T):
+            top = set(int(v) for v in np.argsort(-L[t], kind="stable")[:k])
+            assert tok[t] in top or (L[t].max() - L[t, tok[t]]) < 1e-2
+    else:
+        for t in range(T):
+            # both argmax and categorical select a high-logit token; check it's a plausible pick
+            assert (L[t].max() - L[t, tok[t]]) < (1e-2 if mode == "argmax" else 40.0)
+
+
 @pytest.mark.parametrize("nkm", [(40, 20, 48), (100, 50, 70), (33, 17, 65)])
 def test_matmul_arbitrary(nkm):
     N, K, M = nkm

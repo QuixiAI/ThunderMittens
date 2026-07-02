@@ -706,6 +706,30 @@ def attn_cases(be, preset, formats):
                        flops=flops / (2 if causal else 1))
 
 
+@register("lm_head")
+def lm_head_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(131)
+    # (T, V, K). Decode regime: small T, large vocab.
+    shapes = _pick(preset, [(1, 32000, 2048)],
+                   [(1, 32000, 4096), (8, 32000, 4096)],
+                   [(1, 32000, 4096), (8, 32000, 4096), (1, 128256, 4096)])
+    for T, V, K in shapes:
+        h = (0.5 * rng.standard_normal((T, K))).astype(np.float32)
+        W = (0.5 * rng.standard_normal((V, K))).astype(np.float32)
+        h_d, W_d = be.array(h, "bf16"), be.array(W, "bf16")
+        baselines = {}
+        if be.name == "mlx":
+            mx = be.mx
+
+            def matmul_argmax(h_d=h_d, W_d=W_d):
+                return tk.argmax_sample(mx.matmul(h_d, W_d.T))
+            baselines["matmul+argmax"] = matmul_argmax
+        yield Case("lm_head", f"argmax_T{T}_V{V}_K{K}", {"T": T, "V": V, "K": K}, "bf16",
+                   target=lambda h_d=h_d, W_d=W_d: tk.lm_head_sample(h_d, W_d, mode="argmax"),
+                   baselines=baselines, ref=None, bytes_moved=float(V * K * 2))
+
+
 @register("attn_varlen")
 def attn_varlen_cases(be, preset, formats):
     tk = be.tk()

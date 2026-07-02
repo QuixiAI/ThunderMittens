@@ -41,6 +41,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "moe", "moe.metal"),
     os.path.join(_KERNELS, "attn_causal", "attn_causal.metal"),
     os.path.join(_KERNELS, "attn_varlen", "attn_varlen.metal"),
+    os.path.join(_KERNELS, "lm_head", "lm_head.metal"),
     os.path.join(_KERNELS, "flux", "flux.metal"),
     os.path.join(_KERNELS, "gemm_staged", "gemm_staged.metal"),
     os.path.join(_KERNELS, "attn_multiwarp", "attn_multiwarp.metal"),
@@ -380,6 +381,12 @@ def attn_window(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int):
     """Sliding-window causal attention: query i attends keys [max(0, i-window+1), i].
     window <= 0 disables the window. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""
     return _ext.attn_window(q, k, v, window)
+
+
+def lm_head_sample(h, W, bias, mode, k, temperature, seed):
+    """Fused LM-head + sampling: token id per row of h without materializing (T,V) logits.
+    mode 0=argmax, 1=categorical, 2=top-k. bias (V,) or a 1-elem dummy. Returns (T,) int32. MPS."""
+    return _ext.lm_head_sample(h, W, bias, int(mode), int(k), float(temperature), int(seed))
 
 
 def paged_attention_v2(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,

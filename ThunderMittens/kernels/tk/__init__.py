@@ -706,6 +706,35 @@ def top_p_sample(logits, p, temperature=1.0, seed=0):
     return _mlx().top_p_sample(logits, p, temperature=temperature, seed=seed)
 
 
+_LM_HEAD_MODES = {"argmax": 0, "categorical": 1, "topk": 2}
+
+
+def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None):
+    """Fused LM-head + sampling: a decode token per row of h WITHOUT materializing the (T,V) logits.
+
+    h (T, K), W (V, K) row-major, both fp16/bf16/f32 (same dtype). mode in
+    {"argmax", "categorical", "topk"} (top-p is not fusible -> use a logits matmul + top_p_sample).
+    bias is an optional (V,) additive logit bias. Returns (T,) int32 token ids. The Gumbel noise is
+    indexed by the global vocab id, so the fused draw equals the unfused sampler on the same logits
+    + seed. Accepts mlx.array or torch.Tensor (MPS).
+
+    Note: this fuses the head GEMV with sampling so the (T,V) logits are never materialized, but on
+    Apple it is NOT faster than `matmul + sampler` — the head GEMV is bandwidth-bound at the
+    W-read floor where MLX's matmul already sits, and the saved logits traffic is negligible. Use it
+    when avoiding the logits tensor matters (huge V / memory pressure) or as a single fused decode
+    step, not for speed."""
+    if mode not in _LM_HEAD_MODES:
+        raise ValueError(f"lm_head_sample: mode must be one of {list(_LM_HEAD_MODES)}")
+    m = _LM_HEAD_MODES[mode]
+    if _is_torch(h):
+        import torch
+        b = bias if bias is not None else torch.zeros(1, dtype=torch.float32, device=h.device)
+        return _torch().lm_head_sample(h, W, b, m, int(k), float(temperature), int(seed))
+    import mlx.core as mx
+    b = bias if bias is not None else mx.zeros((1,), dtype=mx.float32)
+    return _mlx().lm_head_sample(h, W, b, m, int(k), float(temperature), int(seed))
+
+
 def apply_penalty(logits, prev_tokens, temperature=1.0, repetition_penalty=1.0,
                   presence_penalty=0.0, frequency_penalty=0.0, bias=None, eos_id=-1,
                   min_length=0, gen_len=0, parent_ids=None):

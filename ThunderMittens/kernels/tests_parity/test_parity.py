@@ -135,6 +135,20 @@ def test_attn_varlen_prefill_parity(D, H, H_KV):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("mode,k", [("argmax", 0), ("categorical", 0), ("topk", 8)])
+def test_lm_head_sample_parity(mode, k):
+    # Same metallib + same logit path on both backends -> identical token ids.
+    rng = np.random.default_rng(4)
+    T, V, K = 4, 4096, 512
+    h = (0.5 * rng.standard_normal((T, K))).astype(np.float32)
+    W = (0.5 * rng.standard_normal((V, K))).astype(np.float32)
+    om = tk.lm_head_sample(_mk(h, "mlx"), _mk(W, "mlx"), mode=mode, k=k,
+                           temperature=0.8, seed=99)
+    ot = tk.lm_head_sample(_mk(h, "torch"), _mk(W, "torch"), mode=mode, k=k,
+                           temperature=0.8, seed=99)
+    _assert_parity(om, ot, atol=0)   # integer token ids: exact
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_rms_norm_parity(shape):
     D = shape[-1]

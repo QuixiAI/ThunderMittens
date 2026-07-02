@@ -1560,6 +1560,54 @@ static at::Tensor attn_varlen_prefill_mps(
   return out;
 }
 
+// Fused LM-head + sampling: token id per row of h without materializing the (T, V) logits.
+static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W_in,
+                                     const at::Tensor& bias_in, int64_t mode, int64_t k,
+                                     double temperature, int64_t seed) {
+  TORCH_CHECK(h_in.device().is_mps(), "lm_head_sample: h must be an MPS tensor");
+  TORCH_CHECK(h_in.dim() == 2 && W_in.dim() == 2 && h_in.size(1) == W_in.size(1),
+              "lm_head_sample: h (T,K) and W (V,K) must share K");
+  TORCH_CHECK(tk_is_float_dtype(h_in) && h_in.scalar_type() == W_in.scalar_type(),
+              "lm_head_sample: h/W must be the same float dtype (f32/f16/bf16)");
+  TORCH_CHECK(mode >= 0 && mode <= 2, "lm_head_sample: mode must be 0/1/2");
+  constexpr int TILE_V = 256;
+  auto h = h_in.contiguous();
+  auto W = W_in.contiguous();
+  auto bias = bias_in.to(at::kFloat).contiguous();
+  const int T = h.size(0), K = h.size(1), V = W.size(0);
+  const int num_vtiles = (V + TILE_V - 1) / TILE_V;
+  const float invtemp = 1.0f / static_cast<float>(temperature);
+  const int use_bias = bias.numel() > 1 ? 1 : 0;
+  const std::string tn = tk_type_name(h);
+  auto i32 = h.options().dtype(at::kInt);
+  auto f32 = h.options().dtype(at::kFloat);
+  auto out = at::empty({T}, i32);
+
+  if (mode == 2) {
+    TORCH_CHECK(k >= 1 && k <= 64 && k <= TILE_V, "lm_head_sample: topk k must be in [1, 64]");
+    auto part_val = at::empty({T, num_vtiles, static_cast<long>(k)}, f32);
+    auto part_id = at::empty({T, num_vtiles, static_cast<long>(k)}, i32);
+    tk_encode([&](TorchEncoder& e) {
+      tk::launch_lm_head_topk_partials(e, h, W, part_val, part_id, bias, V, K, TILE_V, num_vtiles,
+                                       static_cast<int>(k), use_bias, T, tn);
+      tk::launch_lm_head_topk_reduce(e, part_val, part_id, out, num_vtiles, static_cast<int>(k),
+                                     static_cast<unsigned>(seed), invtemp, T);
+    });
+    return out;
+  }
+
+  const int use_gumbel = (mode == 1) ? 1 : 0;
+  auto part_val = at::empty({T, num_vtiles}, f32);
+  auto part_id = at::empty({T, num_vtiles}, i32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_lm_head_argcat_partials(e, h, W, part_val, part_id, bias, V, K, TILE_V, num_vtiles,
+                                       invtemp, static_cast<unsigned>(seed), use_gumbel, use_bias,
+                                       T, tn);
+    tk::launch_lm_head_argcat_reduce(e, part_val, part_id, out, num_vtiles, T);
+  });
+  return out;
+}
+
 static at::Tensor flux_gelu_mps(const at::Tensor& x_in, const at::Tensor& w_in,
                                 const at::Tensor& bias_in) {
   TORCH_CHECK(x_in.device().is_mps(), "flux_gelu: x must be an MPS tensor");
@@ -2064,6 +2112,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_window", &attn_window_mps, "ThunderMittens sliding-window causal attention (MPS)");
   m.def("attn_varlen_prefill", &attn_varlen_prefill_mps,
         "ThunderMittens varlen/paged-prefill causal attention (MPS)");
+  m.def("lm_head_sample", &lm_head_sample_mps, "ThunderMittens fused LM-head + sampling (MPS)");
   m.def("flux_gelu", &flux_gelu_mps, "ThunderMittens fused GEMM+GELU (MPS)");
   m.def("flux_gate", &flux_gate_mps, "ThunderMittens fused GEMM+gate+residual (MPS)");
   m.def("gemm_staged", &gemm_staged_mps, "ThunderMittens staged multi-simdgroup GEMM (MPS)");

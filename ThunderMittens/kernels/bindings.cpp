@@ -76,6 +76,7 @@
 #include "kv_cache/kv_cache.h"
 #include "attn_causal/attn_causal.h"
 #include "attn_varlen/attn_varlen.h"
+#include "lm_head/lm_head.h"
 #include "flux/flux.h"
 #include "gemm_staged/gemm_staged.h"
 #include "attn_multiwarp/attn_multiwarp.h"
@@ -763,6 +764,23 @@ NB_MODULE(_ext, m) {
       R"(
         varlen / paged-prefill causal attention: ragged packed queries (head-major,
         padded per sequence to a multiple of 8) reading K/V from the paged cache
+      )");
+
+    m.def(
+      "lm_head_sample",
+      &lm_head_sample,
+      "h"_a,
+      "w"_a,
+      "bias"_a,
+      "mode"_a,
+      "k"_a,
+      "temperature"_a,
+      "seed"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        fused LM-head + sampling: token id per row without materializing (T,V) logits.
+        mode 0=argmax, 1=categorical, 2=top-k
       )");
 
     m.def(

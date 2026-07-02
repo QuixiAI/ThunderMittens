@@ -1120,6 +1120,57 @@ void launch_attn_varlen_prefill(E& e, typename E::in_t q_hm, typename E::in_t ke
   e.dispatch(n_tiles, H, 1, 32, 1, 1);
 }
 
+// ----- lm_head fused LM-head + sampling (two-stage partition/reduce) -----
+// argcat partials: h@0 W@1 -> part_val@2 part_id@3 ; bias@4 ; V@5 K@6 TILE_V@7 num_vtiles@8 (i32)
+//   invtemp@9 (f32) seed@10 (u32) use_gumbel@11 use_bias@12 (i32) ; grid (num_vtiles, T) × 32.
+template <class E>
+void launch_lm_head_argcat_partials(E& e, typename E::in_t h, typename E::in_t W,
+                                    typename E::out_t part_val, typename E::out_t part_id,
+                                    typename E::in_t bias, int V, int K, int TILE_V, int num_vtiles,
+                                    float invtemp, unsigned seed, int use_gumbel, int use_bias,
+                                    int T, const std::string& t) {
+  e.pipeline("lm_head_argcat_partials_" + t);
+  e.in(h, 0); e.in(W, 1); e.out(part_val, 2); e.out(part_id, 3); e.in(bias, 4);
+  e.bytes(V, 5); e.bytes(K, 6); e.bytes(TILE_V, 7); e.bytes(num_vtiles, 8);
+  e.bytes(invtemp, 9); e.bytes(seed, 10); e.bytes(use_gumbel, 11); e.bytes(use_bias, 12);
+  e.dispatch(num_vtiles, T, 1, 32, 1, 1);
+}
+
+// argcat reduce: part_val@0 part_id@1 -> out_idx@2 ; num_vtiles@3 (i32) ; grid (T,) × 32.
+template <class E>
+void launch_lm_head_argcat_reduce(E& e, typename E::in_t part_val, typename E::in_t part_id,
+                                  typename E::out_t out_idx, int num_vtiles, int T) {
+  e.pipeline("lm_head_argcat_reduce");
+  e.in(part_val, 0); e.in(part_id, 1); e.out(out_idx, 2); e.bytes(num_vtiles, 3);
+  e.dispatch(T, 1, 1, 32, 1, 1);
+}
+
+// topk partials: h@0 W@1 -> part_val@2 part_id@3 ; bias@4 ; V@5 K@6 TILE_V@7 num_vtiles@8 topk@9
+//   use_bias@10 (i32) ; grid (num_vtiles, T) × 32.
+template <class E>
+void launch_lm_head_topk_partials(E& e, typename E::in_t h, typename E::in_t W,
+                                  typename E::out_t part_val, typename E::out_t part_id,
+                                  typename E::in_t bias, int V, int K, int TILE_V, int num_vtiles,
+                                  int topk, int use_bias, int T, const std::string& t) {
+  e.pipeline("lm_head_topk_partials_" + t);
+  e.in(h, 0); e.in(W, 1); e.out(part_val, 2); e.out(part_id, 3); e.in(bias, 4);
+  e.bytes(V, 5); e.bytes(K, 6); e.bytes(TILE_V, 7); e.bytes(num_vtiles, 8);
+  e.bytes(topk, 9); e.bytes(use_bias, 10);
+  e.dispatch(num_vtiles, T, 1, 32, 1, 1);
+}
+
+// topk reduce: part_val@0 part_id@1 -> out_idx@2 ; num_vtiles@3 topk@4 (i32) seed@5 (u32)
+//   invtemp@6 (f32) ; grid (T,) × 32.
+template <class E>
+void launch_lm_head_topk_reduce(E& e, typename E::in_t part_val, typename E::in_t part_id,
+                                typename E::out_t out_idx, int num_vtiles, int topk, unsigned seed,
+                                float invtemp, int T) {
+  e.pipeline("lm_head_topk_reduce");
+  e.in(part_val, 0); e.in(part_id, 1); e.out(out_idx, 2);
+  e.bytes(num_vtiles, 3); e.bytes(topk, 4); e.bytes(seed, 5); e.bytes(invtemp, 6);
+  e.dispatch(T, 1, 1, 32, 1, 1);
+}
+
 // ----- flux_gelu: D@0 A@1 B@2 bias@3 ; N@4 K@5 M@6 (i32) ; grid (M/32, N/32, 1) -----
 // out = gelu(A@B + bias); A (N,K), B (K,M), bias (M,).
 template <class E>

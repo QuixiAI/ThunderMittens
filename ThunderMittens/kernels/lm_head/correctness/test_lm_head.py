@@ -1,0 +1,115 @@
+"""Correctness tests for the fused LM-head + sampling kernels.
+
+tk.lm_head_sample(h, W, mode, ...) selects a decode token per row of h WITHOUT materializing the
+(T, V) logits. The oracle computes the full logits (h @ W.T) from the SAME rounded inputs the kernel
+sees and runs the reference sampler; the Gumbel noise is indexed by the global vocab id so the fused
+draw matches the unfused sampler. Because the fused serial dot differs from a numpy dot by ULPs, the
+selection is validated with a tie tolerance (a fused pick whose logit is within eps of the winner is
+a valid draw).
+
+Run from kernels/:  python -m pytest lm_head/correctness/test_lm_head.py -v
+"""
+
+import mlx.core as mx
+import numpy as np
+import pytest
+
+import tk
+
+_MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
+
+
+def _rng_uniform(seed, a, b):
+    x = (np.uint32(seed) * np.uint32(0x9E3779B9) + np.uint32(a) * np.uint32(0x85EBCA77)
+         + np.uint32(b) * np.uint32(0xC2B2AE3D)).astype(np.uint32)
+    x ^= x >> np.uint32(16); x *= np.uint32(0x7FEB352D)
+    x ^= x >> np.uint32(15); x *= np.uint32(0x846CA68B)
+    x ^= x >> np.uint32(16)
+    return np.float32(x >> np.uint32(8)) * np.float32(1.0 / 16777216.0)
+
+
+def _gumbel(seed, a, b):
+    u = max(float(_rng_uniform(seed, a, b)), 1e-20)
+    return -np.log(-np.log(u))
+
+
+def _logits(hm, Wm):
+    hb = np.array(hm.astype(mx.float32)).astype(np.float64)
+    Wb = np.array(Wm.astype(mx.float32)).astype(np.float64)
+    return hb @ Wb.T
+
+
+def _mk(T, V, K, dtype, seed=0):
+    rng = np.random.default_rng(seed)
+    h = (0.5 * rng.standard_normal((T, K))).astype(np.float32)
+    W = (0.5 * rng.standard_normal((V, K))).astype(np.float32)
+    return mx.array(h).astype(_MX[dtype]), mx.array(W).astype(_MX[dtype])
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("T,V,K", [(1, 32000, 2048), (8, 1000, 512), (4, 128256, 1024)])
+def test_argmax(dtype, T, V, K):
+    hm, Wm = _mk(T, V, K, dtype)
+    tok = np.array(tk.lm_head_sample(hm, Wm, mode="argmax"))
+    L = _logits(hm, Wm)
+    assert tok.shape == (T,)
+    for t in range(T):
+        assert tok[t] == L[t].argmax() or (L[t].max() - L[t, tok[t]]) < 1e-3
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("T,V,K", [(4, 32000, 2048), (8, 1000, 512)])
+def test_categorical(dtype, T, V, K):
+    hm, Wm = _mk(T, V, K, dtype)
+    temp, seed = 0.8, 123
+    tok = np.array(tk.lm_head_sample(hm, Wm, mode="categorical", temperature=temp, seed=seed))
+    L = _logits(hm, Wm)
+    for t in range(T):
+        P = L[t] / temp + np.array([_gumbel(seed, t, v) for v in range(V)])
+        assert tok[t] == P.argmax() or (P.max() - P[tok[t]]) < 2e-3
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("k", [1, 8, 40])
+def test_topk(dtype, k):
+    T, V, K = 4, 32000, 1024
+    hm, Wm = _mk(T, V, K, dtype)
+    temp, seed = 0.7, 7
+    tok = np.array(tk.lm_head_sample(hm, Wm, mode="topk", k=k, temperature=temp, seed=seed))
+    L = _logits(hm, Wm)
+    for t in range(T):
+        top = set(int(v) for v in np.argsort(-L[t], kind="stable")[:k])
+        # the picked token is one of the top-k (boundary ties tolerated), and if k==1 it's the argmax
+        assert tok[t] in top or (L[t].max() - L[t, tok[t]]) < 1e-3
+        if k == 1:
+            assert tok[t] == L[t].argmax() or (L[t].max() - L[t, tok[t]]) < 1e-3
+
+
+def test_bias():
+    T, V, K = 2, 500, 256
+    hm, Wm = _mk(T, V, K, "float32")
+    rng = np.random.default_rng(1)
+    bias = rng.standard_normal(V).astype(np.float32)
+    tok = np.array(tk.lm_head_sample(hm, Wm, mode="argmax", bias=mx.array(bias)))
+    L = _logits(hm, Wm) + bias[None]
+    for t in range(T):
+        assert tok[t] == L[t].argmax() or (L[t].max() - L[t, tok[t]]) < 1e-3
+
+
+def test_matches_argmax_sample():
+    # Fused argmax == materialize-logits + tk.argmax_sample (same rounded logits path).
+    T, V, K = 4, 2000, 512
+    hm, Wm = _mk(T, V, K, "float32", seed=3)
+    fused = np.array(tk.lm_head_sample(hm, Wm, mode="argmax"))
+    L = mx.matmul(hm, Wm.T)
+    unfused = np.array(tk.argmax_sample(L))
+    Ln = np.array(L)
+    for t in range(T):
+        assert fused[t] == unfused[t] or abs(Ln[t, fused[t]] - Ln[t, unfused[t]]) < 1e-3
+
+
+if __name__ == "__main__":
+    test_argmax("bfloat16", 1, 32000, 2048)
+    test_categorical("float32", 4, 32000, 2048)
+    test_topk("float32", 8)
+    print("ok")

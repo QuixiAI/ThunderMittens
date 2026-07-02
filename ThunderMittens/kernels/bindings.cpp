@@ -450,6 +450,19 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "beam_advance",
+      &beam_advance,
+      "logits"_a,
+      "cum_log_probs"_a,
+      "beam_width"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        beam-search advance: one fused log-softmax + cumulative-score + top-beam_width step.
+        Returns [next_token (B,BM), parent_beam (B,BM), cum_log_probs' (B,BM)].
+      )");
+
+    m.def(
       "apply_penalty",
       &apply_penalty,
       "logits"_a,

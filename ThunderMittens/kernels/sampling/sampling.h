@@ -179,4 +179,61 @@ class ApplyPenalty : public Primitive {
   int eos_id_, min_length_, gen_len_;
 };
 
+/**
+ *  Beam-search advance: one fused step of log-softmax + cumulative score + top-beam_width selection
+ *  with parent tracking. logits (B*BM, V) f32/f16/bf16, cum_log_probs (B, BM) f32. Returns
+ *  [next_token (B, BM) int32, parent_beam (B, BM) int32, new_cum_log_probs (B, BM) f32].
+ *  beam_width (BM) <= 16. Step-0 convention: the caller sets cum_log_probs[:, 1:] = -inf.
+ **/
+std::vector<array> beam_advance(
+    const array& logits,
+    const array& cum_log_probs,
+    int beam_width,
+    StreamOrDevice s = {});
+
+class BeamTopkPartials : public Primitive {
+ public:
+  BeamTopkPartials(Stream stream, int two_bm) : Primitive(stream), two_bm_(two_bm) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "BeamTopkPartials"; }
+  void print(std::ostream& os) override { os << "BeamTopkPartials"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return two_bm_ == static_cast<const BeamTopkPartials&>(other).two_bm_;
+  }
+
+ private:
+  int two_bm_;
+};
+
+class BeamSelect : public Primitive {
+ public:
+  BeamSelect(Stream stream, int beam_width, int two_bm)
+      : Primitive(stream), beam_width_(beam_width), two_bm_(two_bm) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "BeamSelect"; }
+  void print(std::ostream& os) override { os << "BeamSelect"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const BeamSelect&>(other);
+    return beam_width_ == o.beam_width_ && two_bm_ == o.two_bm_;
+  }
+
+ private:
+  int beam_width_;
+  int two_bm_;
+};
+
 } // namespace mlx::core

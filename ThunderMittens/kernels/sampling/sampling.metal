@@ -234,6 +234,101 @@ kernel void top_p_sample(device const T *logits  [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------------------
+// Beam-search advance (two stages, the TRT-LLM / FasterTransformer recipe):
+//   beam_topk_partials : grid (B*BM,), one simdgroup per beam row. Computes the row's
+//     log-sum-exp, then its top-2BM candidates (2BM rounds of masked simd_argmax) and
+//     emits cand_score = cum_log_probs[beam] + (logit - lse), cand_token per candidate.
+//   beam_select : grid (B,), one simdgroup per batch. Global top-BM over the beam's
+//     BM*2BM candidates -> next_token, parent_beam, new cum_log_probs. Keeping 2BM per
+//     beam guarantees the union contains the flat top-BM over (BM*V). BM <= 16 (2BM <= 32).
+// ---------------------------------------------------------------------------
+template <typename T>
+kernel void beam_topk_partials(device const T   *logits        [[buffer(0)]],  // (B*BM, V)
+                               device const float *cum_log_probs [[buffer(1)]], // (B*BM,)
+                               device float     *cand_score     [[buffer(2)]],  // (B*BM, 2BM)
+                               device int       *cand_token     [[buffer(3)]],  // (B*BM, 2BM)
+                               constant int &V                  [[buffer(4)]],
+                               constant int &two_bm             [[buffer(5)]],
+                               uint row  [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    const long base = (long)row * V;
+    // log-sum-exp over the row (per-lane online, merged across the simdgroup).
+    float m = SMP_NEG_INF, l = 0.0f;
+    for (int i = (int)lane; i < V; i += 32) {
+        const float x = float(logits[base + i]);
+        const float nm = max(m, x);
+        l = l * exp(m - nm) + exp(x - nm);
+        m = nm;
+    }
+    const float M = simd_max(m);
+    l = simd_sum(l * exp(m - M));
+    const float lse = M + log(l);
+    const float cumr = cum_log_probs[row];
+
+    int chosen[SAMPLE_MAX_K];   // 2BM <= 32
+    for (int k = 0; k < two_bm; ++k) {
+        float best = SMP_NEG_INF;
+        int bi = (int)lane < V ? (int)lane : 0;
+        for (int i = (int)lane; i < V; i += 32) {
+            bool taken = false;
+            for (int j = 0; j < k; ++j) if (chosen[j] == i) taken = true;
+            if (taken) continue;
+            const float x = float(logits[base + i]);
+            if (x > best || (x == best && i < bi)) { best = x; bi = i; }
+        }
+        simd_argmax(best, bi);
+        chosen[k] = bi;
+        if (lane == 0) {
+            cand_token[(long)row * two_bm + k] = bi;
+            cand_score[(long)row * two_bm + k] = cumr + (best - lse);
+        }
+    }
+}
+
+kernel void beam_select(device const float *cand_score   [[buffer(0)]],  // (B*BM, 2BM)
+                        device const int   *cand_token   [[buffer(1)]],  // (B*BM, 2BM)
+                        device int         *next_token   [[buffer(2)]],  // (B, BM)
+                        device int         *parent_beam  [[buffer(3)]],  // (B, BM)
+                        device float       *new_cum      [[buffer(4)]],  // (B, BM)
+                        constant int &BM                 [[buffer(5)]],
+                        constant int &two_bm             [[buffer(6)]],
+                        uint b    [[threadgroup_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    const int ncand = BM * two_bm;
+    const long row0 = (long)b * BM;   // first beam row of batch b
+    int chosen[16];                   // BM <= 16 selected flat candidate indices
+    for (int k = 0; k < BM; ++k) {
+        float best = SMP_NEG_INF;
+        int bc = -1;
+        for (int c = (int)lane; c < ncand; c += 32) {
+            bool taken = false;
+            for (int mchosen = 0; mchosen < k; ++mchosen) if (chosen[mchosen] == c) taken = true;
+            if (taken) continue;
+            const int i = c / two_bm, j = c - i * two_bm;
+            const float sc = cand_score[(row0 + i) * two_bm + j];
+            if (sc > best || (sc == best && c < bc)) { best = sc; bc = c; }
+        }
+        int gc = (bc < 0) ? 0x7fffffff : bc;
+        simd_argmax(best, gc);
+        chosen[k] = gc;
+        if (lane == 0) {
+            const int i = gc / two_bm, j = gc - i * two_bm;
+            next_token[(long)b * BM + k] = cand_token[(row0 + i) * two_bm + j];
+            parent_beam[(long)b * BM + k] = i;
+            new_cum[(long)b * BM + k] = best;
+        }
+    }
+}
+
+#define instantiate_beam(type_name, T)                                          \
+  template [[host_name("beam_topk_partials_" #type_name)]] [[kernel]] void       \
+  beam_topk_partials<T>(device const T *logits [[buffer(0)]],                    \
+    device const float *cum_log_probs [[buffer(1)]], device float *cand_score [[buffer(2)]], \
+    device int *cand_token [[buffer(3)]], constant int &V [[buffer(4)]],         \
+    constant int &two_bm [[buffer(5)]],                                          \
+    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
 #define instantiate_sampling(type_name, T)                                     \
   template [[host_name("argmax_" #type_name)]] [[kernel]] void                 \
   argmax<T>(device const T *logits [[buffer(0)]],                             \
@@ -286,3 +381,7 @@ kernel void top_p_sample(device const T *logits  [[buffer(0)]],
 instantiate_sampling(float32, float)
 instantiate_sampling(float16, half)
 instantiate_sampling(bfloat16, bf16)
+
+instantiate_beam(float32, float)
+instantiate_beam(float16, half)
+instantiate_beam(bfloat16, bf16)

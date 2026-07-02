@@ -706,6 +706,34 @@ def attn_cases(be, preset, formats):
                        flops=flops / (2 if causal else 1))
 
 
+@register("beam")
+def beam_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(151)
+    # (B, beam_width, V)
+    shapes = _pick(preset, [(4, 4, 32000)],
+                   [(4, 4, 32000), (8, 8, 32000)],
+                   [(4, 4, 128256), (8, 8, 128256), (16, 4, 128256)])
+    for B, BM, V in shapes:
+        logits = (rng.standard_normal((B * BM, V))).astype(np.float32)
+        cum = rng.standard_normal((B, BM)).astype(np.float32)
+        lg = be.array(logits, "bf16")
+        cm = be.array(cum, "f32")
+        baselines = {}
+        if be.name == "mlx":
+            mx = be.mx
+
+            def framework_beam(lg=lg, cm=cm, B=B, BM=BM, V=V):
+                logp = lg.astype(mx.float32) - mx.logsumexp(lg.astype(mx.float32), axis=1,
+                                                            keepdims=True)
+                sc = (logp.reshape(B, BM, V) + cm.reshape(B, BM, 1)).reshape(B, BM * V)
+                return mx.argpartition(-sc, BM, axis=1)[:, :BM]
+            baselines["framework_logsoftmax_topk"] = framework_beam
+        yield Case("beam", f"advance_B{B}_BM{BM}_V{V}", {"B": B, "BM": BM, "V": V}, "bf16",
+                   target=lambda lg=lg, cm=cm, BM=BM: tk.beam_advance(lg, cm, BM),
+                   baselines=baselines, ref=None, bytes_moved=float(B * BM * V * 2))
+
+
 @register("cross_entropy")
 def cross_entropy_cases(be, preset, formats):
     tk = be.tk()

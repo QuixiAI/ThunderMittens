@@ -428,6 +428,31 @@ void launch_top_k_sample(E& e, typename E::in_t logits, typename E::out_t out_id
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
+// ----- beam_topk_partials: logits@0 cum_log_probs@1 -> cand_score@2 cand_token@3 ; V@4 two_bm@5
+//        (i32) ; grid (B*BM,) × 32. Per-beam log-softmax top-2BM candidate scores. -----
+template <class E>
+void launch_beam_topk_partials(E& e, typename E::in_t logits, typename E::in_t cum_log_probs,
+                               typename E::out_t cand_score, typename E::out_t cand_token,
+                               int rows, int V, int two_bm, const std::string& type_name) {
+  e.pipeline("beam_topk_partials_" + type_name);
+  e.in(logits, 0); e.in(cum_log_probs, 1); e.out(cand_score, 2); e.out(cand_token, 3);
+  e.bytes(V, 4); e.bytes(two_bm, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- beam_select: cand_score@0 cand_token@1 -> next_token@2 parent_beam@3 new_cum@4 ; BM@5
+//        two_bm@6 (i32) ; grid (B,) × 32. Global top-BM over the batch's BM*2BM candidates. -----
+template <class E>
+void launch_beam_select(E& e, typename E::in_t cand_score, typename E::in_t cand_token,
+                        typename E::out_t next_token, typename E::out_t parent_beam,
+                        typename E::out_t new_cum, int B, int BM, int two_bm) {
+  e.pipeline("beam_select");
+  e.in(cand_score, 0); e.in(cand_token, 1);
+  e.out(next_token, 2); e.out(parent_beam, 3); e.out(new_cum, 4);
+  e.bytes(BM, 5); e.bytes(two_bm, 6);
+  e.dispatch(B, 1, 1, 32, 1, 1);
+}
+
 // ----- top_p_sample: logits@0 -> out_idx@1(i32) ; V@2(i32) p@3(f32) seed@4(u32) invtemp@5(f32) ;
 //        grid (rows,1,1), 32 thr. Gumbel-max sampling from the nucleus (cumulative prob >= p). -----
 template <class E>

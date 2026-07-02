@@ -172,6 +172,18 @@ def test_cross_entropy_parity(eps, z):
     _assert_parity(gm, gt, atol=6e-2)
 
 
+@pytest.mark.parametrize("B,BM,V", [(2, 4, 4000), (3, 8, 4000)])
+def test_beam_advance_parity(B, BM, V):
+    rng = np.random.default_rng(7)
+    logits = (rng.standard_normal((B * BM, V)) * 2.0).astype(np.float32)
+    cum = rng.standard_normal((B, BM)).astype(np.float32)
+    om = tk.beam_advance(_mk(logits, "mlx", "f32"), mx.array(cum), BM)
+    ot = tk.beam_advance(_mk(logits, "torch", "f32"), torch.from_numpy(cum).to("mps"), BM)
+    _assert_parity(om[0], ot[0], atol=0)     # token ids: exact
+    _assert_parity(om[1], ot[1], atol=0)     # parents: exact
+    _assert_parity(om[2], ot[2], atol=1e-4)  # scores
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_rms_norm_parity(shape):
     D = shape[-1]

@@ -493,6 +493,13 @@ def top_p_sample(logits: torch.Tensor, p: float, temperature: float = 1.0, seed:
     return _ext.top_p_sample(logits, float(p), float(temperature), int(seed))
 
 
+def beam_advance(logits, cum_log_probs, beam_width):
+    """Beam-search advance: fused log-softmax + cumulative score + top-beam_width with parent
+    tracking. logits (B*BM, V), cum_log_probs (B, BM). Returns (next_token, parent_beam,
+    cum_log_probs') each (B, BM). beam_width <= 16. MPS."""
+    return _ext.beam_advance(logits, cum_log_probs, int(beam_width))
+
+
 def apply_penalty(logits: torch.Tensor, prev_tokens: torch.Tensor, temperature: float = 1.0,
                   repetition_penalty: float = 1.0, presence_penalty: float = 0.0,
                   frequency_penalty: float = 0.0, bias=None, eos_id: int = -1,

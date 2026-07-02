@@ -1381,6 +1381,36 @@ static at::Tensor top_k_sample_mps(const at::Tensor& logits_in, int64_t k, doubl
 }
 
 // Temperature + repetition/presence/frequency penalties. Returns the penalized logits.
+// Beam-search advance: fused log-softmax + cumulative score + top-beam_width with parent tracking.
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> beam_advance_mps(
+    const at::Tensor& logits_in, const at::Tensor& cum_in, int64_t beam_width) {
+  TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
+              "beam_advance: logits must be a float MPS tensor");
+  TORCH_CHECK(logits_in.dim() == 2 && cum_in.dim() == 2 && cum_in.size(1) == beam_width,
+              "beam_advance: logits (B*BM, V), cum_log_probs (B, BM)");
+  TORCH_CHECK(beam_width >= 1 && beam_width <= 16, "beam_advance: beam_width must be in [1, 16]");
+  const int BM = static_cast<int>(beam_width);
+  const int B = cum_in.size(0), BR = logits_in.size(0), V = logits_in.size(1);
+  TORCH_CHECK(BR == B * BM, "beam_advance: logits rows must equal B * beam_width");
+  const int two_bm = 2 * BM;
+  auto logits = logits_in.contiguous();
+  auto cum = cum_in.to(at::kFloat).contiguous().view({BR});
+  auto f32 = logits.options().dtype(at::kFloat);
+  auto i32 = logits.options().dtype(at::kInt);
+  auto cand_score = at::empty({BR, two_bm}, f32);
+  auto cand_token = at::empty({BR, two_bm}, i32);
+  auto next_token = at::empty({B, BM}, i32);
+  auto parent_beam = at::empty({B, BM}, i32);
+  auto new_cum = at::empty({B, BM}, f32);
+  const std::string tn = tk_type_name(logits);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_beam_topk_partials(e, logits, cum, cand_score, cand_token, BR, V, two_bm, tn);
+    tk::launch_beam_select(e, cand_score, cand_token, next_token, parent_beam, new_cum, B, BM,
+                           two_bm);
+  });
+  return {next_token, parent_beam, new_cum};
+}
+
 static at::Tensor apply_penalty_mps(const at::Tensor& logits_in, const at::Tensor& prev_in,
                                     const at::Tensor& bias_in, const at::Tensor& parent_in,
                                     double temperature,
@@ -2147,6 +2177,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sample_categorical", &sample_categorical_mps, "ThunderMittens Gumbel-max sampling (MPS)");
   m.def("top_k_sample", &top_k_sample_mps, "ThunderMittens top-k sampling (MPS)");
   m.def("top_p_sample", &top_p_sample_mps, "ThunderMittens top-p nucleus sampling (MPS)");
+  m.def("beam_advance", &beam_advance_mps, "ThunderMittens beam-search advance (MPS)");
   m.def("apply_penalty", &apply_penalty_mps, "ThunderMittens logit penalties (MPS)");
   m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8_mps, "ThunderMittens per-tensor fp8 quant (MPS)");
   m.def("quantize_per_tensor_int8", &quantize_per_tensor_int8_mps, "ThunderMittens per-tensor int8 quant (MPS)");

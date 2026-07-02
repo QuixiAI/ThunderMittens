@@ -842,6 +842,22 @@ def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None)
     return _mlx().lm_head_sample(h, W, b, m, int(k), float(temperature), int(seed))
 
 
+def beam_advance(logits, cum_log_probs, beam_width):
+    """Beam-search advance: one fused log-softmax + cumulative-score + top-beam_width step with
+    parent tracking. logits (B*BM, V), cum_log_probs (B, BM). Returns (next_token (B,BM) int32,
+    parent_beam (B,BM) int32, cum_log_probs' (B,BM) f32). beam_width <= 16. Step-0 convention: set
+    cum_log_probs[:, 1:] = -inf. Accepts mlx.array or torch.Tensor (MPS).
+
+    Note: the candidate search does 2*beam_width masked-argmax passes over the vocab, so for large V
+    it is slower than a single framework argpartition; the value is the fused, exact
+    (token, parent, score) selection in one call (no host gather/reshape). A single-pass register-heap
+    top-k is the perf follow-up."""
+    if _is_torch(logits):
+        return _torch().beam_advance(logits, cum_log_probs, int(beam_width))
+    out = _mlx().beam_advance(logits, cum_log_probs, int(beam_width))
+    return out[0], out[1], out[2]
+
+
 def apply_penalty(logits, prev_tokens, temperature=1.0, repetition_penalty=1.0,
                   presence_penalty=0.0, frequency_penalty=0.0, bias=None, eos_id=-1,
                   min_length=0, gen_len=0, parent_ids=None):

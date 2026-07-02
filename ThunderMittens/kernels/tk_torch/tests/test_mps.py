@@ -886,6 +886,28 @@ def test_cross_entropy(dtype, tol):
     assert np.abs(g.float().cpu().numpy() - lt.grad.numpy()).max() < tol
 
 
+@pytest.mark.parametrize("B,BM,V", [(2, 4, 4000), (3, 8, 4000)])
+def test_beam_advance(B, BM, V):
+    import numpy as np
+    rng = np.random.default_rng(B + BM)
+    logits = (rng.standard_normal((B * BM, V)) * 2.0).astype(np.float32)
+    cum = rng.standard_normal((B, BM)).astype(np.float32)
+    nt, pb, nc = tk_torch.beam_advance(torch.from_numpy(logits).to("mps"),
+                                       torch.from_numpy(cum).to("mps"), BM)
+    lg = logits.reshape(B, BM, V).astype(np.float64)
+    mx_ = lg.max(2, keepdims=True)
+    lse = np.log(np.exp(lg - mx_).sum(2, keepdims=True)) + mx_
+    scores = (lg - lse) + cum.reshape(B, BM, 1)
+    ont = np.zeros((B, BM), np.int32)
+    opb = np.zeros((B, BM), np.int32)
+    for b in range(B):
+        order = np.argsort(-scores[b].reshape(-1), kind="stable")[:BM]
+        opb[b] = order // V
+        ont[b] = order % V
+    np.testing.assert_array_equal(nt.cpu().numpy(), ont)
+    np.testing.assert_array_equal(pb.cpu().numpy(), opb)
+
+
 @pytest.mark.parametrize("nkm", [(40, 20, 48), (100, 50, 70), (33, 17, 65)])
 def test_matmul_arbitrary(nkm):
     N, K, M = nkm

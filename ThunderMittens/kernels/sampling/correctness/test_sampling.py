@@ -10,7 +10,52 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty
+from tk import (argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty,
+                beam_advance)
+
+
+def _beam_oracle(logits, cum, B, BM, V):
+    """log_softmax + cum, then flat top-BM over (BM*V) per batch (ties: lowest flat index)."""
+    lg = logits.reshape(B, BM, V).astype(np.float64)
+    mx_ = lg.max(2, keepdims=True)
+    lse = np.log(np.exp(lg - mx_).sum(2, keepdims=True)) + mx_
+    scores = (lg - lse) + cum.reshape(B, BM, 1)
+    nt = np.zeros((B, BM), np.int32)
+    pb = np.zeros((B, BM), np.int32)
+    nc = np.zeros((B, BM))
+    for b in range(B):
+        flat = scores[b].reshape(-1)
+        order = np.argsort(-flat, kind="stable")[:BM]
+        for k, idx in enumerate(order):
+            pb[b, k] = idx // V
+            nt[b, k] = idx % V
+            nc[b, k] = flat[idx]
+    return nt, pb, nc
+
+
+@pytest.mark.parametrize("B,BM,V", [(2, 4, 32000), (1, 1, 1000), (3, 8, 4000), (2, 16, 4000)])
+def test_beam_advance(B, BM, V):
+    rng = np.random.default_rng(B + BM + V)
+    logits = (rng.standard_normal((B * BM, V)) * 2.0).astype(np.float32)
+    cum = rng.standard_normal((B, BM)).astype(np.float32)
+    nt, pb, nc = beam_advance(mx.array(logits), mx.array(cum), BM)
+    mx.eval(nt, pb, nc)
+    ont, opb, onc = _beam_oracle(logits.astype(np.float64), cum.astype(np.float64), B, BM, V)
+    np.testing.assert_array_equal(np.array(nt), ont)      # exact tokens (f32, no ties)
+    np.testing.assert_array_equal(np.array(pb), opb)      # exact parents
+    np.testing.assert_allclose(np.array(nc), onc, atol=1e-4)
+
+
+def test_beam_advance_step0():
+    # step-0 duplicate-beam suppression: cum[:, 1:] = -inf -> all beams pick from beam 0.
+    rng = np.random.default_rng(9)
+    B, BM, V = 2, 4, 5000
+    logits = (rng.standard_normal((B * BM, V)) * 2.0).astype(np.float32)
+    cum = np.full((B, BM), -1e30, np.float32)
+    cum[:, 0] = 0.0
+    nt, pb, nc = beam_advance(mx.array(logits), mx.array(cum), BM)
+    mx.eval(pb)
+    assert np.all(np.array(pb) == 0)   # every selected beam descends from beam 0
 
 
 def _softmax(z):

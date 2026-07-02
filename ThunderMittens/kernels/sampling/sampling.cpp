@@ -321,4 +321,104 @@ std::pair<std::vector<array>, std::vector<int>> ApplyPenalty::vmap(
   throw std::runtime_error("ApplyPenalty has no vmap implementation.");
 }
 
+// ----------------------------- beam_advance -----------------------------
+
+std::vector<array> beam_advance(
+    const array& logits,
+    const array& cum_log_probs,
+    int beam_width,
+    StreamOrDevice s /* = {} */) {
+  if (logits.ndim() != 2) {
+    throw std::invalid_argument("beam_advance: logits must be (B*BM, V)");
+  }
+  if (cum_log_probs.ndim() != 2 || cum_log_probs.shape(1) != beam_width) {
+    throw std::invalid_argument("beam_advance: cum_log_probs must be (B, beam_width)");
+  }
+  if (beam_width < 1 || beam_width > 16) {
+    throw std::invalid_argument("beam_advance: beam_width must be in [1, 16]");
+  }
+  const int B = cum_log_probs.shape(0);
+  const int BR = logits.shape(0);
+  if (BR != B * beam_width) {
+    throw std::invalid_argument("beam_advance: logits rows must equal B * beam_width");
+  }
+  const int two_bm = 2 * beam_width;
+  auto logits_c = contiguous(logits, false, s);
+  auto cum_c = contiguous(astype(reshape(cum_log_probs, {BR}, s), float32, s), false, s);
+
+  auto cands = array::make_arrays(
+      {{BR, two_bm}, {BR, two_bm}}, {float32, int32},
+      std::make_shared<BeamTopkPartials>(to_stream(s), two_bm),
+      {logits_c, cum_c});
+
+  return array::make_arrays(
+      {{B, beam_width}, {B, beam_width}, {B, beam_width}}, {int32, int32, float32},
+      std::make_shared<BeamSelect>(to_stream(s), beam_width, two_bm),
+      {cands[0], cands[1]});
+}
+
+void BeamTopkPartials::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("BeamTopkPartials has no CPU implementation.");
+}
+void BeamTopkPartials::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& logits = inputs[0];
+  auto& cum = inputs[1];
+  auto& cand_score = outputs[0];
+  auto& cand_token = outputs[1];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  cand_score.set_data(allocator::malloc_or_wait(cand_score.nbytes()));
+  cand_token.set_data(allocator::malloc_or_wait(cand_token.nbytes()));
+
+  const int BR = logits.shape(0);
+  const int V = logits.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_beam_topk_partials(enc, logits, cum, cand_score, cand_token, BR, V, two_bm_,
+                                type_to_name(logits));
+}
+
+void BeamSelect::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("BeamSelect has no CPU implementation.");
+}
+void BeamSelect::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& cand_score = inputs[0];
+  auto& cand_token = inputs[1];
+  auto& next_token = outputs[0];
+  auto& parent_beam = outputs[1];
+  auto& new_cum = outputs[2];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  next_token.set_data(allocator::malloc_or_wait(next_token.nbytes()));
+  parent_beam.set_data(allocator::malloc_or_wait(parent_beam.nbytes()));
+  new_cum.set_data(allocator::malloc_or_wait(new_cum.nbytes()));
+
+  const int B = next_token.shape(0);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_beam_select(enc, cand_score, cand_token, next_token, parent_beam, new_cum, B,
+                         beam_width_, two_bm_);
+}
+
+#define TK_BEAM_NO_AUTODIFF(CLASS, LABEL)                                    \
+  std::vector<array> CLASS::jvp(                                             \
+      const std::vector<array>&, const std::vector<array>&,                  \
+      const std::vector<int>&) {                                             \
+    throw std::runtime_error(LABEL " has no jvp implementation.");           \
+  }                                                                          \
+  std::vector<array> CLASS::vjp(                                             \
+      const std::vector<array>&, const std::vector<array>&,                  \
+      const std::vector<int>&, const std::vector<array>&) {                  \
+    throw std::runtime_error(LABEL " has no vjp implementation.");           \
+  }                                                                          \
+  std::pair<std::vector<array>, std::vector<int>> CLASS::vmap(               \
+      const std::vector<array>&, const std::vector<int>&) {                  \
+    throw std::runtime_error(LABEL " has no vmap implementation.");          \
+  }
+
+TK_BEAM_NO_AUTODIFF(BeamTopkPartials, "BeamTopkPartials")
+TK_BEAM_NO_AUTODIFF(BeamSelect, "BeamSelect")
+
 } // namespace mlx::core

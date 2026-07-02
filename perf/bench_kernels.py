@@ -706,6 +706,32 @@ def attn_cases(be, preset, formats):
                        flops=flops / (2 if causal else 1))
 
 
+@register("cross_entropy")
+def cross_entropy_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(141)
+    shapes = _pick(preset, [(1024, 32000)],
+                   [(1024, 32000), (2048, 128256)],
+                   [(1024, 32000), (2048, 128256), (4096, 128256)])
+    for T, V in shapes:
+        logits = (rng.standard_normal((T, V))).astype(np.float32)
+        tgt = rng.integers(0, V, size=(T,)).astype(np.int32)
+        lg = be.array(logits, "bf16")
+        tg = be.int_array(tgt)
+        baselines = {}
+        if be.name == "mlx":
+            mx = be.mx
+
+            def framework_ce(lg=lg, tg=tg):
+                lse = mx.logsumexp(lg.astype(mx.float32), axis=1)
+                xy = mx.take_along_axis(lg.astype(mx.float32), tg[:, None].astype(mx.int32), axis=1)[:, 0]
+                return (lse - xy).mean()
+            baselines["framework_lse_gather"] = framework_ce
+        yield Case("cross_entropy", f"fwd_T{T}_V{V}", {"T": T, "V": V}, "bf16",
+                   target=lambda lg=lg, tg=tg: tk.cross_entropy(lg, tg, reduction="mean"),
+                   baselines=baselines, ref=None, bytes_moved=float(T * V * 2))
+
+
 @register("lm_head")
 def lm_head_cases(be, preset, formats):
     tk = be.tk()

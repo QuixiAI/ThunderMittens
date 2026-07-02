@@ -862,6 +862,30 @@ def test_lm_head_sample(mode, k):
             assert (L[t].max() - L[t, tok[t]]) < (1e-2 if mode == "argmax" else 40.0)
 
 
+@pytest.mark.parametrize("dtype,tol", [(torch.float32, 3e-3), (torch.bfloat16, 6e-2)])
+def test_cross_entropy(dtype, tol):
+    import numpy as np
+    import torch.nn.functional as F
+    import tk
+    rng = np.random.default_rng(6)
+    T, V = 8, 4000
+    logits = (rng.standard_normal((T, V)) * 2.0).astype(np.float32)
+    tgt = rng.integers(0, V, size=(T,)).astype(np.int32)
+    tgt[:2] = -100
+    lm = torch.from_numpy(logits).to(dtype).to("mps")
+    tm = torch.from_numpy(tgt.astype(np.int64)).to("mps")
+    loss, lse = tk.cross_entropy(lm, tm, reduction="none", return_lse=True)
+    ref = F.cross_entropy(torch.from_numpy(logits), torch.from_numpy(tgt.astype(np.int64)),
+                          ignore_index=-100, reduction="none").numpy()
+    assert np.abs(loss.float().cpu().numpy() - ref).max() < tol
+    n = max(int((tgt != -100).sum()), 1)
+    g = tk.cross_entropy_grad(lm, tm, lse, torch.full((T,), 1.0 / n, device="mps"))
+    lt = torch.from_numpy(logits).requires_grad_(True)
+    F.cross_entropy(lt, torch.from_numpy(tgt.astype(np.int64)), ignore_index=-100,
+                    reduction="mean").backward()
+    assert np.abs(g.float().cpu().numpy() - lt.grad.numpy()).max() < tol
+
+
 @pytest.mark.parametrize("nkm", [(40, 20, 48), (100, 50, 70), (33, 17, 65)])
 def test_matmul_arbitrary(nkm):
     N, K, M = nkm

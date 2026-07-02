@@ -51,6 +51,7 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.cpp
     ${CMAKE_CURRENT_LIST_DIR}/attn_varlen/attn_varlen.cpp
     ${CMAKE_CURRENT_LIST_DIR}/lm_head/lm_head.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/cross_entropy/cross_entropy.cpp
     ${CMAKE_CURRENT_LIST_DIR}/flux/flux.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.cpp
     ${CMAKE_CURRENT_LIST_DIR}/attn_multiwarp/attn_multiwarp.cpp
@@ -111,6 +112,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.metal
         ${CMAKE_CURRENT_LIST_DIR}/attn_varlen/attn_varlen.metal
         ${CMAKE_CURRENT_LIST_DIR}/lm_head/lm_head.metal
+        ${CMAKE_CURRENT_LIST_DIR}/cross_entropy/cross_entropy.metal
         ${CMAKE_CURRENT_LIST_DIR}/flux/flux.metal
         ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.metal
         ${CMAKE_CURRENT_LIST_DIR}/attn_multiwarp/attn_multiwarp.metal

@@ -1173,6 +1173,32 @@ void launch_lm_head_topk_reduce(E& e, typename E::in_t part_val, typename E::in_
   e.dispatch(T, 1, 1, 32, 1, 1);
 }
 
+// ----- cross_entropy fwd: logits@0 targets@1 -> loss@2 lse@3 ; V@4 ignore_index@5 (i32)
+//        label_smoothing@6 z_loss@7 (f32) ; grid (T,) × 32 (one simdgroup per row). -----
+template <class E>
+void launch_cross_entropy_fwd(E& e, typename E::in_t logits, typename E::in_t targets,
+                              typename E::out_t loss, typename E::out_t lse, int V,
+                              int ignore_index, float label_smoothing, float z_loss, int T,
+                              const std::string& t) {
+  e.pipeline("cross_entropy_fwd_" + t);
+  e.in(logits, 0); e.in(targets, 1); e.out(loss, 2); e.out(lse, 3);
+  e.bytes(V, 4); e.bytes(ignore_index, 5); e.bytes(label_smoothing, 6); e.bytes(z_loss, 7);
+  e.dispatch(T, 1, 1, 32, 1, 1);
+}
+
+// ----- cross_entropy bwd: logits@0 targets@1 lse@2 grad_out@3 -> grad_logits@4 ; V@5
+//        ignore_index@6 (i32) label_smoothing@7 z_loss@8 (f32) ; grid (T,) × 32. -----
+template <class E>
+void launch_cross_entropy_bwd(E& e, typename E::in_t logits, typename E::in_t targets,
+                              typename E::in_t lse, typename E::in_t grad_out,
+                              typename E::out_t grad_logits, int V, int ignore_index,
+                              float label_smoothing, float z_loss, int T, const std::string& t) {
+  e.pipeline("cross_entropy_bwd_" + t);
+  e.in(logits, 0); e.in(targets, 1); e.in(lse, 2); e.in(grad_out, 3); e.out(grad_logits, 4);
+  e.bytes(V, 5); e.bytes(ignore_index, 6); e.bytes(label_smoothing, 7); e.bytes(z_loss, 8);
+  e.dispatch(T, 1, 1, 32, 1, 1);
+}
+
 // ----- flux_gelu: D@0 A@1 B@2 bias@3 ; N@4 K@5 M@6 (i32) ; grid (M/32, N/32, 1) -----
 // out = gelu(A@B + bias); A (N,K), B (K,M), bias (M,).
 template <class E>

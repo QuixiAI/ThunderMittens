@@ -77,6 +77,7 @@
 #include "attn_causal/attn_causal.h"
 #include "attn_varlen/attn_varlen.h"
 #include "lm_head/lm_head.h"
+#include "cross_entropy/cross_entropy.h"
 #include "flux/flux.h"
 #include "gemm_staged/gemm_staged.h"
 #include "attn_multiwarp/attn_multiwarp.h"
@@ -787,6 +788,36 @@ NB_MODULE(_ext, m) {
       R"(
         fused LM-head + sampling: token id per row without materializing (T,V) logits.
         mode 0=argmax, 1=categorical, 2=top-k
+      )");
+
+    m.def(
+      "cross_entropy_fwd",
+      &cross_entropy_fwd,
+      "logits"_a,
+      "targets"_a,
+      "ignore_index"_a,
+      "label_smoothing"_a,
+      "z_loss"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        fused cross-entropy forward: per-row [loss, lse] without storing probabilities
+      )");
+
+    m.def(
+      "cross_entropy_bwd",
+      &cross_entropy_bwd,
+      "logits"_a,
+      "targets"_a,
+      "lse"_a,
+      "grad_out"_a,
+      "ignore_index"_a,
+      "label_smoothing"_a,
+      "z_loss"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        fused cross-entropy backward: grad_logits (T,V), out-of-place
       )");
 
     m.def(

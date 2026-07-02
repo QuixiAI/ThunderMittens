@@ -149,6 +149,29 @@ def test_lm_head_sample_parity(mode, k):
     _assert_parity(om, ot, atol=0)   # integer token ids: exact
 
 
+@pytest.mark.parametrize("eps,z", [(0.0, 0.0), (0.1, 1e-4)])
+def test_cross_entropy_parity(eps, z):
+    rng = np.random.default_rng(6)
+    T, V = 8, 4000
+    logits = (rng.standard_normal((T, V)) * 2.0).astype(np.float32)
+    tgt = rng.integers(0, V, size=(T,)).astype(np.int32)
+    tgt[:2] = -100
+    lm_loss, lm_lse = tk.cross_entropy(_mk(logits, "mlx"), mx.array(tgt), reduction="none",
+                                       label_smoothing=eps, z_loss=z, return_lse=True)
+    lt_loss, lt_lse = tk.cross_entropy(_mk(logits, "torch"), torch.from_numpy(tgt).to("mps"),
+                                       reduction="none", label_smoothing=eps, z_loss=z,
+                                       return_lse=True)
+    _assert_parity(lm_loss, lt_loss, atol=6e-2)
+    _assert_parity(lm_lse, lt_lse, atol=6e-2)
+    # backward parity
+    go_m = mx.full((T,), 0.25, dtype=mx.float32)
+    gm = tk.cross_entropy_grad(_mk(logits, "mlx"), mx.array(tgt), lm_lse, go_m,
+                               label_smoothing=eps, z_loss=z)
+    gt = tk.cross_entropy_grad(_mk(logits, "torch"), torch.from_numpy(tgt).to("mps"), lt_lse,
+                               torch.full((T,), 0.25, device="mps"), label_smoothing=eps, z_loss=z)
+    _assert_parity(gm, gt, atol=6e-2)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_rms_norm_parity(shape):
     D = shape[-1]

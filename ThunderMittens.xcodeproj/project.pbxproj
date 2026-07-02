@@ -120,6 +120,7 @@
 				kernels/attn_causal/attn_causal.cpp,
 				kernels/attn_varlen/attn_varlen.cpp,
 				kernels/lm_head/lm_head.cpp,
+				kernels/cross_entropy/cross_entropy.cpp,
 				kernels/attn_multiwarp/attn_multiwarp.cpp,
 				kernels/attn_fwd/attn_fwd.cpp,
 				kernels/attn_fwd/correctness/c_attn.m,

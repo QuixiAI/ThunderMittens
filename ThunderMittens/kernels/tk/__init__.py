@@ -710,6 +710,109 @@ def top_p_sample(logits, p, temperature=1.0, seed=0):
     return _mlx().top_p_sample(logits, p, temperature=temperature, seed=seed)
 
 
+def cross_entropy(logits, targets, ignore_index=-100, reduction="mean", label_smoothing=0.0,
+                  z_loss=0.0, return_lse=False):
+    """Fused cross-entropy over the vocab axis WITHOUT storing the (T, V) probabilities.
+
+    logits (T, V) f32/f16/bf16, targets (T,) int. reduction in {"none", "mean", "sum"}. Supports
+    label_smoothing and a z-loss (z_loss * lse^2). Returns the reduced loss (scalar for mean/sum,
+    (T,) for none); if return_lse, also returns per-row lse (needed by cross_entropy_grad).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        import torch
+        loss, lse = _torch().cross_entropy_fwd(logits, targets, int(ignore_index),
+                                               float(label_smoothing), float(z_loss))
+        if reduction == "mean":
+            n = (targets != ignore_index).sum().clamp(min=1).to(loss.dtype)
+            out = loss.sum() / n
+        elif reduction == "sum":
+            out = loss.sum()
+        else:
+            out = loss
+        return (out, lse) if return_lse else out
+    import mlx.core as mx
+    loss, lse = _mlx().cross_entropy_fwd(logits, targets, int(ignore_index),
+                                         float(label_smoothing), float(z_loss))
+    if reduction == "mean":
+        n = mx.maximum((targets != ignore_index).sum(), 1).astype(loss.dtype)
+        out = loss.sum() / n
+    elif reduction == "sum":
+        out = loss.sum()
+    else:
+        out = loss
+    return (out, lse) if return_lse else out
+
+
+def cross_entropy_grad(logits, targets, lse, grad_out, ignore_index=-100, label_smoothing=0.0,
+                       z_loss=0.0):
+    """Fused cross-entropy backward: grad_logits (T, V), out-of-place. grad_out is the per-row
+    upstream gradient (T,) (e.g. 1/n_non_ignore for a mean reduction, or a scalar broadcast).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        import torch
+        if not torch.is_tensor(grad_out) or grad_out.dim() == 0:
+            grad_out = torch.full((logits.shape[0],), float(grad_out) if not torch.is_tensor(grad_out)
+                                  else float(grad_out.item()), dtype=torch.float32,
+                                  device=logits.device)
+        return _torch().cross_entropy_bwd(logits, targets, lse, grad_out, int(ignore_index),
+                                          float(label_smoothing), float(z_loss))
+    import mlx.core as mx
+    if not isinstance(grad_out, mx.array) or grad_out.ndim == 0:
+        val = float(grad_out) if not isinstance(grad_out, mx.array) else float(grad_out.item())
+        grad_out = mx.full((logits.shape[0],), val, dtype=mx.float32)
+    return _mlx().cross_entropy_bwd(logits, targets, lse, grad_out, int(ignore_index),
+                                    float(label_smoothing), float(z_loss))
+
+
+def fused_linear_cross_entropy(h, W, targets, chunk_size=4096, ignore_index=-100,
+                               label_smoothing=0.0, z_loss=0.0):
+    """Liger-style chunked fused-linear-CE: loss + grads for (h @ W.T) vs targets without ever
+    materializing the full (T, V) logits. Computes logits chunk by chunk over the token axis.
+    h (T, K), W (V, K); targets (T,). Returns (loss (mean over non-ignored), dh (T,K), dW (V,K)).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    is_t = _is_torch(h)
+    T = h.shape[0]
+    if is_t:
+        import torch
+        n = int((targets != ignore_index).sum().clamp(min=1).item())
+        dh = torch.zeros_like(h)
+        dW = torch.zeros_like(W)
+        total = torch.zeros((), dtype=torch.float32, device=h.device)
+        for c0 in range(0, T, chunk_size):
+            c1 = min(c0 + chunk_size, T)
+            hc = h[c0:c1]
+            tc = targets[c0:c1]
+            logits = hc @ W.T
+            loss_c, lse_c = _torch().cross_entropy_fwd(logits, tc, int(ignore_index),
+                                                       float(label_smoothing), float(z_loss))
+            total = total + loss_c.sum()
+            go = torch.full((c1 - c0,), 1.0 / n, dtype=torch.float32, device=h.device)
+            g = _torch().cross_entropy_bwd(logits, tc, lse_c, go, int(ignore_index),
+                                           float(label_smoothing), float(z_loss))
+            dh[c0:c1] = g @ W
+            dW = dW + g.T @ hc
+        return total / n, dh, dW
+    import mlx.core as mx
+    n = int(mx.maximum((targets != ignore_index).sum(), 1).item())
+    dh_parts = []
+    dW = mx.zeros(W.shape, dtype=W.dtype)
+    total = mx.zeros((), dtype=mx.float32)
+    for c0 in range(0, T, chunk_size):
+        c1 = min(c0 + chunk_size, T)
+        hc = h[c0:c1]
+        tc = targets[c0:c1]
+        logits = hc @ mx.swapaxes(W, 0, 1)
+        loss_c, lse_c = _mlx().cross_entropy_fwd(logits, tc, int(ignore_index),
+                                                 float(label_smoothing), float(z_loss))
+        total = total + loss_c.sum()
+        go = mx.full((c1 - c0,), 1.0 / n, dtype=mx.float32)
+        g = _mlx().cross_entropy_bwd(logits, tc, lse_c, go, int(ignore_index),
+                                     float(label_smoothing), float(z_loss))
+        dh_parts.append(mx.matmul(g, W))
+        dW = dW + mx.matmul(mx.swapaxes(g, 0, 1), hc)
+    return total / n, mx.concatenate(dh_parts, axis=0), dW
+
+
 _LM_HEAD_MODES = {"argmax": 0, "categorical": 1, "topk": 2}
 
 

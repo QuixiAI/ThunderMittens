@@ -1610,6 +1610,48 @@ static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W
   return out;
 }
 
+// Fused cross-entropy forward: per-row [loss, lse] without storing (T, V) probabilities.
+static std::tuple<at::Tensor, at::Tensor> cross_entropy_fwd_mps(
+    const at::Tensor& logits_in, const at::Tensor& targets_in, int64_t ignore_index,
+    double label_smoothing, double z_loss) {
+  TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
+              "cross_entropy_fwd: logits must be a float MPS tensor");
+  TORCH_CHECK(logits_in.dim() == 2, "cross_entropy_fwd: logits must be (T, V)");
+  auto logits = logits_in.contiguous();
+  auto targets = targets_in.to(at::kInt).contiguous();
+  const int T = logits.size(0), V = logits.size(1);
+  auto f32 = logits.options().dtype(at::kFloat);
+  auto loss = at::empty({T}, f32);
+  auto lse = at::empty({T}, f32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_cross_entropy_fwd(e, logits, targets, loss, lse, V, static_cast<int>(ignore_index),
+                                 static_cast<float>(label_smoothing), static_cast<float>(z_loss),
+                                 T, tk_type_name(logits));
+  });
+  return {loss, lse};
+}
+
+// Fused cross-entropy backward: grad_logits (T, V), out-of-place.
+static at::Tensor cross_entropy_bwd_mps(
+    const at::Tensor& logits_in, const at::Tensor& targets_in, const at::Tensor& lse_in,
+    const at::Tensor& grad_out_in, int64_t ignore_index, double label_smoothing, double z_loss) {
+  TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
+              "cross_entropy_bwd: logits must be a float MPS tensor");
+  TORCH_CHECK(logits_in.dim() == 2, "cross_entropy_bwd: logits must be (T, V)");
+  auto logits = logits_in.contiguous();
+  auto targets = targets_in.to(at::kInt).contiguous();
+  auto lse = lse_in.to(at::kFloat).contiguous();
+  auto grad_out = grad_out_in.to(at::kFloat).contiguous();
+  const int T = logits.size(0), V = logits.size(1);
+  auto grad_logits = at::empty_like(logits);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_cross_entropy_bwd(e, logits, targets, lse, grad_out, grad_logits, V,
+                                 static_cast<int>(ignore_index), static_cast<float>(label_smoothing),
+                                 static_cast<float>(z_loss), T, tk_type_name(logits));
+  });
+  return grad_logits;
+}
+
 static at::Tensor flux_gelu_mps(const at::Tensor& x_in, const at::Tensor& w_in,
                                 const at::Tensor& bias_in) {
   TORCH_CHECK(x_in.device().is_mps(), "flux_gelu: x must be an MPS tensor");
@@ -2115,6 +2157,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_varlen_prefill", &attn_varlen_prefill_mps,
         "ThunderMittens varlen/paged-prefill causal attention (MPS)");
   m.def("lm_head_sample", &lm_head_sample_mps, "ThunderMittens fused LM-head + sampling (MPS)");
+  m.def("cross_entropy_fwd", &cross_entropy_fwd_mps, "ThunderMittens fused cross-entropy fwd (MPS)");
+  m.def("cross_entropy_bwd", &cross_entropy_bwd_mps, "ThunderMittens fused cross-entropy bwd (MPS)");
   m.def("flux_gelu", &flux_gelu_mps, "ThunderMittens fused GEMM+GELU (MPS)");
   m.def("flux_gate", &flux_gate_mps, "ThunderMittens fused GEMM+gate+residual (MPS)");
   m.def("gemm_staged", &gemm_staged_mps, "ThunderMittens staged multi-simdgroup GEMM (MPS)");

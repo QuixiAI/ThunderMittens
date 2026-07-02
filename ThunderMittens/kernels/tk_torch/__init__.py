@@ -42,6 +42,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "attn_causal", "attn_causal.metal"),
     os.path.join(_KERNELS, "attn_varlen", "attn_varlen.metal"),
     os.path.join(_KERNELS, "lm_head", "lm_head.metal"),
+    os.path.join(_KERNELS, "cross_entropy", "cross_entropy.metal"),
     os.path.join(_KERNELS, "flux", "flux.metal"),
     os.path.join(_KERNELS, "gemm_staged", "gemm_staged.metal"),
     os.path.join(_KERNELS, "attn_multiwarp", "attn_multiwarp.metal"),
@@ -392,6 +393,18 @@ def lm_head_sample(h, W, bias, mode, k, temperature, seed):
     """Fused LM-head + sampling: token id per row of h without materializing (T,V) logits.
     mode 0=argmax, 1=categorical, 2=top-k. bias (V,) or a 1-elem dummy. Returns (T,) int32. MPS."""
     return _ext.lm_head_sample(h, W, bias, int(mode), int(k), float(temperature), int(seed))
+
+
+def cross_entropy_fwd(logits, targets, ignore_index, label_smoothing, z_loss):
+    """Fused cross-entropy forward. Returns (loss (T,), lse (T,)) f32. MPS."""
+    return _ext.cross_entropy_fwd(logits, targets, int(ignore_index),
+                                  float(label_smoothing), float(z_loss))
+
+
+def cross_entropy_bwd(logits, targets, lse, grad_out, ignore_index, label_smoothing, z_loss):
+    """Fused cross-entropy backward -> grad_logits (T,V), out-of-place. MPS."""
+    return _ext.cross_entropy_bwd(logits, targets, lse, grad_out, int(ignore_index),
+                                  float(label_smoothing), float(z_loss))
 
 
 def paged_attention_v2(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,

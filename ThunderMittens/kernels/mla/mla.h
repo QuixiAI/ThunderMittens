@@ -235,6 +235,37 @@ class MlaDecodePartition : public Primitive {
   int partition_size_;
 };
 
+// Partitioned fp8 MLA decode (dense OR sparse, distinguished by input count: 5 = dense
+// (q, data, scale, table, context_lens), 6 = sparse (…, indices, topk_length)). Emits
+// paged-v2-style partials combined by PagedAttentionV2Reduce.
+class MlaDecodeFp8Partition : public Primitive {
+ public:
+  MlaDecodeFp8Partition(Stream stream, float scale, int num_partitions, int partition_size)
+      : Primitive(stream), scale_(scale), num_partitions_(num_partitions),
+        partition_size_(partition_size) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MlaDecodeFp8Partition"; }
+  void print(std::ostream& os) override { os << "MlaDecodeFp8Partition"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const MlaDecodeFp8Partition&>(other);
+    return scale_ == o.scale_ && num_partitions_ == o.num_partitions_ &&
+           partition_size_ == o.partition_size_;
+  }
+
+ private:
+  float scale_;
+  int num_partitions_;
+  int partition_size_;
+};
+
 class MlaDecodeFp8 : public Primitive {
  public:
   MlaDecodeFp8(Stream stream, float scale) : Primitive(stream), scale_(scale) {}

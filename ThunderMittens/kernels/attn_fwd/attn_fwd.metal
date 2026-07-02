@@ -30,7 +30,10 @@ subexp2(thread RV &dst, thread const RV &lhs, thread const U &rhs) {
 }
 
 constant constexpr const int TN = 8;
-template <int D>
+// TNQ = query rows per simdgroup. Default 8; a 16-row variant halves the number of passes
+// over K/V (each pass streams the whole K/V) and is routed in for D=128 when N%16==0 — at
+// (2,16,4096,128) the 8-row tile fell to 7.4 TFLOP/s from K/V re-read pressure.
+template <int D, int TNQ = TN>
 kernel void attn_fwd(device   bf16     *q [[buffer(0)]],
                      device   bf16     *k [[buffer(1)]],
                      device   bf16     *v [[buffer(2)]],
@@ -46,12 +49,12 @@ kernel void attn_fwd(device   bf16     *q [[buffer(0)]],
     global_layout gl_v(v, nullptr, H, N, nullptr);
     global_layout gl_o(o, nullptr, H, N, nullptr);
     using st_qkv     = st_bf<TN, D>;
-    using rt_qkv     = rt_bf<TN, D>;
+    using rt_qkv     = rt_bf<TNQ, D>;
     using rt_k_t     = rt_bf<TN, D, ducks::rt_layout::col>;
-    using rt_att     = rt_fl<TN, TN>;
-    using rt_att_mma = rt_bf<TN, TN>;
-    using rt_o       = rt_fl<TN, D>;
-    using rv_att     = rt_fl<TN, TN>::col_vec;
+    using rt_att     = rt_fl<TNQ, TN>;
+    using rt_att_mma = rt_bf<TNQ, TN>;
+    using rt_o       = rt_fl<TNQ, D>;
+    using rv_att     = typename rt_fl<TNQ, TN>::col_vec;
 
     const int block = blockIdx.z;
     const int head = blockIdx.y;
@@ -60,7 +63,7 @@ kernel void attn_fwd(device   bf16     *q [[buffer(0)]],
     const int kv_blocks = N / st_qkv::rows;
     rt_qkv q_reg;
     rt_k_t k_reg;
-    rt_qkv v_reg;
+    rt_bf<TN, D> v_reg;   // K/V tiles stay 8 rows regardless of the Q-tile height
     rt_att att_block;
     rt_o o_reg;
     rv_att max_vec_last;
@@ -113,5 +116,19 @@ kernel void attn_fwd(device   bf16     *q [[buffer(0)]],
 
 instantiate_add_custom(64);
 instantiate_add_custom(128);
+
+// 16-row Q tiles (routed in when N % 16 == 0): halves the passes over K/V.
+#define instantiate_attn_fwd_q16(D)                                     \
+  template [[host_name("attn_fwd_" #D "_q16")]] [[kernel]] void         \
+  attn_fwd<D, 16>(device   bf16     *q [[buffer(0)]],                   \
+                  device   bf16     *k [[buffer(1)]],                   \
+                  device   bf16     *v [[buffer(2)]],                   \
+                  device   bf16     *o [[buffer(3)]],                   \
+                  constant unsigned &N [[buffer(4)]],                   \
+                  constant unsigned &H [[buffer(5)]],                   \
+                  uint3 blockIdx [[threadgroup_position_in_grid]],      \
+                  uint laneId [[thread_index_in_simdgroup]]);
+
+instantiate_attn_fwd_q16(128);
 
 }

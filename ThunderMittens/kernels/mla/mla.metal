@@ -558,6 +558,165 @@ kernel void mla_decode_fp8_sparse(device const bf16 *q            [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------------------
+// P4a-v2 / P4b-v2: partitioned variants of the fp8 dense/sparse decodes — the same
+// sequence-partition upgrade that gave the bf16 mla_decode 1.7-6.3x (grid gains a partition
+// axis; per-partition online-softmax partials are combined by paged_attention_reduce<bf16,512>).
+// The dense kernel partitions the token range; the sparse kernel partitions the top-k INDEX LIST
+// (indices are arbitrary token positions, so no block alignment is needed).
+// ---------------------------------------------------------------------------
+kernel void mla_decode_fp8_partition(
+        device const bf16 *q            [[buffer(0)]],   // (B, N, 512)
+        device const uchar *data_cache  [[buffer(1)]],   // (nb, bs, 576)
+        device const uchar *scale_cache [[buffer(2)]],   // (nb, bs, 8)
+        device const int  *block_table  [[buffer(3)]],
+        device const int  *context_lens [[buffer(4)]],
+        device float      *tmp_out      [[buffer(5)]],   // (B, N, P, 512)
+        device float      *max_logits   [[buffer(6)]],   // (B, N, P)
+        device float      *exp_sums     [[buffer(7)]],   // (B, N, P)
+        constant int &block_size        [[buffer(8)]],
+        constant int &block_table_stride [[buffer(9)]],
+        constant float &scale           [[buffer(10)]],
+        constant int &num_heads         [[buffer(11)]],
+        constant int &num_partitions    [[buffer(12)]],
+        constant int &partition_size    [[buffer(13)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr int LATENT = 512, NOPE = 448, VPL = LATENT / 32;
+    constexpr float MLA_NEG_INF = -3.4028234663852886e38f;
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int part = (int)tgid.z;
+    const int context_len = context_lens[batch];
+    const int t_beg = part * partition_size;
+    const int t_end = min(context_len, t_beg + partition_size);
+    const long q_base = ((long)batch * num_heads + head) * LATENT;
+
+    float qv[VPL], acc[VPL];
+    for (int i = 0; i < VPL; ++i) { qv[i] = float(q[q_base + lane + 32 * i]); acc[i] = 0.0f; }
+
+    float m = MLA_NEG_INF, l = 0.0f;
+    for (int t = t_beg; t < t_end; ++t) {
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) { continue; }
+        const long dslot = (long)block * block_size + slot;
+        const long dbase = dslot * 576;
+        const long sbase = dslot * 8;
+        device const bf16 *rope = (device const bf16 *)(data_cache + dbase + NOPE);
+
+        float lat[VPL];
+        float partial = 0.0f;
+        for (int i = 0; i < VPL; ++i) {
+            const int d = lane + 32 * i;
+            if (d < NOPE) {
+                const uchar code = data_cache[dbase + d];
+                const int e = (int)scale_cache[sbase + d / 64];
+                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+            } else {
+                lat[i] = float(rope[d - NOPE]);
+            }
+            partial += qv[i] * lat[i];
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VPL; ++i) { acc[i] = acc[i] * alpha + beta * lat[i]; }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    const long stat = ((long)batch * num_heads + head) * num_partitions + part;
+    const long ob = stat * LATENT;
+    for (int i = 0; i < VPL; ++i) {
+        tmp_out[ob + lane + 32 * i] = l == 0.0f ? 0.0f : acc[i] / l;
+    }
+    if (lane == 0) {
+        max_logits[stat] = l == 0.0f ? MLA_NEG_INF : m;
+        exp_sums[stat] = l;
+    }
+}
+
+kernel void mla_decode_fp8_sparse_partition(
+        device const bf16 *q            [[buffer(0)]],
+        device const uchar *data_cache  [[buffer(1)]],
+        device const uchar *scale_cache [[buffer(2)]],
+        device const int  *block_table  [[buffer(3)]],
+        device const int  *indices      [[buffer(4)]],   // (B, max_topk)
+        device const int  *topk_length  [[buffer(5)]],   // (B,)
+        device float      *tmp_out      [[buffer(6)]],   // (B, N, P, 512)
+        device float      *max_logits   [[buffer(7)]],   // (B, N, P)
+        device float      *exp_sums     [[buffer(8)]],   // (B, N, P)
+        constant int &block_size        [[buffer(9)]],
+        constant int &block_table_stride [[buffer(10)]],
+        constant float &scale           [[buffer(11)]],
+        constant int &num_heads         [[buffer(12)]],
+        constant int &max_topk          [[buffer(13)]],
+        constant int &num_partitions    [[buffer(14)]],
+        constant int &partition_size    [[buffer(15)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr int LATENT = 512, NOPE = 448, VPL = LATENT / 32;
+    constexpr float MLA_NEG_INF = -3.4028234663852886e38f;
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int part = (int)tgid.z;
+    const int len = topk_length[batch];
+    const int j_beg = part * partition_size;               // partition of the top-k index list
+    const int j_end = min(len, j_beg + partition_size);
+    const long q_base = ((long)batch * num_heads + head) * LATENT;
+
+    float qv[VPL], acc[VPL];
+    for (int i = 0; i < VPL; ++i) { qv[i] = float(q[q_base + lane + 32 * i]); acc[i] = 0.0f; }
+
+    float m = MLA_NEG_INF, l = 0.0f;
+    for (int j = j_beg; j < j_end; ++j) {
+        const int t = indices[batch * max_topk + j];
+        if (t < 0) { continue; }
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) { continue; }
+        const long dslot = (long)block * block_size + slot;
+        const long dbase = dslot * 576;
+        const long sbase = dslot * 8;
+        device const bf16 *rope = (device const bf16 *)(data_cache + dbase + NOPE);
+
+        float lat[VPL];
+        float partial = 0.0f;
+        for (int i = 0; i < VPL; ++i) {
+            const int d = lane + 32 * i;
+            if (d < NOPE) {
+                const uchar code = data_cache[dbase + d];
+                const int e = (int)scale_cache[sbase + d / 64];
+                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+            } else {
+                lat[i] = float(rope[d - NOPE]);
+            }
+            partial += qv[i] * lat[i];
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VPL; ++i) { acc[i] = acc[i] * alpha + beta * lat[i]; }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    const long stat = ((long)batch * num_heads + head) * num_partitions + part;
+    const long ob = stat * LATENT;
+    for (int i = 0; i < VPL; ++i) {
+        tmp_out[ob + lane + 32 * i] = l == 0.0f ? 0.0f : acc[i] / l;
+    }
+    if (lane == 0) {
+        max_logits[stat] = l == 0.0f ? MLA_NEG_INF : m;
+        exp_sums[stat] = l;
+    }
+}
+
 // Single-buffer bf16 copy (clone-then-insert prologue for the MLA cache).
 kernel void mla_cache_clone(device const bf16 *src [[buffer(0)]],
                             device bf16       *dst [[buffer(1)]],

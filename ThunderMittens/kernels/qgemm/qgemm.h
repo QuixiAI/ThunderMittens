@@ -85,6 +85,31 @@ class QGemmActorder : public Primitive {
   std::string fmt_;
 };
 
+// Full-weight dequant to fp16: packed wq (N, K/bk, bytes) -> W (N, K) half. Backs the
+// k-quant (256-superblock) prefill route in qgemm: dequantize-then-mx.matmul measured
+// 2-2.3x faster than the in-GEMM fragment dequant for those formats.
+class QDequant : public Primitive {
+ public:
+  explicit QDequant(Stream stream, std::string format)
+      : Primitive(stream), fmt_(std::move(format)) {};
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QDequant"; }
+  void print(std::ostream& os) override { os << "QDequant[" << fmt_ << "]"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return fmt_ == static_cast<const QDequant&>(other).fmt_;
+  }
+
+ private:
+  std::string fmt_;
+};
+
 class QGemm : public Primitive {
  public:
   explicit QGemm(Stream stream, std::string format, bool direct = false)

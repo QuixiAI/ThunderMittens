@@ -739,9 +739,21 @@ static at::Tensor mla_decode_fp8_mps(
   auto bt = block_table_in.contiguous(), cl = context_lens_in.contiguous();
   auto out = at::empty({B, N, 512}, q.options());
   const float scale_f = scale > 0.0 ? static_cast<float>(scale) : 1.0f / std::sqrt(512.0f);
+  // P4a-v2 route: partitioned decode + paged-v2 reduce (same upgrade as bf16 mla_decode)
+  const int block_size = static_cast<int>(data.size(1));
+  const int max_ctx = static_cast<int>(bt.size(1)) * block_size;
+  const int psize = ((512 + block_size - 1) / block_size) * block_size;
+  const int P = std::max(1, (max_ctx + psize - 1) / psize);
+  auto f32 = q.options().dtype(at::kFloat);
+  auto tmp_out = at::empty({B, N, P, 512}, f32);
+  auto max_logits = at::empty({B, N, P}, f32);
+  auto exp_sums = at::empty({B, N, P}, f32);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_mla_decode_fp8(e, q, data, sc, bt, cl, out, B, N, static_cast<int>(data.size(1)),
-                              static_cast<int>(bt.size(1)), scale_f);
+    tk::launch_mla_decode_fp8_partition(e, q, data, sc, bt, cl, tmp_out, max_logits, exp_sums,
+                                        B, N, block_size, static_cast<int>(bt.size(1)), scale_f,
+                                        P, psize);
+    tk::launch_paged_attention_reduce(e, tmp_out, max_logits, exp_sums, out, B, N, 512, P,
+                                      "bfloat16");
   });
   return out;
 }
@@ -767,10 +779,21 @@ static at::Tensor mla_decode_fp8_sparse_mps(
   auto idx = indices_in.to(at::kInt).contiguous(), lens = lens_in.to(at::kInt).contiguous();
   auto out = at::empty({B, N, 512}, q.options());
   const float scale_f = scale > 0.0 ? static_cast<float>(scale) : 1.0f / std::sqrt(512.0f);
+  // P4b-v2 route: partition the top-k index list + paged-v2 reduce
+  const int psize = 512;
+  const int P = std::max(1, (max_topk + psize - 1) / psize);
+  auto f32 = q.options().dtype(at::kFloat);
+  auto tmp_out = at::empty({B, N, P, 512}, f32);
+  auto max_logits = at::empty({B, N, P}, f32);
+  auto exp_sums = at::empty({B, N, P}, f32);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_mla_decode_fp8_sparse(e, q, data, sc, bt, idx, lens, out, B, N,
-                                     static_cast<int>(data.size(1)), static_cast<int>(bt.size(1)),
-                                     scale_f, max_topk);
+    tk::launch_mla_decode_fp8_sparse_partition(e, q, data, sc, bt, idx, lens, tmp_out,
+                                               max_logits, exp_sums, B, N,
+                                               static_cast<int>(data.size(1)),
+                                               static_cast<int>(bt.size(1)), scale_f, max_topk,
+                                               P, psize);
+    tk::launch_paged_attention_reduce(e, tmp_out, max_logits, exp_sums, out, B, N, 512, P,
+                                      "bfloat16");
   });
   return out;
 }
@@ -1726,6 +1749,13 @@ static at::Tensor qgemm_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
                     : (format == "nvfp4") ? 16 : 32;
   const int N = wq.size(0), K = (int)wq.size(1) * block_k, M = x.size(1);
   TORCH_CHECK(x.size(0) == K && N % 32 == 0 && M % 32 == 0, "qgemm: N%32,M%32, x rows==K");
+  // k-quant (256-superblock) prefill route: in-GEMM fragment dequant of these formats measured
+  // 2-2.3x slower than dequantize-then-matmul — use the span-decode dequant + torch GEMM.
+  if (block_k == 256 && M >= 64) {
+    auto w = at::empty({N, K}, x.options());
+    tk_encode([&](TorchEncoder& e) { tk::launch_qdequant_fp16(e, w, wq, N, K, format); });
+    return at::matmul(w, x);
+  }
   auto out = at::empty({N, M}, x.options());
   // dequant-direct-to-fragment (Marlin zero-shuffle) — ~40% faster than the staged path, same result.
   tk_encode([&](TorchEncoder& e) { tk::launch_qgemm_frag(e, out, wq, x, N, K, M, format); });

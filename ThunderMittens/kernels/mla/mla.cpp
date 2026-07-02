@@ -313,11 +313,74 @@ array mla_decode_fp8(
   auto scale_c = contiguous(astype(scale_cache, uint8, s), false, s);
   auto table_c = contiguous(astype(block_table, int32, s), false, s);
   auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
-  return array(
-      {q.shape(0), q.shape(1), 512},
-      bfloat16,
-      std::make_shared<MlaDecodeFp8>(to_stream(s), scale),
+  // P4a-v2 route: partitioned decode + paged-v2 reduce (same upgrade as bf16 mla_decode).
+  const int B = q.shape(0);
+  const int N = q.shape(1);
+  const int block_size = data_cache.shape(1);
+  const int max_ctx = block_table.shape(1) * block_size;
+  int psize = ((512 + block_size - 1) / block_size) * block_size;
+  const int P = std::max(1, (max_ctx + psize - 1) / psize);
+  auto parts = array::make_arrays(
+      {{B, N, P, 512}, {B, N, P}, {B, N, P}},
+      {float32, float32, float32},
+      std::make_shared<MlaDecodeFp8Partition>(to_stream(s), scale, P, psize),
       {q_c, data_c, scale_c, table_c, lens_c});
+  return array(
+      {B, N, 512},
+      bfloat16,
+      std::make_shared<PagedAttentionV2Reduce>(to_stream(s)),
+      {parts[0], parts[1], parts[2]});
+}
+
+void MlaDecodeFp8Partition::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MlaDecodeFp8Partition has no CPU implementation.");
+}
+
+void MlaDecodeFp8Partition::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& q = inputs[0];
+  auto& data_cache = inputs[1];
+  auto& scale_cache = inputs[2];
+  auto& block_table = inputs[3];
+  auto& tmp_out = outputs[0];
+  auto& max_logits = outputs[1];
+  auto& exp_sums = outputs[2];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  tmp_out.set_data(allocator::malloc_or_wait(tmp_out.nbytes()));
+  max_logits.set_data(allocator::malloc_or_wait(max_logits.nbytes()));
+  exp_sums.set_data(allocator::malloc_or_wait(exp_sums.nbytes()));
+
+  const float scale = scale_ > 0.0f ? scale_ : 1.0f / std::sqrt(512.0f);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  if (inputs.size() == 5) {   // dense: (q, data, scale, table, context_lens)
+    auto& context_lens = inputs[4];
+    tk::launch_mla_decode_fp8_partition(
+        enc, q, data_cache, scale_cache, block_table, context_lens, tmp_out, max_logits,
+        exp_sums, q.shape(0), q.shape(1), data_cache.shape(1), block_table.shape(1), scale,
+        num_partitions_, partition_size_);
+  } else {                    // sparse: (q, data, scale, table, indices, topk_length)
+    auto& indices = inputs[4];
+    auto& topk_length = inputs[5];
+    tk::launch_mla_decode_fp8_sparse_partition(
+        enc, q, data_cache, scale_cache, block_table, indices, topk_length, tmp_out,
+        max_logits, exp_sums, q.shape(0), q.shape(1), data_cache.shape(1),
+        block_table.shape(1), scale, indices.shape(1), num_partitions_, partition_size_);
+  }
+}
+
+std::vector<array> MlaDecodeFp8Partition::jvp(const std::vector<array>&, const std::vector<array>&,
+                                              const std::vector<int>&) {
+  throw std::runtime_error("MlaDecodeFp8Partition has no jvp implementation.");
+}
+std::vector<array> MlaDecodeFp8Partition::vjp(const std::vector<array>&, const std::vector<array>&,
+                                              const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("MlaDecodeFp8Partition has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> MlaDecodeFp8Partition::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("MlaDecodeFp8Partition has no vmap implementation.");
 }
 
 void MlaDecodeFp8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -376,11 +439,22 @@ array mla_decode_fp8_sparse(
   auto table_c = contiguous(astype(block_table, int32, s), false, s);
   auto idx_c = contiguous(astype(indices, int32, s), false, s);
   auto len_c = contiguous(astype(topk_length, int32, s), false, s);
-  return array(
-      {q.shape(0), q.shape(1), 512},
-      bfloat16,
-      std::make_shared<MlaDecodeFp8Sparse>(to_stream(s), scale),
+  // P4b-v2 route: partition the top-k index list + paged-v2 reduce.
+  const int B = q.shape(0);
+  const int N = q.shape(1);
+  const int max_topk = indices.shape(1);
+  const int psize = 512;
+  const int P = std::max(1, (max_topk + psize - 1) / psize);
+  auto parts = array::make_arrays(
+      {{B, N, P, 512}, {B, N, P}, {B, N, P}},
+      {float32, float32, float32},
+      std::make_shared<MlaDecodeFp8Partition>(to_stream(s), scale, P, psize),
       {q_c, data_c, scale_c, table_c, idx_c, len_c});
+  return array(
+      {B, N, 512},
+      bfloat16,
+      std::make_shared<PagedAttentionV2Reduce>(to_stream(s)),
+      {parts[0], parts[1], parts[2]});
 }
 
 void MlaDecodeFp8Sparse::eval_cpu(const std::vector<array>&, std::vector<array>&) {

@@ -286,6 +286,52 @@ dispatch_sync per op) is ~1.5 µs over torch's own add (8×8: 0.0105 vs
 0.0091 ms); at 4096×1024 tk.add_rt is 1.2× of torch add. The earlier 0.42×
 harness reading did not reproduce; no fix needed.
 
+## Pass 3 (2026-07-01, mop-up): the five catalogued gaps
+
+### mla_decode_fp8 / fp8_sparse — LANDED (partition upgrade, 1.7–3.8× single-call)
+Same v2-style partition as the bf16 decode (dense partitions the token range;
+sparse partitions the top-k INDEX LIST; both feed paged_attention_reduce<bf16,512>).
+The win lives in the regime that matters — sequential single-call decode:
+(8,16,4096): 2.75→0.85 ms (3.2×); (8,16,8192): 5.47→1.44 ms (3.8×);
+(8,32,2048): 1.46→0.84 ms (1.7×); sparse topk=2048: 0.57 ms flat regardless of
+ctx. The fully-pipelined synthetic regime pays a small partial+reduce tax at
+moderate ctx (overlap already saturated the old kernel there) — accepted, same
+trade as the bf16 upgrade. Key measurement lesson re-confirmed: the old
+geometry's pipelined numbers (0.6–1.2 ms) completely masked a 2.7–5.5 ms
+single-call reality.
+
+### k-quant prefill routing — LANDED (2–2.3×)
+New `qdequant_fp16<FMT>` kernel (flat, one thread per 8-col span via
+tk_dequant8) + route in qgemm (both backends): 256-superblock formats at M≥64
+dequantize the whole weight and use the framework GEMM. q4_K (11008,4096)
+M=512: 8.43→3.65 ms (within 11% of a pre-dequantized fp16 matmul — the residual
+is the dequant pass itself). M=32 measured a wash (fixed dequant cost dominates)
+→ threshold M≥64; below it the fragment path stays.
+
+### hadamard — LANDED (lanes-per-row parameterization)
+Kernel generalized to LPR lanes per row (32/LPR rows per simdgroup, xor-shuffles
+confined to the row's lane group). D=64 → LPR=8 (16-byte loads, 4 rows/sg):
+65536×64 0.209→0.139 ms, from 0.42× BEHIND the matmul-H baseline to 1.38×
+ahead. D=128 → LPR=16: 2.2× ahead (was 1.4×). First attempt (2 whole rows per
+lane at LPR=32) was only marginal — the fix was load WIDTH, not just work per
+simdgroup.
+
+### attn_fwd 16-row Q tile (D=128) — LANDED (1.3–1.6×)
+attn_fwd templated on TNQ; a 16-row-Q variant (halves the passes over K/V)
+routed in for D=128 when N%16==0. (2,16,4096,128): 36.8→23.6 ms — from 0.79× of
+sdpa to **1.48× ahead**; (1,8,2048,128) 1.29×; (1,8,1024,128) 1.47×. D=64 q16
+TRIED AND REJECTED: K/V stream is half the bytes there and the doubled register
+footprint made it ~1.4× slower.
+
+### Moderate-N float GEMV geometry — TRIED AND REJECTED (2nd idea)
+Two-simdgroup split-K on the q4_0 fast path (both half-split and interleaved
+strips): 3–4× faster at the small BitNet shapes (3840×2560, 2560×6912) but
+2–3× SLOWER at the K=4096 LLM shapes (11008×4096, 4096×11008) — the ~22 MB
+working set sits at the SLC boundary and the extra concurrency thrashes it.
+Reverted; both rejected geometries documented at the launch site. The moderate-N
+float GEMV gap is now formally an accepted limitation (integer w8a8 got its win
+from 2-row; float paths resist both geometries).
+
 ## Decision log
 - 2026-07-01: harness rewritten (schema v1, all families, batched timing);
   perf.md updated to match reality (reference mirrors, device context, timing

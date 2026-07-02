@@ -41,10 +41,47 @@ array qgemm(const array& wq, const array& x, const std::string& format, StreamOr
   assert(x.shape(0) == K && "qgemm: x rows must equal K");
   assert(N % 32 == 0 && M % 32 == 0 && "qgemm: requires N%32==0, M%32==0");
   (void)N; (void)K; (void)M;
+  // k-quant (256-superblock) prefill route: the fragment-path in-GEMM dequant of these branchy
+  // formats measured 2-2.3x slower than dequantize-then-mx.matmul at every M — dequantize the
+  // whole weight with the span-decode kernel and use the framework GEMM instead.
+  if (format_block_k(format) == 256 && M >= 64) {
+    auto w = array({N, K}, float16,
+                   std::make_shared<QDequant>(to_stream(s), format), {wq});
+    return matmul(w, x, s);
+  }
   // dequant-direct-to-fragment (Marlin zero-shuffle) — ~40% faster than dequant-to-shared and
   // bit-identical; it is the default. The staged path remains available via the frag flag = false.
   return array({N, M}, float16,
                std::make_shared<QGemm>(to_stream(s), format, true), {wq, x});
+}
+
+void QDequant::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("QDequant has no CPU implementation.");
+}
+
+void QDequant::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& wq = inputs[0];
+  auto& out = outputs[0];
+  auto& s = stream(); auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int N = out.shape(0);
+  const int K = out.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_qdequant_fp16(enc, out, wq, N, K, fmt_);
+}
+
+std::vector<array> QDequant::jvp(const std::vector<array>&, const std::vector<array>&,
+                                 const std::vector<int>&) {
+  throw std::runtime_error("QDequant has no jvp implementation.");
+}
+std::vector<array> QDequant::vjp(const std::vector<array>&, const std::vector<array>&,
+                                 const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("QDequant has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> QDequant::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("QDequant has no vmap implementation.");
 }
 
 array qgemm_direct(const array& wq, const array& x, const std::string& format, StreamOrDevice s) {

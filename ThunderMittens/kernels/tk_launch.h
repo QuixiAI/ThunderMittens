@@ -161,10 +161,15 @@ void launch_matmul_custom(E& e, typename E::out_t o, typename E::in_t a, typenam
 template <class E>
 void launch_attn_fwd(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
                      typename E::out_t o, unsigned N, unsigned H, int B, int D) {
-  e.pipeline(attn_fwd_kernel_name(D));
+  // 16-row Q tile for D=128 when N allows: halves the passes over K/V (the 8-row tile fell
+  // to 7.4 TFLOP/s at (2,16,4096,128) from K/V re-read pressure; q16 measured 1.3-1.6x).
+  // D=64 was TRIED and reverted: its K/V stream is half the bytes and the doubled register
+  // footprint made q16 ~1.4x slower there.
+  const bool q16 = (D == 128) && (N % 16 == 0);
+  e.pipeline(q16 ? attn_fwd_kernel_name(D) + "_q16" : attn_fwd_kernel_name(D));
   e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
   e.bytes(N, 4); e.bytes(H, 5);
-  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+  e.dispatch(static_cast<int>(N) / (q16 ? 16 : 8), static_cast<int>(H), B, 32, 1, 1);
 }
 
 // ----- attn_q (quantized-KV attention): q@0(bf16) Kq@1(uchar) Vq@2(uchar) o@3(bf16) ; N@4 H@5 ;
@@ -651,6 +656,42 @@ void launch_mla_decode_fp8_sparse(E& e, typename E::in_t q, typename E::in_t dat
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 
+// ----- MLA fp8 decode, PARTITIONED (P4a-v2/P4b-v2): paged-v2-style partials, combined with
+//        launch_paged_attention_reduce("bfloat16", 512). Dense partitions the token range
+//        (grid (H,B,P)); sparse partitions the top-k index list. -----
+template <class E>
+void launch_mla_decode_fp8_partition(E& e, typename E::in_t q, typename E::in_t data_cache,
+                                     typename E::in_t scale_cache, typename E::in_t block_table,
+                                     typename E::in_t context_lens, typename E::out_t tmp_out,
+                                     typename E::out_t max_logits, typename E::out_t exp_sums,
+                                     int batch, int num_heads, int block_size,
+                                     int block_table_stride, float scale, int num_partitions,
+                                     int partition_size) {
+  e.pipeline("mla_decode_fp8_partition");
+  e.in(q, 0); e.in(data_cache, 1); e.in(scale_cache, 2); e.in(block_table, 3);
+  e.in(context_lens, 4); e.out(tmp_out, 5); e.out(max_logits, 6); e.out(exp_sums, 7);
+  e.bytes(block_size, 8); e.bytes(block_table_stride, 9); e.bytes(scale, 10);
+  e.bytes(num_heads, 11); e.bytes(num_partitions, 12); e.bytes(partition_size, 13);
+  e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
+}
+template <class E>
+void launch_mla_decode_fp8_sparse_partition(E& e, typename E::in_t q, typename E::in_t data_cache,
+                                            typename E::in_t scale_cache, typename E::in_t block_table,
+                                            typename E::in_t indices, typename E::in_t topk_length,
+                                            typename E::out_t tmp_out, typename E::out_t max_logits,
+                                            typename E::out_t exp_sums, int batch, int num_heads,
+                                            int block_size, int block_table_stride, float scale,
+                                            int max_topk, int num_partitions, int partition_size) {
+  e.pipeline("mla_decode_fp8_sparse_partition");
+  e.in(q, 0); e.in(data_cache, 1); e.in(scale_cache, 2); e.in(block_table, 3);
+  e.in(indices, 4); e.in(topk_length, 5);
+  e.out(tmp_out, 6); e.out(max_logits, 7); e.out(exp_sums, 8);
+  e.bytes(block_size, 9); e.bytes(block_table_stride, 10); e.bytes(scale, 11);
+  e.bytes(num_heads, 12); e.bytes(max_topk, 13); e.bytes(num_partitions, 14);
+  e.bytes(partition_size, 15);
+  e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
+}
+
 // ----- gelu (elementwise, last axis): x@0 -> o@1 ; M@2(u32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
 void launch_gelu(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, int D) {
@@ -675,8 +716,9 @@ void launch_glu(E& e, typename E::in_t x, typename E::in_t gate, typename E::out
   e.dispatch(static_cast<int>((nthreads + threads - 1) / threads), 1, 1, threads, 1, 1);
 }
 
-// ----- Hadamard/FWHT over the final axis: x@0 -> out@1 ; scale@2. D in {64,128,256,512}.
-//        One simdgroup (32 lanes) per row: in-register + simd_shuffle_xor butterflies. -----
+// ----- Hadamard/FWHT over the final axis: x@0 -> out@1 ; scale@2 nrows@3. D in {64,128,256,512}.
+//        One simdgroup per R rows (R=2 at D=64, else 1): in-register + simd_shuffle_xor
+//        butterflies. -----
 template <class E>
 void launch_hadamard(
     E& e,
@@ -690,7 +732,9 @@ void launch_hadamard(
   e.in(x, 0);
   e.out(out, 1);
   e.bytes(scale, 2);
-  e.dispatch(rows, 1, 1, 32, 1, 1);
+  e.bytes(rows, 3);
+  const int R = (D == 64) ? 4 : (D == 128) ? 2 : 1;   // rows per simdgroup = 32/LPR
+  e.dispatch((rows + R - 1) / R, 1, 1, 32, 1, 1);
 }
 
 // ----- KV cache zero: key_cache@0 value_cache@1 ; n@2(ulong). Flat memset for fresh caches. -----
@@ -1306,6 +1350,18 @@ void launch_qgemm_frag(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.dispatch(M / 32, N / 32, 1, 32, 1, 1);  // 32 threads = 1 simdgroup
 }
 
+// ----- qdequant_fp16: W@0(N,K half) Wq@1 ; N@2 K@3 (i32) ; flat, one thread per 8-col span.
+//        Full-weight dequant backing the k-quant prefill route. -----
+template <class E>
+void launch_qdequant_fp16(E& e, typename E::out_t w, typename E::in_t wq,
+                          int N, int K, const std::string& fmt) {
+  e.pipeline("qdequant_" + fmt);
+  e.out(w, 0); e.in(wq, 1);
+  e.bytes(N, 2); e.bytes(K, 3);
+  const long threads = (long)N * (K / 8);
+  e.dispatch(static_cast<int>((threads + 255) / 256), 1, 1, 256, 1, 1);
+}
+
 // ----- qgemv (quantized GEMV, batch-1 decode): D@0 Wq@1 X@2 ; N@3 K@4 (i32) ;
 //        grid (N,1,1), 32 threads (1 simdgroup) per output row. d = W @ x, x (K,1) half. -----
 template <class E>
@@ -1315,9 +1371,10 @@ void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq, typename E::in
   e.pipeline(use_small ? qgemv_kernel_name(fmt) + "_small" : qgemv_kernel_name(fmt));
   e.out(d, 0); e.in(wq, 1); e.in(x, 2);
   e.bytes(N, 3); e.bytes(K, 4);
-  // one simdgroup per output row. (Two rows per simdgroup was measured: 1.9x BETTER for the
-  // integer w8a8 path but 1.6-2.8x WORSE here — the float dequant streams double the register
-  // pressure; see optimization_status.md.)
+  // one simdgroup per output row. Geometry experiments measured and REJECTED here: two ROWS
+  // per simdgroup (1.9x better for the integer w8a8 path, 1.6-2.8x worse here — float dequant
+  // doubles register pressure) and two-simdgroup split-K (3-4x better at the small BitNet
+  // shapes but 2-3x worse at the K=4096 LLM shapes, both half-split and interleaved).
   e.dispatch(N, 1, 1, 32, 1, 1);
 }
 

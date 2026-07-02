@@ -344,6 +344,31 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "moe_pad_schedule",
+      &moe_pad_schedule,
+      "sorted_row_idx"_a,
+      "offsets"_a,
+      "k"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        MoE padded schedule: 32-row-padded per-expert segments for the grouped GEMMs.
+        Returns [expert_of_tile (max_tiles, -1 = pad tile), gather_idx (total_pad_max,
+        -1 = pad row), inv_pad (T*k), off_pad (E+1)] (int32). Worst-case static sizing.
+      )");
+
+    m.def(
+      "moe_gather",
+      &moe_gather,
+      "x"_a,
+      "gather_idx"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        MoE gather: out[p, :] = x[gather_idx[p], :] (zeros where gather_idx[p] < 0).
+      )");
+
+    m.def(
       "moe_grouped_gemm",
       &moe_grouped_gemm,
       "permuted_input"_a, "W"_a, "expert_of_tile"_a,

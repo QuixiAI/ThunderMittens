@@ -1236,6 +1236,53 @@ def moe_cases(be, preset, formats):
                        tk.moe_grouped_gemm(x_d, W_d, eot_d),
                    baselines=baselines, ref=None, flops=2.0 * rows * Hd * Hd)
 
+    # End-to-end MoE MLP: all-GPU schedule (moe_pad_schedule + moe_gather) vs the old
+    # host-side numpy schedule (the removed host round-trip is the win being measured).
+    mlp_shapes = _pick(preset, [(256, 512, 512, 8, 2)], [(1024, 2048, 1024, 8, 2)],
+                       [(1024, 2048, 1024, 8, 2), (4096, 2048, 1024, 16, 2)])
+    for T, Hd, I, E, K in mlp_shapes:
+        x = (0.1 * rng.standard_normal((T, Hd))).astype(np.float32)
+        rl = rng.standard_normal((T, E)).astype(np.float32)
+        W1 = (0.1 * rng.standard_normal((E, Hd, 2 * I))).astype(np.float32)
+        W2 = (0.1 * rng.standard_normal((E, I, Hd))).astype(np.float32)
+        x_d, rl_d = be.array(x, "bf16"), be.array(rl, "f32")
+        W1_d, W2_d = be.array(W1, "bf16"), be.array(W2, "bf16")
+        baselines = {}
+        if be.name == "mlx":
+            mx = be.mx
+
+            def host_glued(x_d=x_d, rl_d=rl_d, W1_d=W1_d, W2_d=W2_d, E=E, K=K):
+                ids, w = tk.moe_route_topk(rl_d, K)
+                sidx, offsets, _ = tk.moe_permute(ids, E)
+                mx.eval(sidx, offsets)                      # the host sync being removed
+                so, off = np.array(sidx), np.array(offsets)
+                counts = np.diff(off)
+                off_pad = np.concatenate(
+                    [[0], np.cumsum(((counts + 31) // 32) * 32)]).astype(np.int64)
+                total_pad = int(off_pad[-1])
+                eot = np.zeros(total_pad // 32, np.int32)
+                tb = off_pad // 32
+                for e in range(E):
+                    eot[tb[e]:tb[e + 1]] = e
+                padpos = np.zeros(len(so), np.int64)
+                for e in range(E):
+                    s, en = int(off[e]), int(off[e + 1])
+                    padpos[s:en] = off_pad[e] + np.arange(en - s)
+                gidx = np.zeros(total_pad, np.int64)
+                gidx[padpos] = so // K
+                inv = np.argsort(so)
+                px = x_d[mx.array(gidx)]
+                eot_d = mx.array(eot)
+                h = tk.moe_grouped_gemm_swiglu(px, W1_d, eot_d)
+                op = tk.moe_grouped_gemm_rect(h, W2_d, eot_d)
+                return tk.moe_finalize(op, mx.array(padpos[inv].astype(np.int32)), w, K)
+            baselines["host_glued_schedule"] = host_glued
+        yield Case("moe", f"mlp_T{T}_H{Hd}_I{I}_E{E}_K{K}",
+                   {"T": T, "H": Hd, "I": I, "E": E, "K": K}, "bf16",
+                   target=lambda x_d=x_d, rl_d=rl_d, W1_d=W1_d, W2_d=W2_d, K=K:
+                       tk.moe_mlp(x_d, rl_d, W1_d, W2_d, K),
+                   baselines=baselines, ref=None, flops=2.0 * T * K * 3.0 * Hd * I)
+
 
 @register("quant_rt")
 def quant_rt_cases(be, preset, formats):

@@ -26,6 +26,23 @@ std::vector<array> moe_route_topk(const array& logits, int k, StreamOrDevice s =
 std::vector<array> moe_permute(const array& topk_ids, int num_experts, StreamOrDevice s = {});
 
 /**
+ *  MoE padded schedule (GPU replacement for the host glue): turns moe_permute's compact
+ *  layout into 32-row-padded per-expert segments for the grouped GEMMs. Static worst-case
+ *  sizing: total_pad_max = ceil32(T*K + 31*E), max_tiles = total_pad_max/32; -1 sentinels
+ *  mark tiles/rows beyond the real (data-dependent) total. Returns int32 arrays
+ *  [expert_of_tile (max_tiles), gather_idx (total_pad_max), inv_pad (T*K), off_pad (E+1)].
+ *  inv_pad[r] is the padded row finalize must read for routing row r.
+ **/
+std::vector<array> moe_pad_schedule(
+    const array& sorted_row_idx, const array& offsets, int k, StreamOrDevice s = {});
+
+/**
+ *  MoE gather: permuted_input[p, :] = x[gather_idx[p], :] (zeros where gather_idx[p] < 0).
+ *  x (T, H) float32/bfloat16; returns (len(gather_idx), H).
+ **/
+array moe_gather(const array& x, const array& gather_idx, StreamOrDevice s = {});
+
+/**
  *  MoE finalize: out[t] = sum_k topk_weights[t,k] * expert_out[inv_idx[t*k+k]].
  *  expert_out is (T*K, Hdim) in permuted order; topk_weights (T, k) f32. Returns (T, Hdim).
  **/
@@ -72,6 +89,48 @@ class MoeRouteTopk : public Primitive {
 
  private:
   int k_;
+};
+
+class MoePadSchedule : public Primitive {
+ public:
+  MoePadSchedule(Stream stream, int num_experts, int k)
+      : Primitive(stream), num_experts_(num_experts), k_(k) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoePadSchedule"; }
+  void print(std::ostream& os) override { os << "MoePadSchedule"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const MoePadSchedule&>(other);
+    return num_experts_ == o.num_experts_ && k_ == o.k_;
+  }
+
+ private:
+  int num_experts_;
+  int k_;
+};
+
+class MoeGather : public Primitive {
+ public:
+  explicit MoeGather(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeGather"; }
+  void print(std::ostream& os) override { os << "MoeGather"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
 };
 
 class MoePermute : public Primitive {

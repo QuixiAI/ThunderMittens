@@ -402,6 +402,19 @@ def moe_permute(topk_ids: torch.Tensor, num_experts: int):
     return _ext.moe_permute(topk_ids, int(num_experts))
 
 
+def moe_pad_schedule(sorted_row_idx: torch.Tensor, offsets: torch.Tensor, k: int):
+    """32-row-padded per-expert schedule for the grouped GEMMs.
+
+    Returns (expert_of_tile, gather_idx, inv_pad, off_pad) int32; -1 sentinels mark
+    pad tiles/rows beyond the real (data-dependent) total. MPS."""
+    return _ext.moe_pad_schedule(sorted_row_idx, offsets, int(k))
+
+
+def moe_gather(x: torch.Tensor, gather_idx: torch.Tensor):
+    """out[p, :] = x[gather_idx[p], :] (zeros where gather_idx[p] < 0). MPS."""
+    return _ext.moe_gather(x, gather_idx)
+
+
 def moe_grouped_gemm(permuted_input, W, expert_of_tile):
     """Fused grouped expert GEMM: out = permuted_input @ W[expert]. Returns (total_rows, H). MPS."""
     return _ext.moe_grouped_gemm(permuted_input, W, expert_of_tile)

@@ -145,6 +145,126 @@ kernel void moe_scatter(device const int *topk_ids       [[buffer(0)]],
     inv_idx[tid] = pos;
 }
 
+// ---------------------------------------------------------------------------
+// MoE padded schedule (the GPU replacement for the host-side glue): turns the compact
+// per-expert layout from moe_permute into 32-row-padded segments the grouped GEMMs consume.
+// MLX needs static shapes, so the padded space is allocated at the worst case
+// total_pad_max = ceil32(T*K + 31*E) and marked with -1 sentinels beyond the real total:
+//   expert_of_tile[t] = -1  -> the grouped GEMMs early-exit that tile
+//   gather_idx[p]     = -1  -> moe_gather zero-fills that padded row
+// (Mirrors vLLM's moe_align_block_size / TRT-LLM expandInputRowsKernel.)
+// ---------------------------------------------------------------------------
+
+// Single threadgroup: off_pad(E+1) = exclusive scan of ceil32(counts) (counts derived from
+// the unpadded offsets), then fill expert_of_tile via binary search over off_pad and init
+// gather_idx to -1. Empty experts produce zero-width segments the search skips naturally.
+kernel void moe_pad_offsets(device const int *offsets        [[buffer(0)]],   // (E+1) unpadded
+                            device int       *off_pad        [[buffer(1)]],   // (E+1)
+                            device int       *expert_of_tile [[buffer(2)]],   // (max_tiles)
+                            device int       *gather_idx     [[buffer(3)]],   // (total_pad_max)
+                            constant int &E [[buffer(4)]],
+                            constant int &max_tiles [[buffer(5)]],
+                            constant int &total_pad_max [[buffer(6)]],
+                            uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup int sg_sums[MOE_SCAN_NT / 32];
+    threadgroup int running;
+    if (tid == 0) { running = 0; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int b = 0; b < E; b += (int)MOE_SCAN_NT) {
+        const int e = b + (int)tid;
+        const int count = (e < E) ? (offsets[e + 1] - offsets[e]) : 0;
+        const int padded = ((count + 31) / 32) * 32;
+        int total;
+        const int excl = threadgroup_exclusive_scan_i32(padded, tid, MOE_SCAN_NT, sg_sums, total);
+        if (e < E) { off_pad[e] = running + excl; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) { running += total; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) { off_pad[E] = running; }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    const int total_pad = off_pad[E];
+    for (int t = (int)tid; t < max_tiles; t += (int)MOE_SCAN_NT) {
+        const int pos = t * 32;
+        if (pos >= total_pad) { expert_of_tile[t] = -1; continue; }
+        int lo = 0, hi = E;              // largest e with off_pad[e] <= pos (segment contains pos)
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) / 2;
+            if (off_pad[mid] <= pos) { lo = mid; } else { hi = mid; }
+        }
+        expert_of_tile[t] = lo;
+    }
+    for (int p = (int)tid; p < total_pad_max; p += (int)MOE_SCAN_NT) {
+        gather_idx[p] = -1;
+    }
+}
+
+// Per compact permuted position p: place it at its padded position and record both maps —
+// gather_idx[padpos] = token feeding that padded row, inv_pad[r] = padded position of routing
+// row r (what finalize reads). Derives inv_pad directly, no dependence on inv_idx.
+kernel void moe_pad_scatter(device const int *sorted_row_idx [[buffer(0)]],   // (TK)
+                            device const int *offsets        [[buffer(1)]],   // (E+1) unpadded
+                            device const int *off_pad        [[buffer(2)]],   // (E+1)
+                            device int       *gather_idx     [[buffer(3)]],   // (total_pad_max)
+                            device int       *inv_pad        [[buffer(4)]],   // (TK)
+                            constant int &TK [[buffer(5)]],
+                            constant int &E [[buffer(6)]],
+                            constant int &K [[buffer(7)]],
+                            uint tid [[thread_position_in_grid]]) {
+    const int p = (int)tid;
+    if (p >= TK) { return; }
+    int lo = 0, hi = E;                  // expert whose compact segment contains p
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) / 2;
+        if (offsets[mid] <= p) { lo = mid; } else { hi = mid; }
+    }
+    const int padpos = off_pad[lo] + (p - offsets[lo]);
+    const int r = sorted_row_idx[p];     // flat routing row (token r/K, slot r%K)
+    gather_idx[padpos] = r / K;
+    inv_pad[r] = padpos;
+}
+
+// Gather the permuted activations: permuted_input[p, :] = x[gather_idx[p], :] (zeros for
+// pad rows / the unused tail). One threadgroup of 128 threads per padded row, vec4 loads.
+template <typename T>
+kernel void moe_gather(device const T   *x          [[buffer(0)]],   // (T, H)
+                       device const int *gather_idx [[buffer(1)]],   // (total_pad_max)
+                       device T         *out        [[buffer(2)]],   // (total_pad_max, H)
+                       constant int &H [[buffer(3)]],
+                       uint3 tgid [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]]) {
+    using T4 = metal::vec<T, 4>;
+    const long p = (long)tgid.x;
+    const int src = gather_idx[p];
+    device T* dst = out + p * H;
+    if (src < 0) {
+        for (int i = (int)tid * 4; i + 4 <= H; i += 128 * 4) {
+            ((device T4*)(dst + i))[0] = T4(0);
+        }
+        for (int i = (H & ~3) + (int)tid; i < H; i += 128) { dst[i] = T(0); }
+        return;
+    }
+    device const T* row = x + (long)src * H;
+    for (int i = (int)tid * 4; i + 4 <= H; i += 128 * 4) {
+        ((device T4*)(dst + i))[0] = ((device const T4*)(row + i))[0];
+    }
+    for (int i = (H & ~3) + (int)tid; i < H; i += 128) { dst[i] = row[i]; }
+}
+
+#define instantiate_moe_gather(type_name, T)                                   \
+  template [[host_name("moe_gather_" #type_name)]] [[kernel]] void             \
+  moe_gather<T>(device const T *x [[buffer(0)]],                               \
+                device const int *gather_idx [[buffer(1)]],                    \
+                device T *out [[buffer(2)]],                                   \
+                constant int &H [[buffer(3)]],                                 \
+                uint3 tgid [[threadgroup_position_in_grid]],                   \
+                uint tid [[thread_index_in_threadgroup]]);
+
+instantiate_moe_gather(float32, float)
+instantiate_moe_gather(bfloat16, bf16)
+
 // Finalize: per token, weighted k-way reduce of the expert outputs (permuted order),
 // gathered back via inv_idx. No atomics — each token owns its K contributions.
 // expert_out (T*K, Hdim) in permuted order; weights (T, K); out (T, Hdim).
@@ -190,6 +310,8 @@ kernel void moe_grouped_gemm(device T *out                       [[buffer(0)]],
     const int OY = (int)threadgroup_id.y;   // global row-tile (32 rows)
     const int OX = (int)threadgroup_id.x;   // output column-tile (in H)
     const int e = expert_of_tile[OY];
+    if (e < 0) { return; }   // padding tile beyond the real schedule (worst-case grid);
+                             // its output rows are never read (inv_pad only maps real rows)
 
     using global_layout = gl<T, 1, 1, -1, -1>;
     global_layout gl_a(A, nullptr, nullptr, total_rows, H);
@@ -245,6 +367,7 @@ kernel void moe_grouped_gemm_rect(device T *out                    [[buffer(0)]]
     const int OY = (int)threadgroup_id.y;    // row-tile
     const int OX = (int)threadgroup_id.x;    // output column-tile (in N_out)
     const int e = expert_of_tile[OY];
+    if (e < 0) { return; }   // padding tile beyond the real schedule (never read downstream)
 
     using global_layout = gl<T, 1, 1, -1, -1>;
     global_layout gl_a(A, nullptr, nullptr, total_rows, K_dim);
@@ -283,6 +406,7 @@ kernel void moe_grouped_gemm_swiglu(device T *out                    [[buffer(0)
     const int OY = (int)threadgroup_id.y;
     const int OX = (int)threadgroup_id.x;    // output column-tile in inter
     const int e = expert_of_tile[OY];
+    if (e < 0) { return; }   // padding tile beyond the real schedule (never read downstream)
 
     constexpr const int N_BE = N_BLOCK * TILE_DIM, M_BE = M_BLOCK * TILE_DIM, K_BE = K_BLOCK * TILE_DIM;
     using global_layout = gl<T, 1, 1, -1, -1>;

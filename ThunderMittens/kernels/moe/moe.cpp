@@ -120,6 +120,123 @@ void MoePermute::eval_gpu(
   tk::launch_moe_scatter(enc, ids, cursor, sorted_row_idx, inv_idx, TK);
 }
 
+// ----------------------------- moe_pad_schedule / moe_gather -----------------------------
+
+std::vector<array> moe_pad_schedule(
+    const array& sorted_row_idx, const array& offsets, int k, StreamOrDevice s /* = {} */) {
+  if (sorted_row_idx.ndim() != 1 || offsets.ndim() != 1) {
+    throw std::invalid_argument("moe_pad_schedule: sorted_row_idx (TK,), offsets (E+1,)");
+  }
+  if (k <= 0) {
+    throw std::invalid_argument("moe_pad_schedule: k must be positive");
+  }
+  const int TK = sorted_row_idx.shape(0);
+  const int E = offsets.shape(0) - 1;
+  // worst case: every expert pads by up to 31 rows; ceil32 gives a whole tile count
+  const int total_pad_max = ((TK + 31 * E + 31) / 32) * 32;
+  const int max_tiles = total_pad_max / 32;
+  auto sorted_c = contiguous(astype(sorted_row_idx, int32, s), false, s);
+  auto offsets_c = contiguous(astype(offsets, int32, s), false, s);
+  return array::make_arrays(
+      {{max_tiles}, {total_pad_max}, {TK}, {E + 1}},
+      {int32, int32, int32, int32},
+      std::make_shared<MoePadSchedule>(to_stream(s), E, k),
+      {sorted_c, offsets_c});
+}
+
+void MoePadSchedule::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MoePadSchedule has no CPU implementation.");
+}
+
+void MoePadSchedule::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& sorted_row_idx = inputs[0];
+  auto& offsets = inputs[1];
+  auto& expert_of_tile = outputs[0];
+  auto& gather_idx = outputs[1];
+  auto& inv_pad = outputs[2];
+  auto& off_pad = outputs[3];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  for (auto* o : {&expert_of_tile, &gather_idx, &inv_pad, &off_pad}) {
+    o->set_data(allocator::malloc_or_wait(o->nbytes()));
+  }
+  const int TK = sorted_row_idx.shape(0);
+  const int max_tiles = expert_of_tile.shape(0);
+  const int total_pad_max = gather_idx.shape(0);
+
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_moe_pad_offsets(enc, offsets, off_pad, expert_of_tile, gather_idx,
+                             num_experts_, max_tiles, total_pad_max);
+  tk::launch_moe_pad_scatter(enc, sorted_row_idx, offsets, off_pad, gather_idx, inv_pad,
+                             TK, num_experts_, k_);
+}
+
+std::vector<array> MoePadSchedule::jvp(
+    const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("MoePadSchedule has no jvp implementation.");
+}
+std::vector<array> MoePadSchedule::vjp(
+    const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+    const std::vector<array>&) {
+  throw std::runtime_error("MoePadSchedule has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> MoePadSchedule::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("MoePadSchedule has no vmap implementation.");
+}
+
+array moe_gather(const array& x, const array& gather_idx, StreamOrDevice s /* = {} */) {
+  if (x.ndim() != 2 || gather_idx.ndim() != 1) {
+    throw std::invalid_argument("moe_gather: x (T, H), gather_idx (total_pad,)");
+  }
+  if (x.dtype() != float32 && x.dtype() != bfloat16) {
+    throw std::invalid_argument("moe_gather: x must be float32 or bfloat16");
+  }
+  auto idx_c = contiguous(astype(gather_idx, int32, s), false, s);
+  return array(
+      {gather_idx.shape(0), x.shape(1)}, x.dtype(),
+      std::make_shared<MoeGather>(to_stream(s)),
+      {contiguous(x, false, s), idx_c});
+}
+
+void MoeGather::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MoeGather has no CPU implementation.");
+}
+
+void MoeGather::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& x = inputs[0];
+  auto& gather_idx = inputs[1];
+  auto& out = outputs[0];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int H = x.shape(1);
+  const int total_pad_max = gather_idx.shape(0);
+  const std::string tn = x.dtype() == float32 ? "float32" : "bfloat16";
+
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_moe_gather(enc, x, gather_idx, out, H, total_pad_max, tn);
+}
+
+std::vector<array> MoeGather::jvp(
+    const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("MoeGather has no jvp implementation.");
+}
+std::vector<array> MoeGather::vjp(
+    const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+    const std::vector<array>&) {
+  throw std::runtime_error("MoeGather has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> MoeGather::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("MoeGather has no vmap implementation.");
+}
+
 // ----------------------------- moe_finalize -----------------------------
 
 array moe_finalize(

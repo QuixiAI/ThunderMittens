@@ -10,8 +10,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import (moe_route_topk, moe_permute, moe_finalize, moe_grouped_gemm,
-                moe_grouped_gemm_rect, moe_grouped_gemm_swiglu)
+from tk import (moe_route_topk, moe_permute, moe_pad_schedule, moe_gather, moe_finalize,
+                moe_grouped_gemm, moe_grouped_gemm_rect, moe_grouped_gemm_swiglu, moe_mlp)
 
 _MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 
@@ -70,6 +70,79 @@ def test_moe_permute(E, K):
         assert set(sorted_idx[s:en].tolist()) == set(np.where(flat == e)[0].tolist())
     # inv is the inverse permutation
     assert np.array_equal(sorted_idx[inv], np.arange(TK))
+
+
+def _pad_schedule_ref(sorted_idx, offsets, K):
+    """Numpy oracle for moe_pad_schedule (the former host-side glue)."""
+    off = np.asarray(offsets, np.int64)
+    E = len(off) - 1
+    TK = len(sorted_idx)
+    counts = np.diff(off)
+    off_pad = np.concatenate([[0], np.cumsum(((counts + 31) // 32) * 32)]).astype(np.int32)
+    total_pad_max = ((TK + 31 * E + 31) // 32) * 32
+    eot = np.full(total_pad_max // 32, -1, np.int32)
+    tb = off_pad // 32
+    for e in range(E):
+        eot[tb[e]:tb[e + 1]] = e
+    gather_idx = np.full(total_pad_max, -1, np.int32)
+    inv_pad = np.zeros(TK, np.int32)
+    for e in range(E):
+        s, en = int(off[e]), int(off[e + 1])
+        for p in range(s, en):
+            padpos = off_pad[e] + (p - s)
+            r = int(sorted_idx[p])
+            gather_idx[padpos] = r // K
+            inv_pad[r] = padpos
+    return eot, gather_idx, inv_pad, off_pad
+
+
+def _route(rng, T, E, K, scenario):
+    if scenario == "one_expert":
+        return np.full((T, K), min(3, E - 1), np.int32)  # everything on one expert (max pad)
+    if scenario == "aligned":
+        # exactly 32 rows per expert (zero padding needed): T*K = 32*E, round-robin
+        return (np.arange(T * K, dtype=np.int32) % E).reshape(T, K)
+    ids = rng.integers(0, E, size=(T, K)).astype(np.int32)
+    if scenario == "empty_expert" and E > 1:
+        ids[ids == 0] = 1  # expert 0 gets no tokens
+    return ids
+
+
+@pytest.mark.parametrize("scenario", ["random", "empty_expert", "one_expert", "aligned"])
+@pytest.mark.parametrize("E,K", [(8, 2), (16, 4), (1, 1), (300, 2)])
+def test_moe_pad_schedule(scenario, E, K):
+    rng = np.random.default_rng(3)
+    T = 16 * E if scenario == "aligned" else 50
+    ids = _route(rng, T, E, K, scenario)
+    sidx, offsets, _ = moe_permute(mx.array(ids), E)
+    eot, gidx, inv_pad, off_pad = moe_pad_schedule(sidx, offsets, K)
+    mx.eval(eot, gidx, inv_pad, off_pad)
+    eot_r, gidx_r, inv_pad_r, off_pad_r = _pad_schedule_ref(np.array(sidx), np.array(offsets), K)
+    np.testing.assert_array_equal(np.array(off_pad), off_pad_r)
+    np.testing.assert_array_equal(np.array(eot), eot_r)
+    np.testing.assert_array_equal(np.array(gidx), gidx_r)
+    np.testing.assert_array_equal(np.array(inv_pad), inv_pad_r)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("H", [64, 96, 4096])
+def test_moe_gather(dtype, H):
+    rng = np.random.default_rng(4)
+    T, E, K = 37, 8, 2
+    ids = rng.integers(0, E, size=(T, K)).astype(np.int32)
+    sidx, offsets, _ = moe_permute(mx.array(ids), E)
+    _, gidx, _, _ = moe_pad_schedule(sidx, offsets, K)
+    x = rng.standard_normal((T, H)).astype(np.float32)
+    xm = mx.array(x).astype(_MX[dtype])
+    out = moe_gather(xm, gidx)
+    mx.eval(out)
+    assert out.dtype == xm.dtype
+    gidx_np = np.array(gidx)
+    xr = np.array(xm.astype(mx.float32))
+    ref = np.zeros((len(gidx_np), H), np.float32)
+    valid = gidx_np >= 0
+    ref[valid] = xr[gidx_np[valid]]
+    np.testing.assert_array_equal(np.array(out.astype(mx.float32)), ref)  # pure copy: exact
 
 
 @pytest.mark.parametrize("K,H", [(2, 64), (4, 128), (1, 256)])
@@ -157,8 +230,8 @@ def test_moe_grouped_gemm(dtype, atol, H):
 
 @pytest.mark.parametrize("E,K", [(8, 2), (16, 4)])
 def test_moe_forward_grouped_gemm(E, K):
-    # Full fused MoE forward using the grouped GEMM: route -> permute -> (host-padded gather)
-    # -> moe_grouped_gemm -> finalize, vs a dense per-expert reference.
+    # Full fused MoE forward, all-GPU schedule: route -> permute -> pad_schedule -> gather
+    # -> moe_grouped_gemm -> finalize(inv_pad), vs a dense per-expert reference.
     rng = np.random.default_rng(7)
     T, H = 40, 64
     x = (0.1 * rng.standard_normal((T, H))).astype(np.float32)
@@ -167,30 +240,12 @@ def test_moe_forward_grouped_gemm(E, K):
     xm, Wm = mx.array(x), mx.array(W)
 
     ids, weights = moe_route_topk(mx.array(rl), K)
-    sidx, offsets, inv = moe_permute(ids, E)
-    mx.eval(ids, weights, sidx, offsets, inv)
+    sidx, offsets, _ = moe_permute(ids, E)
+    eot, gather_idx, inv_pad, _ = moe_pad_schedule(sidx, offsets, K)
+    permuted_x = moe_gather(xm, gather_idx)                    # (total_pad_max, H)
+    out_pad = moe_grouped_gemm(permuted_x, Wm, eot)            # (total_pad_max, H)
+    y = np.array(moe_finalize(out_pad, inv_pad, weights, K))
     ids_np, w_np = np.array(ids), np.array(weights)
-    off, sidx_np, inv_np = np.array(offsets), np.array(sidx), np.array(inv)
-
-    counts = np.diff(off)
-    padded = (((counts + 31) // 32) * 32).astype(np.int64)
-    off_pad = np.concatenate([[0], np.cumsum(padded)]).astype(np.int64)
-    total_pad = int(off_pad[-1])
-    tb = off_pad // 32
-    eot = np.zeros(total_pad // 32, np.int32)
-    for e in range(E):
-        eot[tb[e]:tb[e + 1]] = e
-    padpos = np.zeros(len(sidx_np), np.int64)
-    for e in range(E):
-        s, en = int(off[e]), int(off[e + 1])
-        padpos[s:en] = off_pad[e] + np.arange(en - s)
-    gather_idx = np.zeros(total_pad, np.int64)
-    gather_idx[padpos] = sidx_np // K
-
-    permuted_x = xm[mx.array(gather_idx)]                      # (total_pad, H)
-    out_pad = moe_grouped_gemm(permuted_x, Wm, mx.array(eot))  # (total_pad, H)
-    inv_pad = mx.array(padpos[inv_np].astype(np.int32))
-    y = np.array(moe_finalize(out_pad, inv_pad, mx.array(w_np), K))
 
     ref = np.zeros((T, H), np.float32)
     for t in range(T):
@@ -247,51 +302,66 @@ def test_moe_grouped_gemm_swiglu(dtype, atol, H, inter):
     np.testing.assert_allclose(np.array(out.astype(mx.float32)), ref, atol=atol, rtol=2e-2)
 
 
+def _moe_mlp_ref(x, rl_ids, rl_w, W1, W2):
+    T, H = x.shape
+    inter = W2.shape[1]
+    ref = np.zeros((T, H), np.float32)
+    for t in range(T):
+        for j in range(rl_ids.shape[1]):
+            e = rl_ids[t, j]
+            g = x[t] @ W1[e, :, :inter]
+            u = x[t] @ W1[e, :, inter:]
+            ref[t] += rl_w[t, j] * ((_silu(g) * u) @ W2[e])
+    return ref
+
+
 @pytest.mark.parametrize("E,K", [(8, 2), (16, 4)])
 def test_moe_mlp_swiglu_forward(E, K):
-    # Full SwiGLU MoE MLP: route -> permute -> GEMM1(+silu-glu) -> GEMM2 -> finalize, vs a dense ref.
+    # Full SwiGLU MoE MLP, all-GPU schedule: route -> permute -> pad_schedule -> gather
+    # -> GEMM1(+silu-glu) -> GEMM2 -> finalize(inv_pad), vs a dense ref.
     rng = np.random.default_rng(11)
     T, H, inter = 40, 64, 128
     x = (0.1 * rng.standard_normal((T, H))).astype(np.float32)
     rl = rng.standard_normal((T, E)).astype(np.float32)
     W1 = (0.1 * rng.standard_normal((E, H, 2 * inter))).astype(np.float32)
     W2 = (0.1 * rng.standard_normal((E, inter, H))).astype(np.float32)
-    xm = mx.array(x)
 
     ids, weights = moe_route_topk(mx.array(rl), K)
-    sidx, offsets, inv = moe_permute(ids, E)
-    mx.eval(ids, weights, sidx, offsets, inv)
-    ids_np, w_np = np.array(ids), np.array(weights)
-    off, sidx_np, inv_np = np.array(offsets), np.array(sidx), np.array(inv)
+    sidx, offsets, _ = moe_permute(ids, E)
+    eot, gather_idx, inv_pad, _ = moe_pad_schedule(sidx, offsets, K)
+    px = moe_gather(mx.array(x), gather_idx)
+    h = moe_grouped_gemm_swiglu(px, mx.array(W1), eot)     # (total_pad_max, inter)
+    op = moe_grouped_gemm_rect(h, mx.array(W2), eot)       # (total_pad_max, H)
+    y = np.array(moe_finalize(op, inv_pad, weights, K))
 
-    counts = np.diff(off)
-    off_pad = np.concatenate([[0], np.cumsum(((counts + 31) // 32) * 32)]).astype(np.int64)
-    total_pad = int(off_pad[-1])
-    tb = off_pad // 32
-    eot = np.zeros(total_pad // 32, np.int32)
-    for e in range(E):
-        eot[tb[e]:tb[e + 1]] = e
-    padpos = np.zeros(len(sidx_np), np.int64)
-    for e in range(E):
-        s, en = int(off[e]), int(off[e + 1])
-        padpos[s:en] = off_pad[e] + np.arange(en - s)
-    gather_idx = np.zeros(total_pad, np.int64)
-    gather_idx[padpos] = sidx_np // K
-
-    px = xm[mx.array(gather_idx)]
-    h = moe_grouped_gemm_swiglu(px, mx.array(W1), mx.array(eot))     # (total_pad, inter)
-    op = moe_grouped_gemm_rect(h, mx.array(W2), mx.array(eot))       # (total_pad, H)
-    inv_pad = mx.array(padpos[inv_np].astype(np.int32))
-    y = np.array(moe_finalize(op, inv_pad, mx.array(w_np), K))
-
-    ref = np.zeros((T, H), np.float32)
-    for t in range(T):
-        for j in range(K):
-            e = ids_np[t, j]
-            g = x[t] @ W1[e, :, :inter]
-            u = x[t] @ W1[e, :, inter:]
-            ref[t] += w_np[t, j] * ((_silu(g) * u) @ W2[e])
+    ref = _moe_mlp_ref(x, np.array(ids), np.array(weights), W1, W2)
     np.testing.assert_allclose(y, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype,atol", [("float32", 1e-2), ("bfloat16", 8e-2)])
+@pytest.mark.parametrize("E,K,T", [(8, 2, 40), (16, 4, 100), (1, 1, 33), (4, 2, 1)])
+def test_moe_mlp(dtype, atol, E, K, T):
+    # One-call tk.moe_mlp (the whole pipeline, no host sync) vs a dense per-expert reference.
+    rng = np.random.default_rng(12)
+    H, inter = 64, 96
+    x = (0.1 * rng.standard_normal((T, H))).astype(np.float32)
+    rl = rng.standard_normal((T, E)).astype(np.float32)
+    W1 = (0.1 * rng.standard_normal((E, H, 2 * inter))).astype(np.float32)
+    W2 = (0.1 * rng.standard_normal((E, inter, H))).astype(np.float32)
+    md = _MX[dtype]
+    xm, W1m, W2m = mx.array(x).astype(md), mx.array(W1).astype(md), mx.array(W2).astype(md)
+
+    y = moe_mlp(xm, mx.array(rl), W1m, W2m, K)
+    mx.eval(y)
+    assert y.shape == (T, H) and y.dtype == md
+
+    ids, weights = moe_route_topk(mx.array(rl), K)
+    mx.eval(ids, weights)
+    xr = np.array(xm.astype(mx.float32))
+    W1r = np.array(W1m.astype(mx.float32))
+    W2r = np.array(W2m.astype(mx.float32))
+    ref = _moe_mlp_ref(xr, np.array(ids), np.array(weights), W1r, W2r)
+    np.testing.assert_allclose(np.array(y.astype(mx.float32)), ref, atol=atol, rtol=5e-2)
 
 
 if __name__ == "__main__":

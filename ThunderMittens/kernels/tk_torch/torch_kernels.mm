@@ -1204,6 +1204,51 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_permute_mps(
   return {sorted, offsets, inv};
 }
 
+// MoE padded schedule: 32-row-padded per-expert segments for the grouped GEMMs.
+// Returns (expert_of_tile, gather_idx, inv_pad, off_pad); -1 sentinels mark pad tiles/rows.
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_pad_schedule_mps(
+    const at::Tensor& sorted_in, const at::Tensor& offsets_in, int64_t k) {
+  TORCH_CHECK(sorted_in.device().is_mps(), "moe_pad_schedule: sorted_row_idx must be MPS");
+  TORCH_CHECK(sorted_in.dim() == 1 && offsets_in.dim() == 1,
+              "moe_pad_schedule: sorted_row_idx (TK,), offsets (E+1,)");
+  TORCH_CHECK(k > 0, "moe_pad_schedule: k must be positive");
+  auto sorted = sorted_in.to(at::kInt).contiguous();
+  auto offsets = offsets_in.to(at::kInt).contiguous();
+  const int TK = sorted.size(0);
+  const int E = static_cast<int>(offsets.size(0)) - 1;
+  const int total_pad_max = ((TK + 31 * E + 31) / 32) * 32;
+  const int max_tiles = total_pad_max / 32;
+  auto opt = sorted.options();
+  auto expert_of_tile = at::empty({max_tiles}, opt);
+  auto gather_idx = at::empty({total_pad_max}, opt);
+  auto inv_pad = at::empty({TK}, opt);
+  auto off_pad = at::empty({E + 1}, opt);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_pad_offsets(e, offsets, off_pad, expert_of_tile, gather_idx,
+                               E, max_tiles, total_pad_max);
+    tk::launch_moe_pad_scatter(e, sorted, offsets, off_pad, gather_idx, inv_pad,
+                               TK, E, static_cast<int>(k));
+  });
+  return {expert_of_tile, gather_idx, inv_pad, off_pad};
+}
+
+// MoE gather: out[p, :] = x[gather_idx[p], :] (zeros where gather_idx[p] < 0).
+static at::Tensor moe_gather_mps(const at::Tensor& x_in, const at::Tensor& gather_idx_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "moe_gather: x must be an MPS tensor");
+  TORCH_CHECK(x_in.dim() == 2 && gather_idx_in.dim() == 1, "moe_gather: x (T,H), gather_idx (P,)");
+  TORCH_CHECK(x_in.scalar_type() == at::kFloat || x_in.scalar_type() == at::kBFloat16,
+              "moe_gather: x must be float32 or bfloat16");
+  auto x = x_in.contiguous();
+  auto gi = gather_idx_in.to(at::kInt).contiguous();
+  const int H = x.size(1);
+  const int total_pad_max = gi.size(0);
+  auto out = at::empty({total_pad_max, H}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_gather(e, x, gi, out, H, total_pad_max, tk_type_name(x));
+  });
+  return out;
+}
+
 // Fused grouped expert GEMM: out = permuted_input @ W[expert]. Returns (total_rows, H).
 static at::Tensor moe_grouped_gemm_mps(const at::Tensor& pi_in, const at::Tensor& W_in,
                                        const at::Tensor& eot_in) {
@@ -1968,6 +2013,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("paged_attention_v2_fp8", &paged_attention_v2_fp8_mps, "ThunderMittens long-context fp8 paged attention (MPS)");
   m.def("moe_route_topk", &moe_route_topk_mps, "ThunderMittens MoE top-k routing (MPS)");
   m.def("moe_permute", &moe_permute_mps, "ThunderMittens MoE permute (MPS)");
+  m.def("moe_pad_schedule", &moe_pad_schedule_mps, "ThunderMittens MoE padded schedule (MPS)");
+  m.def("moe_gather", &moe_gather_mps, "ThunderMittens MoE permuted-input gather (MPS)");
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");

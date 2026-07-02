@@ -205,6 +205,51 @@ def test_moe_permute_offsets_parity(E, K):
     _assert_parity(om, ot, atol=0)
 
 
+@pytest.mark.parametrize("E,K", [(8, 2), (16, 4)])
+def test_moe_pad_schedule_parity(E, K):
+    # Feed both backends the SAME (deterministic) sorted/offsets so all four outputs
+    # must match exactly (moe_permute's own within-segment order is nondeterministic).
+    rng = np.random.default_rng(3)
+    T = 50
+    flat = rng.integers(0, E, size=(T * K,)).astype(np.int32)
+    sidx = np.argsort(flat, kind="stable").astype(np.int32)
+    offsets = np.concatenate([[0], np.cumsum(np.bincount(flat, minlength=E))]).astype(np.int32)
+    om = tk.moe_pad_schedule(mx.array(sidx), mx.array(offsets), K)
+    ot = tk.moe_pad_schedule(torch.from_numpy(sidx).to("mps"),
+                             torch.from_numpy(offsets).to("mps"), K)
+    for a, b in zip(om, ot):
+        _assert_parity(a, b, atol=0)
+
+
+@pytest.mark.parametrize("H", [64, 96])
+def test_moe_gather_parity(H):
+    rng = np.random.default_rng(4)
+    T = 40
+    gidx = np.full(96, -1, np.int32)
+    gidx[:T] = rng.permutation(T).astype(np.int32)
+    x = rng.standard_normal((T, H)).astype(np.float32)
+    om = tk.moe_gather(_mk(x, "mlx", "f32"), mx.array(gidx))
+    ot = tk.moe_gather(_mk(x, "torch", "f32"), torch.from_numpy(gidx).to("mps"))
+    _assert_parity(om, ot, atol=0)  # pure copy: exact
+
+
+@pytest.mark.parametrize("E,K", [(8, 2), (16, 4)])
+def test_moe_mlp_parity(E, K):
+    # Whole pipeline. Output is invariant to permute's within-segment order (each padded
+    # row's GEMM depends only on its own token row), so cross-backend values must agree.
+    rng = np.random.default_rng(5)
+    T, H, inter = 40, 64, 96
+    x = (0.1 * rng.standard_normal((T, H))).astype(np.float32)
+    rl = rng.standard_normal((T, E)).astype(np.float32)
+    W1 = (0.1 * rng.standard_normal((E, H, 2 * inter))).astype(np.float32)
+    W2 = (0.1 * rng.standard_normal((E, inter, H))).astype(np.float32)
+    om = tk.moe_mlp(_mk(x, "mlx", "f32"), _mk(rl, "mlx", "f32"),
+                    _mk(W1, "mlx", "f32"), _mk(W2, "mlx", "f32"), K)
+    ot = tk.moe_mlp(_mk(x, "torch", "f32"), _mk(rl, "torch", "f32"),
+                    _mk(W1, "torch", "f32"), _mk(W2, "torch", "f32"), K)
+    _assert_parity(om, ot, atol=2e-3)
+
+
 @pytest.mark.parametrize("K,H", [(2, 64), (4, 128)])
 def test_moe_finalize_parity(K, H):
     rng = np.random.default_rng(1)

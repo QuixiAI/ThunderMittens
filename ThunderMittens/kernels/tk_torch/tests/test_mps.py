@@ -431,6 +431,69 @@ def test_moe_forward_end_to_end():
     np.testing.assert_allclose(y, ref, atol=1e-3, rtol=1e-3)
 
 
+def test_moe_pad_schedule_and_gather():
+    import numpy as np
+    rng = np.random.default_rng(3)
+    T, E, K, H = 50, 8, 2, 64
+    ids = rng.integers(0, E, size=(T, K)).astype(np.int32)
+    ids[ids == 0] = 1  # expert 0 empty (edge case)
+    s_t, off_t, _ = tk_torch.moe_permute(torch.from_numpy(ids).to("mps"), E)
+    eot_t, gidx_t, inv_pad_t, off_pad_t = tk_torch.moe_pad_schedule(s_t, off_t, K)
+    sidx, off = s_t.cpu().numpy(), off_t.cpu().numpy()
+    TK = T * K
+    counts = np.diff(off)
+    off_pad = np.concatenate([[0], np.cumsum(((counts + 31) // 32) * 32)]).astype(np.int32)
+    total_pad_max = ((TK + 31 * E + 31) // 32) * 32
+    eot = np.full(total_pad_max // 32, -1, np.int32)
+    tb = off_pad // 32
+    for e in range(E):
+        eot[tb[e]:tb[e + 1]] = e
+    gidx = np.full(total_pad_max, -1, np.int32)
+    inv_pad = np.zeros(TK, np.int32)
+    for e in range(E):
+        for p in range(off[e], off[e + 1]):
+            padpos = off_pad[e] + (p - off[e])
+            gidx[padpos] = sidx[p] // K
+            inv_pad[sidx[p]] = padpos
+    np.testing.assert_array_equal(off_pad_t.cpu().numpy(), off_pad)
+    np.testing.assert_array_equal(eot_t.cpu().numpy(), eot)
+    np.testing.assert_array_equal(gidx_t.cpu().numpy(), gidx)
+    np.testing.assert_array_equal(inv_pad_t.cpu().numpy(), inv_pad)
+    # gather
+    x = rng.standard_normal((T, H)).astype(np.float32)
+    out = tk_torch.moe_gather(torch.from_numpy(x).to("mps"), gidx_t).cpu().numpy()
+    ref = np.zeros((total_pad_max, H), np.float32)
+    ref[gidx >= 0] = x[gidx[gidx >= 0]]
+    np.testing.assert_array_equal(out, ref)
+
+
+def test_moe_mlp_gpu_schedule():
+    import numpy as np
+    rng = np.random.default_rng(12)
+    T, H, inter, E, K = 40, 64, 96, 8, 2
+    x = (0.1 * rng.standard_normal((T, H))).astype(np.float32)
+    rl = rng.standard_normal((T, E)).astype(np.float32)
+    W1 = (0.1 * rng.standard_normal((E, H, 2 * inter))).astype(np.float32)
+    W2 = (0.1 * rng.standard_normal((E, inter, H))).astype(np.float32)
+    xt = torch.from_numpy(x).to("mps")
+    ids_t, w_t = tk_torch.moe_route_topk(torch.from_numpy(rl).to("mps"), K)
+    s_t, off_t, _ = tk_torch.moe_permute(ids_t, E)
+    eot_t, gidx_t, inv_pad_t, _ = tk_torch.moe_pad_schedule(s_t, off_t, K)
+    px = tk_torch.moe_gather(xt, gidx_t)
+    h = tk_torch.moe_grouped_gemm_swiglu(px, torch.from_numpy(W1).to("mps"), eot_t)
+    op = tk_torch.moe_grouped_gemm_rect(h, torch.from_numpy(W2).to("mps"), eot_t)
+    y = tk_torch.moe_finalize(op, inv_pad_t, w_t, K).cpu().numpy()
+    ids, w = ids_t.cpu().numpy(), w_t.cpu().numpy()
+    ref = np.zeros((T, H), np.float32)
+    for t in range(T):
+        for j in range(K):
+            e = ids[t, j]
+            g = x[t] @ W1[e, :, :inter]
+            u = x[t] @ W1[e, :, inter:]
+            ref[t] += w[t, j] * ((g / (1 + np.exp(-g)) * u) @ W2[e])
+    np.testing.assert_allclose(y, ref, atol=1e-2, rtol=1e-2)
+
+
 def test_apply_penalty():
     import numpy as np
     rng = np.random.default_rng(0)

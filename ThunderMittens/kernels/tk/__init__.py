@@ -509,6 +509,49 @@ def moe_permute(topk_ids, num_experts):
     return sorted_idx, offsets, inv_idx
 
 
+def moe_pad_schedule(sorted_row_idx, offsets, k):
+    """32-row-padded per-expert schedule for the grouped GEMMs (all-GPU, no host sync).
+
+    Turns moe_permute's compact layout into padded segments. Returns int32 arrays
+    (expert_of_tile (max_tiles,), gather_idx (total_pad_max,), inv_pad (T*k,),
+    off_pad (E+1,)); -1 sentinels mark pad tiles/rows beyond the real total.
+    inv_pad[r] is the padded row moe_finalize must read for routing row r.
+    Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(sorted_row_idx):
+        return _torch().moe_pad_schedule(sorted_row_idx, offsets, k)
+    out = _mlx().moe_pad_schedule(sorted_row_idx, offsets, k)
+    return out[0], out[1], out[2], out[3]
+
+
+def moe_gather(x, gather_idx):
+    """Gather padded rows: out[p, :] = x[gather_idx[p], :] (zeros where gather_idx[p] < 0).
+
+    x (T, H) float32/bfloat16; returns (len(gather_idx), H). Accepts mlx.array or
+    torch.Tensor (MPS).
+    """
+    if _is_torch(x):
+        return _torch().moe_gather(x, gather_idx)
+    return _mlx().moe_gather(x, gather_idx)
+
+
+def moe_mlp(x, router_logits, W1, W2, k):
+    """End-to-end MoE MLP: route → permute → pad-schedule → gather → SwiGLU GEMM →
+    down-proj GEMM → weighted combine. All-GPU, no host sync.
+
+    x (T, H); router_logits (T, E); W1 (E, H, 2*I) laid out [gate | up]; W2 (E, I, H);
+    k experts per token. Returns (T, H) in x's dtype. H%16, I%32 required.
+    Accepts mlx.array or torch.Tensor (MPS).
+    """
+    topk_ids, topk_weights = moe_route_topk(router_logits, k)
+    sorted_row_idx, offsets, _inv_idx = moe_permute(topk_ids, W1.shape[0])
+    expert_of_tile, gather_idx, inv_pad, _off_pad = moe_pad_schedule(sorted_row_idx, offsets, k)
+    permuted = moe_gather(x, gather_idx)
+    inter = moe_grouped_gemm_swiglu(permuted, W1, expert_of_tile)
+    expert_out = moe_grouped_gemm_rect(inter, W2, expert_of_tile)
+    return moe_finalize(expert_out, inv_pad, topk_weights, k)
+
+
 def moe_grouped_gemm(permuted_input, W, expert_of_tile):
     """Fused grouped expert GEMM: out = permuted_input @ W[expert]. Returns (total_rows, H).
 

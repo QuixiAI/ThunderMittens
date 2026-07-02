@@ -312,6 +312,41 @@ void launch_moe_scatter(Enc& e, typename Enc::in_t topk_ids, typename Enc::out_t
   e.dispatch((TK + 255) / 256, 1, 1, 256, 1, 1);
 }
 
+// ----- moe padded schedule (GPU replacement for the host glue): -----
+// moe_pad_offsets: offsets@0(E+1) -> off_pad@1(E+1) expert_of_tile@2(max_tiles)
+//   gather_idx@3(init -1) ; E@4 max_tiles@5 total_pad_max@6 ; one threadgroup.
+template <class Enc>
+void launch_moe_pad_offsets(Enc& e, typename Enc::in_t offsets, typename Enc::out_t off_pad,
+                            typename Enc::out_t expert_of_tile, typename Enc::out_t gather_idx,
+                            int E, int max_tiles, int total_pad_max) {
+  e.pipeline("moe_pad_offsets");
+  e.in(offsets, 0); e.out(off_pad, 1); e.out(expert_of_tile, 2); e.out(gather_idx, 3);
+  e.bytes(E, 4); e.bytes(max_tiles, 5); e.bytes(total_pad_max, 6);
+  e.dispatch(1, 1, 1, 256, 1, 1);
+}
+// moe_pad_scatter: sorted_row_idx@0 offsets@1 off_pad@2 -> gather_idx@3 inv_pad@4 ;
+//   TK@5 E@6 K@7 ; flat over TK.
+template <class Enc>
+void launch_moe_pad_scatter(Enc& e, typename Enc::in_t sorted_row_idx, typename Enc::in_t offsets,
+                            typename Enc::in_t off_pad, typename Enc::out_t gather_idx,
+                            typename Enc::out_t inv_pad, int TK, int E, int K) {
+  e.pipeline("moe_pad_scatter");
+  e.in(sorted_row_idx, 0); e.in(offsets, 1); e.in(off_pad, 2);
+  e.out(gather_idx, 3); e.out(inv_pad, 4);
+  e.bytes(TK, 5); e.bytes(E, 6); e.bytes(K, 7);
+  e.dispatch((TK + 255) / 256, 1, 1, 256, 1, 1);
+}
+// moe_gather: x@0(T,H) gather_idx@1 -> out@2(total_pad_max,H) ; H@3 ;
+//   grid (total_pad_max,) x 128 thr (vec4 row copies; gather_idx<0 rows zero-filled).
+template <class Enc>
+void launch_moe_gather(Enc& e, typename Enc::in_t x, typename Enc::in_t gather_idx,
+                       typename Enc::out_t out, int H, int total_pad_max,
+                       const std::string& type_name) {
+  e.pipeline("moe_gather_" + type_name);
+  e.in(x, 0); e.in(gather_idx, 1); e.out(out, 2); e.bytes(H, 3);
+  e.dispatch(total_pad_max, 1, 1, 128, 1, 1);
+}
+
 // ----- moe_grouped_gemm: out@0 A@1(permuted_input) W@2(E,H,H) expert_of_tile@3(i32) ;
 //        total_rows@4 H@5 ; grid (H/32, total_rows/32, 1), 32 thr. out = A @ W[expert]. -----
 template <class Enc>

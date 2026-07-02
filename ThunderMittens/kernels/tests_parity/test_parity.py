@@ -664,6 +664,18 @@ def test_attn_causal_parity(shape):
     _assert_parity(om, ot, atol=1e-2)
 
 
+@pytest.mark.parametrize("window", [5, 13, 100])
+@pytest.mark.parametrize("shape", [(1, 2, 256, 64), (1, 2, 128, 128)])
+def test_attn_window_parity(shape, window):
+    rng = np.random.default_rng(0)
+    q = rng.standard_normal(shape).astype(np.float32)
+    k = rng.standard_normal(shape).astype(np.float32)
+    v = rng.standard_normal(shape).astype(np.float32)
+    om = tk.attn_window(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"), window)
+    ot = tk.attn_window(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"), window)
+    _assert_parity(om, ot, atol=1e-2)
+
+
 @pytest.mark.parametrize("nkm", [(40, 20, 48), (33, 17, 65)])
 def test_matmul_arbitrary_parity(nkm):
     N, K, M = nkm

@@ -664,6 +664,16 @@ def attn_causal(q, k, v):
     return _mlx().attn_causal(q, k, v)
 
 
+def attn_window(q, k, v, window):
+    """Sliding-window causal attention (Mistral/Gemma-style local attention): a query at
+    position i attends keys [max(0, i-window+1), i] — the `window` most recent tokens
+    including self. window <= 0 disables the window (== attn_causal). q,k,v (B,H,N,D) bf16,
+    D in {64,128}, N%8==0. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().attn_window(q, k, v, window)
+    return _mlx().attn_window(q, k, v, window)
+
+
 def flux_gelu(x, w, bias):
     """Fused gelu(x @ w + bias). Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(x):

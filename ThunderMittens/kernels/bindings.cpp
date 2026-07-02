@@ -707,6 +707,20 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "attn_window",
+      &attn_window,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "window"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        sliding-window causal attention forward: query i attends keys
+        [max(0, i-window+1), i]; window <= 0 disables the window
+      )");
+
+    m.def(
       "flux_gelu",
       &flux_gelu,
       "x"_a,

@@ -1465,6 +1465,24 @@ static at::Tensor attn_causal_mps(const at::Tensor& q_in, const at::Tensor& k_in
   return out;
 }
 
+static at::Tensor attn_window_mps(const at::Tensor& q_in, const at::Tensor& k_in,
+                                  const at::Tensor& v_in, int64_t window) {
+  TORCH_CHECK(q_in.device().is_mps(), "attn_window: q must be an MPS tensor");
+  TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "attn_window: q must be bfloat16");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
+  TORCH_CHECK(q.dim() == 4, "attn_window: expects (B,H,N,D)");
+  const int B = q.size(0), H = q.size(1);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  const int D = q.size(3);
+  TORCH_CHECK(D == 64 || D == 128, "attn_window: D must be 64 or 128");
+  TORCH_CHECK(N % 8 == 0, "attn_window: N must be a multiple of 8");
+  auto out = at::empty_like(q);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_attn_window(e, q, k, v, out, N, H, B, D, static_cast<int>(window));
+  });
+  return out;
+}
+
 static at::Tensor flux_gelu_mps(const at::Tensor& x_in, const at::Tensor& w_in,
                                 const at::Tensor& bias_in) {
   TORCH_CHECK(x_in.device().is_mps(), "flux_gelu: x must be an MPS tensor");
@@ -1964,6 +1982,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("quantize_per_token_fp8", &quantize_per_token_fp8_mps, "ThunderMittens per-row fp8 quant (MPS)");
   m.def("quantize_per_token_int8", &quantize_per_token_int8_mps, "ThunderMittens per-row int8 quant (MPS)");
   m.def("attn_causal", &attn_causal_mps, "ThunderMittens causal attention (MPS)");
+  m.def("attn_window", &attn_window_mps, "ThunderMittens sliding-window causal attention (MPS)");
   m.def("flux_gelu", &flux_gelu_mps, "ThunderMittens fused GEMM+GELU (MPS)");
   m.def("flux_gate", &flux_gate_mps, "ThunderMittens fused GEMM+gate+residual (MPS)");
   m.def("gemm_staged", &gemm_staged_mps, "ThunderMittens staged multi-simdgroup GEMM (MPS)");

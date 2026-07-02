@@ -670,6 +670,25 @@ def test_attn_causal(shape):
     assert _maxdiff(got, exp) < 0.05
 
 
+@pytest.mark.parametrize("window", [5, 100])
+@pytest.mark.parametrize("shape", [(1, 2, 256, 64), (2, 2, 128, 128)])
+def test_attn_window(shape, window):
+    B, H, N, D = shape
+    torch.manual_seed(0)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    got = tk_torch.attn_window(q, k, v, window)
+    i = torch.arange(N, device="mps")[:, None]
+    j = torch.arange(N, device="mps")[None, :]
+    mask = (j <= i) & (j >= i - window + 1)
+    exp = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    assert _maxdiff(got, exp) < 0.05
+    full = tk_torch.attn_window(q, k, v, N + 1)
+    causal = tk_torch.attn_causal(q, k, v)
+    assert torch.equal(full, causal), "window >= N must match attn_causal exactly"
+
+
 @pytest.mark.parametrize("nkm", [(40, 20, 48), (100, 50, 70), (33, 17, 65)])
 def test_matmul_arbitrary(nkm):
     N, K, M = nkm

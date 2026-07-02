@@ -22,9 +22,44 @@ array attn_causal(
     StreamOrDevice s = {}
 );
 
+/**
+ *  Sliding-window causal flash-attention forward: a query at position i attends keys
+ *  j in [max(0, i-window+1), i] (the `window` most recent tokens including self).
+ *  window <= 0 disables the window (== attn_causal). q, k, v (B,H,N,D) bf16; D in {64,128}.
+ **/
+array attn_window(
+    const array& q,
+    const array& k,
+    const array& v,
+    int window,
+    StreamOrDevice s = {}
+);
+
 ///////////////////////////////////////////////////////////////////////////////
 // Primitive
 ///////////////////////////////////////////////////////////////////////////////
+
+class AttnWindow : public Primitive {
+ public:
+  explicit AttnWindow(Stream stream, int window) : Primitive(stream), window_(window) {};
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "AttnWindow"; }
+  void print(std::ostream& os) override { os << "AttnWindow[" << window_ << "]"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return window_ == static_cast<const AttnWindow&>(other).window_;
+  }
+
+ private:
+  int window_;
+};
 
 class AttnCausal : public Primitive {
  public:

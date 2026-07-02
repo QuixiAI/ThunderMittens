@@ -287,6 +287,69 @@ make_causal(thread RT &dst, thread const RT &src, const unsigned laneid, thread 
     }
 }
 
+/* ----------  BAND MASKS (sliding window / shifted causal)  ---------- */
+// Generic diagonal-band masks over ROW-layout register tiles, expressed with the substrate's
+// lane -> (row, col) fragment map (see global_to_register.metal): lane elements [0] and [1] of
+// each 8x8 subtile live at (r, c) and (r, c+1) with
+//   qid = lane/4 ; r = (qid & 4) + (lane/2) % 4 ; c = (qid & 2)*2 + (lane % 2)*2.
+// Unlike make_causal's fixed diagonal, the boundary here is runtime `shift`, so the masks are
+// computed per element instead of from precomputed lane bitmasks.
+
+/**
+ * @brief Sliding-window mask: sets elements with (row - col) >= shift to `val`.
+ *
+ * For an attention tile whose rows are queries i and columns are keys j (both tile-local),
+ * masking (i - j) >= shift removes keys OLDER than the window. With a query tile at global row
+ * q0 and key tile at global row k0, pass shift = window - (q0 - k0): a key at global column
+ * k0+c is out-of-window for query q0+r iff (q0+r) - (k0+c) >= window.
+ */
+template<typename RT>
+static METAL_FUNC typename metal::enable_if<ducks::is_row_register_tile<RT>(), void>::type
+make_windowed(thread RT &dst, thread const RT &src, const unsigned laneid, const int shift,
+              thread const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    const int qid = (int)laneid / 4;
+    const int r = (qid & 4) + ((int)laneid / 2) % 4;
+    const int c = (qid & 2) * 2 + ((int)laneid % 2) * 2;
+    #pragma clang loop unroll(full)
+    for(int i = 0; i < dst.height; i++) {
+        #pragma clang loop unroll(full)
+        for(int j = 0; j < dst.width; j++) {
+            const int dr = (i * 8 + r) - (j * 8 + c);   // row - col of element [0]
+            dst.tiles[i][j].data.thread_elements()[0] =
+                (dr >= shift) ? val : src.tiles[i][j].data.thread_elements()[0];
+            dst.tiles[i][j].data.thread_elements()[1] =
+                (dr - 1 >= shift) ? val : src.tiles[i][j].data.thread_elements()[1];
+        }
+    }
+}
+
+/**
+ * @brief Shifted causal mask: sets elements with (col - row) > shift to `val`.
+ *
+ * shift = 0 reproduces make_causal (strictly-above-diagonal masked). For varlen prefill where
+ * a query at tile-local row r may attend keys up to global position past + local0 + r, a key
+ * tile at global key position k0 uses shift = past + local0 - k0.
+ */
+template<typename RT>
+static METAL_FUNC typename metal::enable_if<ducks::is_row_register_tile<RT>(), void>::type
+make_causal_shifted(thread RT &dst, thread const RT &src, const unsigned laneid, const int shift,
+                    thread const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    const int qid = (int)laneid / 4;
+    const int r = (qid & 4) + ((int)laneid / 2) % 4;
+    const int c = (qid & 2) * 2 + ((int)laneid % 2) * 2;
+    #pragma clang loop unroll(full)
+    for(int i = 0; i < dst.height; i++) {
+        #pragma clang loop unroll(full)
+        for(int j = 0; j < dst.width; j++) {
+            const int dc = (j * 8 + c) - (i * 8 + r);   // col - row of element [0]
+            dst.tiles[i][j].data.thread_elements()[0] =
+                (dc > shift) ? val : src.tiles[i][j].data.thread_elements()[0];
+            dst.tiles[i][j].data.thread_elements()[1] =
+                (dc + 1 > shift) ? val : src.tiles[i][j].data.thread_elements()[1];
+        }
+    }
+}
+
 
     
 /* ----------  SUBTILE  ---------- */

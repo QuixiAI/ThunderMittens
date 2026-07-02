@@ -1054,6 +1054,17 @@ void launch_attn_causal(E& e, typename E::in_t q, typename E::in_t k, typename E
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
+// ----- attn_window: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) window@6(i32) ;
+//        grid (N/8, H, B) group (32,1,1). Sliding-window causal (W most recent keys incl self). -----
+template <class E>
+void launch_attn_window(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                        typename E::out_t o, unsigned N, unsigned H, int B, int D, int window) {
+  e.pipeline("attn_window_" + std::to_string(D));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
+  e.bytes(N, 4); e.bytes(H, 5); e.bytes(window, 6);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
 // ----- flux_gelu: D@0 A@1 B@2 bias@3 ; N@4 K@5 M@6 (i32) ; grid (M/32, N/32, 1) -----
 // out = gelu(A@B + bias); A (N,K), B (K,M), bias (M,).
 template <class E>

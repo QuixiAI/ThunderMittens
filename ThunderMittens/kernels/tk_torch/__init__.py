@@ -363,6 +363,12 @@ def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     return _ext.attn_causal(q, k, v)
 
 
+def attn_window(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int):
+    """Sliding-window causal attention: query i attends keys [max(0, i-window+1), i].
+    window <= 0 disables the window. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""
+    return _ext.attn_window(q, k, v, window)
+
+
 def paged_attention_v2(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
                        block_table: torch.Tensor, context_lens: torch.Tensor,
                        scale: float = 0.0, partition_size: int = 512):

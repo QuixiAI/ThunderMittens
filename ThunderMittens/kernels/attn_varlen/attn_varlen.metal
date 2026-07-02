@@ -1,0 +1,129 @@
+#include "tk.metal"
+#include <metal_stdlib>
+namespace mittens {
+
+// Varlen / paged-prefill flash attention: causal attention over ragged packed queries that read
+// K/V straight from the paged KV cache (no dense (B,H,N,D) materialization), with prefix support
+// (context_len >= q_len), GQA, and D in {64,128}.
+//
+// Layout decisions (see kernels/attn_varlen/attn_varlen.cpp for the host worklist builder):
+//  - Q and O are HEAD-MAJOR packed: (H, total_padded, D). The register-tile loader hardcodes
+//    row_stride == cols, so rows of a tile must be D-contiguous; head-major gives exactly that.
+//    Each sequence is padded to a multiple of 8 rows, so the 8-row tiles never straddle two
+//    sequences and tile gx owns packed rows [8*gx, 8*gx+8).
+//  - The paged cache is (num_blocks, block_size, H_KV, D). A tile's 8 KV rows are strided by
+//    H_KV*D there, so they can't be tile-loaded directly -> they are staged into a threadgroup
+//    st<bf16,8,D> first (the attn_q pattern). block_size % 8 == 0 (asserted host-side) keeps an
+//    8-aligned KV tile inside a single block.
+//
+// Per tile the worklist supplies: tile_seq[gx] = batch b, tile_local0[gx] = the tile's first row
+// as a query index within sequence b. A query at tile-local row r sits at absolute position
+// past + local0 + r (past = context_len[b] - q_len[b], the cached prefix) and attends keys
+// [0, past+local0+r]. The boundary KV tile uses make_causal_shifted with shift = past+local0-kv0.
+constant constexpr const int TNV = 8;
+
+template <int D>
+kernel void attn_varlen_prefill(device   bf16     *q_hm         [[buffer(0)]],  // (H, total_padded, D)
+                                device   bf16     *key_cache    [[buffer(1)]],  // (nb, bs, H_KV, D)
+                                device   bf16     *value_cache  [[buffer(2)]],
+                                device const int  *block_table  [[buffer(3)]],  // (B, max_blocks)
+                                device const int  *context_lens [[buffer(4)]],  // (B,)
+                                device const int  *tile_seq     [[buffer(5)]],  // (n_tiles,)
+                                device const int  *tile_local0  [[buffer(6)]],  // (n_tiles,)
+                                device const int  *seq_qlen     [[buffer(7)]],  // (B,)
+                                device   bf16     *o_hm         [[buffer(8)]],  // (H, total_padded, D)
+                                constant int      &total_padded [[buffer(9)]],
+                                constant int      &H            [[buffer(10)]],
+                                constant int      &H_KV         [[buffer(11)]],
+                                constant int      &block_size   [[buffer(12)]],
+                                constant int      &bt_stride    [[buffer(13)]],
+                                constant float    &scale        [[buffer(14)]],
+                                uint3 blockIdx [[threadgroup_position_in_grid]],
+                                uint  tid      [[thread_index_in_threadgroup]],
+                                uint  laneId   [[thread_index_in_simdgroup]]) {
+    static_assert(D == 64 || D == 128, "D must be 64 or 128");
+    using global_layout = gl<bfloat, 1, -1, -1, D>;
+    global_layout gl_q(q_hm, nullptr, H, total_padded, nullptr);
+    global_layout gl_o(o_hm, nullptr, H, total_padded, nullptr);
+    using rt_qkv = rt_bf<TNV, D>;
+    using rt_k_t = rt_bf<TNV, D, ducks::rt_layout::col>;
+    using rt_att = rt_fl<TNV, TNV>;
+    using rt_o   = rt_fl<TNV, D>;
+    using rv_att = rt_fl<TNV, TNV>::col_vec;
+
+    const int gx   = (int)blockIdx.x;   // tile index
+    const int head = (int)blockIdx.y;
+    const int b    = tile_seq[gx];
+    const int local0 = tile_local0[gx];
+    const int ctx  = context_lens[b];
+    const int past = ctx - seq_qlen[b];             // cached prefix length (>= 0)
+    const int kv_head = head / (H / H_KV);          // GQA/MQA
+
+    int kv_limit = past + local0 + TNV;             // exclusive upper bound over the tile's rows
+    if (kv_limit > ctx) kv_limit = ctx;
+
+    threadgroup st<half, TNV, D> sK, sV;
+    rt_qkv q_reg; rt_k_t k_reg; rt_qkv v_reg; rt_att att_block; rt_o o_reg;
+    rv_att max_vec_last, max_vec, norm_vec;
+
+    load(q_reg, gl_q, {0, head, gx, 0}, laneId);
+    neg_infty(max_vec); zero(norm_vec); zero(o_reg);
+    const bf16 q_mul = (bf16)(scale * 1.44269504089f);   // fold scale * log2(e) (exp2 softmax)
+    mul(q_reg, q_reg, q_mul);
+
+    for (int kv0 = 0; kv0 < kv_limit; kv0 += TNV) {
+        const int block_col = kv0 / block_size;
+        const int slot0 = kv0 - block_col * block_size;
+        const int blk = block_table[b * bt_stride + block_col];
+        // Stage the 8-row KV tile from the paged cache into threadgroup memory.
+        for (int idx = (int)tid; idx < TNV * D; idx += 32) {
+            const int s = idx / D, d = idx - s * D;
+            if (blk < 0) { sK[int2(s, d)] = (half)0; sV[int2(s, d)] = (half)0; continue; }
+            const long crow = (((long)blk * block_size + slot0 + s) * H_KV + kv_head) * D;
+            sK[int2(s, d)] = (half)key_cache[crow + d];
+            sV[int2(s, d)] = (half)value_cache[crow + d];
+        }
+        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+        load(k_reg, sK, laneId);                                    // shared -> col reg (K^T)
+        zero(att_block);
+        mma_ABt(att_block, q_reg, k_reg, att_block);
+        // Boundary tile: mask keys past each query's causal horizon. shift = past+local0-kv0;
+        // shift >= 7 means the whole tile is in-horizon (no-op).
+        const int shift = past + local0 - kv0;
+        if (shift <= 6) {   // shift >= 7 => whole tile within every row's causal horizon (no-op)
+            float nb = -1e30f;
+            make_causal_shifted(att_block, att_block, laneId, shift, nb);
+        }
+        copy(max_vec_last, max_vec, laneId);
+        row_max(max_vec, att_block, max_vec, laneId);
+        sub(max_vec_last, max_vec_last, max_vec); exp2(max_vec_last, max_vec_last);
+        sub_row(att_block, att_block, max_vec); exp2(att_block, att_block);
+        mul(norm_vec, norm_vec, max_vec_last);
+        row_sum(norm_vec, att_block, norm_vec, laneId);
+        mul_row(o_reg, o_reg, max_vec_last);
+        load(v_reg, sV, laneId);                                    // shared -> row reg
+        mma_AB(o_reg, att_block, v_reg, o_reg);
+        threadgroup_barrier(metal::mem_flags::mem_threadgroup);     // before sK/sV reuse
+    }
+    div_row(o_reg, o_reg, norm_vec);
+    store(gl_o, o_reg, {0, head, gx, 0}, laneId);
+}
+
+#define instantiate_attn_varlen(D)                                                     \
+  template [[host_name("attn_varlen_prefill_" #D)]] [[kernel]] void                    \
+  attn_varlen_prefill<D>(device bf16 *q_hm [[buffer(0)]], device bf16 *key_cache [[buffer(1)]], \
+    device bf16 *value_cache [[buffer(2)]], device const int *block_table [[buffer(3)]], \
+    device const int *context_lens [[buffer(4)]], device const int *tile_seq [[buffer(5)]], \
+    device const int *tile_local0 [[buffer(6)]], device const int *seq_qlen [[buffer(7)]], \
+    device bf16 *o_hm [[buffer(8)]], constant int &total_padded [[buffer(9)]],         \
+    constant int &H [[buffer(10)]], constant int &H_KV [[buffer(11)]],                 \
+    constant int &block_size [[buffer(12)]], constant int &bt_stride [[buffer(13)]],   \
+    constant float &scale [[buffer(14)]],                                             \
+    uint3 blockIdx [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint laneId [[thread_index_in_simdgroup]]);
+
+instantiate_attn_varlen(64);
+instantiate_attn_varlen(128);
+
+}

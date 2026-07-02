@@ -94,6 +94,83 @@ def attn_fwd(q, k, v):
     return _mlx().attn_fwd(q, k, v)
 
 
+def _varlen_worklist(cu_seqlens_q):
+    """Host-side (numpy) prefill tile plan. Returns qlens, padded qlens, pad offsets, and the
+    per-tile (batch, local-row-0) worklist — all derived from the host cu_seqlens ints."""
+    import numpy as np
+    cu = np.asarray(cu_seqlens_q, dtype=np.int64)
+    B = len(cu) - 1
+    qlens = np.diff(cu).astype(np.int32)
+    padded = (((qlens + 7) // 8) * 8).astype(np.int32)
+    pad_off = np.concatenate([[0], np.cumsum(padded)]).astype(np.int64)
+    tile_seq, tile_local0 = [], []
+    for b in range(B):
+        for t in range(int(padded[b]) // 8):
+            tile_seq.append(b)
+            tile_local0.append(t * 8)
+    return (qlens, padded, pad_off,
+            np.asarray(tile_seq, np.int32), np.asarray(tile_local0, np.int32))
+
+
+def attn_varlen_prefill(q_packed, key_cache, value_cache, block_table, context_lens,
+                        cu_seqlens_q, scale=0.0):
+    """Varlen / paged-prefill causal attention: ragged packed queries reading K/V from the paged
+    cache, no dense (B,H,N,D) materialization. Supports a cached prefix (context_len >= q_len),
+    GQA, and D in {64,128}.
+
+    q_packed (total_q, H, D) bf16 with sequences concatenated per cu_seqlens_q (a host int
+    sequence of length B+1). key_cache/value_cache (num_blocks, block_size, H_KV, D) bf16;
+    block_table (B, max_blocks) int32; context_lens (B,) int32. scale defaults to 1/sqrt(D).
+    Returns (total_q, H, D) bf16. KV insertion is separate (call rope_kv_insert / kv_cache_scatter
+    before this). Accepts mlx.array or torch.Tensor (MPS)."""
+    import numpy as np
+    total_q, H, D = q_packed.shape
+    if scale == 0.0:
+        scale = 1.0 / (float(D) ** 0.5)
+    cu = np.asarray(cu_seqlens_q, dtype=np.int64)
+    B = len(cu) - 1
+    qlens, padded, pad_off, tile_seq, tile_local0 = _varlen_worklist(cu_seqlens_q)
+    total_padded = int(pad_off[-1])
+    is_t = _is_torch(q_packed)
+
+    if is_t:
+        import torch
+        dev = q_packed.device
+        parts = []
+        for b in range(B):
+            seg = q_packed[int(cu[b]):int(cu[b + 1])]
+            pad = int(padded[b]) - int(qlens[b])
+            if pad:
+                seg = torch.cat(
+                    [seg, torch.zeros(pad, H, D, dtype=seg.dtype, device=dev)], 0)
+            parts.append(seg)
+        q_hm = torch.cat(parts, 0).permute(1, 0, 2).contiguous()   # (H, total_padded, D)
+        ts = torch.from_numpy(tile_seq).to(dev)
+        tl = torch.from_numpy(tile_local0).to(dev)
+        sq = torch.from_numpy(qlens).to(dev)
+        o_hm = _torch().attn_varlen_prefill(
+            q_hm, key_cache, value_cache, block_table, context_lens, ts, tl, sq, float(scale))
+        o_pad = o_hm.permute(1, 0, 2).contiguous()                 # (total_padded, H, D)
+        outs = [o_pad[int(pad_off[b]):int(pad_off[b]) + int(qlens[b])] for b in range(B)]
+        return torch.cat(outs, 0)
+
+    import mlx.core as mx
+    parts = []
+    for b in range(B):
+        seg = q_packed[int(cu[b]):int(cu[b + 1])]
+        pad = int(padded[b]) - int(qlens[b])
+        if pad:
+            seg = mx.concatenate([seg, mx.zeros((pad, H, D), dtype=seg.dtype)], axis=0)
+        parts.append(seg)
+    q_hm = mx.transpose(mx.concatenate(parts, axis=0), (1, 0, 2))   # (H, total_padded, D)
+    ts, tl, sq = mx.array(tile_seq), mx.array(tile_local0), mx.array(qlens)
+    o_hm = _mlx().attn_varlen_prefill(
+        q_hm, key_cache, value_cache, block_table, context_lens, ts, tl, sq, float(scale))
+    o_pad = mx.transpose(o_hm, (1, 0, 2))                           # (total_padded, H, D)
+    outs = [o_pad[int(pad_off[b]):int(pad_off[b]) + int(qlens[b])] for b in range(B)]
+    return mx.concatenate(outs, axis=0)
+
+
 def rope_kv_insert(k, v, cos, sin, positions, slot_mapping, key_cache, value_cache):
     """Fused RoPE (split-half) on K + paged-KV insert. Returns updated (key_cache, value_cache).
 

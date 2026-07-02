@@ -40,6 +40,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "sampling", "sampling.metal"),
     os.path.join(_KERNELS, "moe", "moe.metal"),
     os.path.join(_KERNELS, "attn_causal", "attn_causal.metal"),
+    os.path.join(_KERNELS, "attn_varlen", "attn_varlen.metal"),
     os.path.join(_KERNELS, "flux", "flux.metal"),
     os.path.join(_KERNELS, "gemm_staged", "gemm_staged.metal"),
     os.path.join(_KERNELS, "attn_multiwarp", "attn_multiwarp.metal"),
@@ -361,6 +362,18 @@ def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
 def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     """Causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""
     return _ext.attn_causal(q, k, v)
+
+
+def attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
+                        tile_seq, tile_local0, seq_qlen, scale):
+    """Low-level varlen/paged-prefill attention (head-major q/o + host worklist). MPS.
+
+    q_hm (H, total_padded, D) bf16; key_cache/value_cache (nb, bs, H_KV, D) bf16;
+    block_table (B, max_blocks), context_lens (B,), tile_seq/tile_local0 (n_tiles,),
+    seq_qlen (B,) int32. Returns o_hm (H, total_padded, D). Prefer tk.attn_varlen_prefill,
+    which builds the worklist and pads/transposes for you."""
+    return _ext.attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
+                                    tile_seq, tile_local0, seq_qlen, float(scale))
 
 
 def attn_window(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int):

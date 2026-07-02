@@ -75,6 +75,7 @@
 #include "hadamard/hadamard.h"
 #include "kv_cache/kv_cache.h"
 #include "attn_causal/attn_causal.h"
+#include "attn_varlen/attn_varlen.h"
 #include "flux/flux.h"
 #include "gemm_staged/gemm_staged.h"
 #include "attn_multiwarp/attn_multiwarp.h"
@@ -743,6 +744,25 @@ NB_MODULE(_ext, m) {
       R"(
         sliding-window causal attention forward: query i attends keys
         [max(0, i-window+1), i]; window <= 0 disables the window
+      )");
+
+    m.def(
+      "attn_varlen_prefill",
+      &attn_varlen_prefill,
+      "q_hm"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      "tile_seq"_a,
+      "tile_local0"_a,
+      "seq_qlen"_a,
+      "scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        varlen / paged-prefill causal attention: ragged packed queries (head-major,
+        padded per sequence to a multiple of 8) reading K/V from the paged cache
       )");
 
     m.def(

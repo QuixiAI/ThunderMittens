@@ -107,6 +107,34 @@ def test_attn_q_parity(fmt):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("D,H,H_KV", [(64, 4, 4), (64, 8, 2), (128, 4, 4)])
+def test_attn_varlen_prefill_parity(D, H, H_KV):
+    rng = np.random.default_rng(3)
+    cu = [0, 4, 20, 37]
+    ctxs = [10, 30, 25]
+    bs = 16
+    scale = 1.0 / np.sqrt(D)
+    total_q = cu[-1]
+    q = (0.3 * rng.standard_normal((total_q, H, D))).astype(np.float32)
+    nb = sum((c + bs - 1) // bs for c in ctxs) + 2
+    mbk = max((c + bs - 1) // bs for c in ctxs)
+    kc = (0.3 * rng.standard_normal((nb, bs, H_KV, D))).astype(np.float32)
+    vc = (0.3 * rng.standard_normal((nb, bs, H_KV, D))).astype(np.float32)
+    bt = np.full((len(ctxs), mbk), -1, np.int32)
+    blk = 1
+    for b in range(len(ctxs)):
+        for c in range((ctxs[b] + bs - 1) // bs):
+            bt[b, c] = blk
+            blk += 1
+    cl = np.array(ctxs, np.int32)
+    om = tk.attn_varlen_prefill(_mk(q, "mlx"), _mk(kc, "mlx"), _mk(vc, "mlx"),
+                                mx.array(bt), mx.array(cl), cu, scale=float(scale))
+    ot = tk.attn_varlen_prefill(_mk(q, "torch"), _mk(kc, "torch"), _mk(vc, "torch"),
+                                torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"),
+                                cu, scale=float(scale))
+    _assert_parity(om, ot, atol=2e-2)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_rms_norm_parity(shape):
     D = shape[-1]

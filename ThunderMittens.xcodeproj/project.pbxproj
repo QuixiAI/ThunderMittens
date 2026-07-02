@@ -118,6 +118,7 @@
 				kernels/add_rt/add_rt.cpp,
 				kernels/add_norm/add_norm.cpp,
 				kernels/attn_causal/attn_causal.cpp,
+				kernels/attn_varlen/attn_varlen.cpp,
 				kernels/attn_multiwarp/attn_multiwarp.cpp,
 				kernels/attn_fwd/attn_fwd.cpp,
 				kernels/attn_fwd/correctness/c_attn.m,

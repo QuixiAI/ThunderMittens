@@ -752,6 +752,54 @@ def test_attn_window(shape, window):
     assert torch.equal(full, causal), "window >= N must match attn_causal exactly"
 
 
+@pytest.mark.parametrize("D,H,H_KV", [(64, 4, 4), (64, 8, 2), (128, 4, 4)])
+def test_attn_varlen_prefill(D, H, H_KV):
+    import numpy as np
+    rng = np.random.default_rng(2)
+    cu = [0, 4, 20, 37]
+    ctxs = [10, 30, 25]
+    bs = 16
+    scale = 1.0 / np.sqrt(D)
+    total_q = cu[-1]
+    q = (0.3 * rng.standard_normal((total_q, H, D))).astype(np.float32)
+    nb = sum((c + bs - 1) // bs for c in ctxs) + 2
+    mbk = max((c + bs - 1) // bs for c in ctxs)
+    kc = (0.3 * rng.standard_normal((nb, bs, H_KV, D))).astype(np.float32)
+    vc = (0.3 * rng.standard_normal((nb, bs, H_KV, D))).astype(np.float32)
+    bt = np.full((len(ctxs), mbk), -1, np.int32)
+    blk = 1
+    for b in range(len(ctxs)):
+        for c in range((ctxs[b] + bs - 1) // bs):
+            bt[b, c] = blk
+            blk += 1
+    # tk.attn_varlen_prefill builds the head-major worklist + pad/transpose, then calls the MPS op.
+    import tk
+    o = tk.attn_varlen_prefill(
+        torch.from_numpy(q).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(kc).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(vc).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(bt).to("mps"), torch.from_numpy(np.array(ctxs, np.int32)).to("mps"),
+        cu, scale=float(scale))
+    on = o.float().cpu().numpy()
+    grp = H // H_KV
+    ref = np.zeros((total_q, H, D), np.float32)
+    for b in range(len(ctxs)):
+        s, e = cu[b], cu[b + 1]
+        qlen, ctx = e - s, ctxs[b]
+        past = ctx - qlen
+        K = np.stack([kc[bt[b, t // bs], t % bs] for t in range(ctx)], 0)
+        V = np.stack([vc[bt[b, t // bs], t % bs] for t in range(ctx)], 0)
+        for h in range(H):
+            kvh = h // grp
+            for j in range(qlen):
+                lim = past + j + 1
+                sc = (q[s + j, h].astype(np.float64) @ K[:lim, kvh].T.astype(np.float64)) * scale
+                sc -= sc.max()
+                w = np.exp(sc); w /= w.sum()
+                ref[s + j, h] = w @ V[:lim, kvh]
+    assert np.abs(on - ref).max() / (np.abs(ref).max() + 1e-6) < 0.03
+
+
 @pytest.mark.parametrize("nkm", [(40, 20, 48), (100, 50, 70), (33, 17, 65)])
 def test_matmul_arbitrary(nkm):
     N, K, M = nkm

@@ -1100,6 +1100,26 @@ void launch_attn_window(E& e, typename E::in_t q, typename E::in_t k, typename E
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
+// ----- attn_varlen_prefill: q_hm@0 key_cache@1 value_cache@2 block_table@3 context_lens@4
+//        tile_seq@5 tile_local0@6 seq_qlen@7 -> o_hm@8 ; total_padded@9 H@10 H_KV@11
+//        block_size@12 bt_stride@13 (i32) scale@14 (f32) ; grid (n_tiles, H, 1) group (32,1,1).
+//        Ragged causal prefill reading K/V from the paged cache; q/o are head-major (H,tp,D). -----
+template <class E>
+void launch_attn_varlen_prefill(E& e, typename E::in_t q_hm, typename E::in_t key_cache,
+                                typename E::in_t value_cache, typename E::in_t block_table,
+                                typename E::in_t context_lens, typename E::in_t tile_seq,
+                                typename E::in_t tile_local0, typename E::in_t seq_qlen,
+                                typename E::out_t o_hm, int n_tiles, int total_padded, int H,
+                                int H_KV, int block_size, int bt_stride, float scale, int D) {
+  e.pipeline("attn_varlen_prefill_" + std::to_string(D));
+  e.in(q_hm, 0); e.in(key_cache, 1); e.in(value_cache, 2); e.in(block_table, 3);
+  e.in(context_lens, 4); e.in(tile_seq, 5); e.in(tile_local0, 6); e.in(seq_qlen, 7);
+  e.out(o_hm, 8);
+  e.bytes(total_padded, 9); e.bytes(H, 10); e.bytes(H_KV, 11);
+  e.bytes(block_size, 12); e.bytes(bt_stride, 13); e.bytes(scale, 14);
+  e.dispatch(n_tiles, H, 1, 32, 1, 1);
+}
+
 // ----- flux_gelu: D@0 A@1 B@2 bias@3 ; N@4 K@5 M@6 (i32) ; grid (M/32, N/32, 1) -----
 // out = gelu(A@B + bias); A (N,K), B (K,M), bias (M,).
 template <class E>

@@ -1528,6 +1528,38 @@ static at::Tensor attn_window_mps(const at::Tensor& q_in, const at::Tensor& k_in
   return out;
 }
 
+static at::Tensor attn_varlen_prefill_mps(
+    const at::Tensor& q_hm_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
+    const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
+    const at::Tensor& tile_seq_in, const at::Tensor& tile_local0_in, const at::Tensor& seq_qlen_in,
+    double scale) {
+  TORCH_CHECK(q_hm_in.device().is_mps(), "attn_varlen_prefill: q_hm must be an MPS tensor");
+  TORCH_CHECK(q_hm_in.scalar_type() == at::kBFloat16 &&
+              key_cache_in.scalar_type() == at::kBFloat16 &&
+              value_cache_in.scalar_type() == at::kBFloat16,
+              "attn_varlen_prefill: q_hm/key_cache/value_cache must be bfloat16");
+  auto q_hm = q_hm_in.contiguous();
+  auto key_cache = key_cache_in.contiguous(), value_cache = value_cache_in.contiguous();
+  auto block_table = block_table_in.to(at::kInt).contiguous();
+  auto context_lens = context_lens_in.to(at::kInt).contiguous();
+  auto tile_seq = tile_seq_in.to(at::kInt).contiguous();
+  auto tile_local0 = tile_local0_in.to(at::kInt).contiguous();
+  auto seq_qlen = seq_qlen_in.to(at::kInt).contiguous();
+  TORCH_CHECK(q_hm.dim() == 3, "attn_varlen_prefill: q_hm must be (H, total_padded, D)");
+  const int H = q_hm.size(0), total_padded = q_hm.size(1), D = q_hm.size(2);
+  const int H_KV = key_cache.size(2), block_size = key_cache.size(1);
+  const int bt_stride = block_table.size(1), n_tiles = tile_seq.size(0);
+  TORCH_CHECK(D == 64 || D == 128, "attn_varlen_prefill: D must be 64 or 128");
+  TORCH_CHECK(block_size % 8 == 0, "attn_varlen_prefill: block_size must be a multiple of 8");
+  auto out = at::empty_like(q_hm);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_attn_varlen_prefill(e, q_hm, key_cache, value_cache, block_table, context_lens,
+                                   tile_seq, tile_local0, seq_qlen, out, n_tiles, total_padded,
+                                   H, H_KV, block_size, bt_stride, static_cast<float>(scale), D);
+  });
+  return out;
+}
+
 static at::Tensor flux_gelu_mps(const at::Tensor& x_in, const at::Tensor& w_in,
                                 const at::Tensor& bias_in) {
   TORCH_CHECK(x_in.device().is_mps(), "flux_gelu: x must be an MPS tensor");
@@ -2030,6 +2062,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("quantize_per_token_int8", &quantize_per_token_int8_mps, "ThunderMittens per-row int8 quant (MPS)");
   m.def("attn_causal", &attn_causal_mps, "ThunderMittens causal attention (MPS)");
   m.def("attn_window", &attn_window_mps, "ThunderMittens sliding-window causal attention (MPS)");
+  m.def("attn_varlen_prefill", &attn_varlen_prefill_mps,
+        "ThunderMittens varlen/paged-prefill causal attention (MPS)");
   m.def("flux_gelu", &flux_gelu_mps, "ThunderMittens fused GEMM+GELU (MPS)");
   m.def("flux_gate", &flux_gate_mps, "ThunderMittens fused GEMM+gate+residual (MPS)");
   m.def("gemm_staged", &gemm_staged_mps, "ThunderMittens staged multi-simdgroup GEMM (MPS)");

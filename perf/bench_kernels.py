@@ -706,6 +706,49 @@ def attn_cases(be, preset, formats):
                        flops=flops / (2 if causal else 1))
 
 
+@register("attn_varlen")
+def attn_varlen_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(122)
+    bs = 16
+    # (cu_seqlens, ctxs, H, H_KV, D) — ragged packed queries reading K/V from the paged cache.
+    cfgs = _pick(
+        preset,
+        [([0, 128, 384], [128, 256], 8, 8, 64)],
+        [([0, 128, 384], [128, 256], 8, 8, 128),
+         ([0, 512, 1024, 1536], [512, 512, 512], 16, 4, 128)],
+        [([0, 512, 1024, 1536], [512, 512, 512], 16, 4, 128),
+         ([0, 1024, 3072], [1024, 2048], 32, 8, 128)])
+    for cu, ctxs, H, H_KV, D in cfgs:
+        total_q = cu[-1]
+        scale = 1.0 / np.sqrt(D)
+        q = (0.3 * rng.standard_normal((total_q, H, D))).astype(np.float32)
+        nb = sum((c + bs - 1) // bs for c in ctxs) + 2
+        mbk = max((c + bs - 1) // bs for c in ctxs)
+        kc = (0.3 * rng.standard_normal((nb, bs, H_KV, D))).astype(np.float32)
+        vc = (0.3 * rng.standard_normal((nb, bs, H_KV, D))).astype(np.float32)
+        bt = np.full((len(ctxs), mbk), -1, np.int32)
+        blk = 1
+        for b in range(len(ctxs)):
+            for c in range((ctxs[b] + bs - 1) // bs):
+                bt[b, c] = blk
+                blk += 1
+        q_d, kc_d, vc_d = be.array(q, "bf16"), be.array(kc, "bf16"), be.array(vc, "bf16")
+        bt_d, cl_d = be.int_array(bt), be.int_array(np.array(ctxs, np.int32))
+        # flops ~ 2 * sum_b (qkv passes) = 4 * H * D * sum_b qlen_b * ctx_b (causal ~ /2 of dense ctx)
+        flops = 0.0
+        for b in range(len(ctxs)):
+            qlen = cu[b + 1] - cu[b]
+            flops += 4.0 * H * D * qlen * ctxs[b]
+        yield Case("attn_varlen",
+                   f"prefill_B{len(ctxs)}_tq{total_q}_H{H}kv{H_KV}_D{D}",
+                   {"B": len(ctxs), "total_q": total_q, "H": H, "H_KV": H_KV, "D": D}, "bf16",
+                   target=lambda q_d=q_d, kc_d=kc_d, vc_d=vc_d, bt_d=bt_d, cl_d=cl_d,
+                   cu=cu, scale=scale:
+                       tk.attn_varlen_prefill(q_d, kc_d, vc_d, bt_d, cl_d, cu, scale=float(scale)),
+                   baselines={}, ref=None, flops=flops)
+
+
 @register("attn_bwd")
 def attn_bwd_cases(be, preset, formats):
     tk = be.tk()
